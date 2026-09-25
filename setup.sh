@@ -1,6 +1,7 @@
 #!/bin/bash
-# Install the Ubuntu ARM GNU toolchain, clone upstream LK at a pinned commit,
-# and apply the profiler overlay.
+# Install the Ubuntu ARM GNU toolchain, clone upstream LK at its current
+# default-branch tip (no pin -- deliberately tracks latest), and apply the
+# profiler overlay (app/profiler + a small core-LK patch).
 #
 # No custom toolchain needed: LK's own arch/arm/toolchain.mk auto-probes for
 # `arm-none-eabi-gcc` on PATH among its candidate prefixes, so apt's
@@ -8,7 +9,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-LK_PIN="$(tr -d '[:space:]' < "$ROOT/LK_PIN")"
 LK_DIR="${LK_DIR:-$ROOT/build/lk}"
 
 ensure_toolchain() {
@@ -25,12 +25,27 @@ clone_lk() {
     if [ ! -d "$LK_DIR/.git" ]; then
         echo "Cloning littlekernel/lk into $LK_DIR ..."
         mkdir -p "$(dirname "$LK_DIR")"
-        git clone https://github.com/littlekernel/lk.git "$LK_DIR"
+        git clone -q https://github.com/littlekernel/lk.git "$LK_DIR"
+    else
+        echo "Pulling latest littlekernel/lk into $LK_DIR ..."
+        git -C "$LK_DIR" checkout -q -- . 2>/dev/null || true
+        git -C "$LK_DIR" pull -q --ff-only
     fi
+    echo "LK at: $(git -C "$LK_DIR" rev-parse --short HEAD) ($(git -C "$LK_DIR" log -1 --format=%s))"
+}
 
-    echo "Checking out LK pin $LK_PIN ..."
-    git -C "$LK_DIR" fetch origin --tags
-    git -C "$LK_DIR" checkout --force "$LK_PIN"
+apply_lk_patches() {
+    local patch_dir="$ROOT/overlay/lk"
+    [ -d "$patch_dir" ] || return 0
+    for patch in "$patch_dir"/*.patch; do
+        [ -e "$patch" ] || continue
+        if git -C "$LK_DIR" apply --check --reverse "$patch" >/dev/null 2>&1; then
+            echo "  already applied: $(basename "$patch")"
+            continue
+        fi
+        echo "  applying: $(basename "$patch")"
+        git -C "$LK_DIR" apply "$patch"
+    done
 }
 
 apply_overlay() {
@@ -39,11 +54,12 @@ apply_overlay() {
     rsync -a "$ROOT/app/profiler/" "$LK_DIR/app/profiler/"
     cp "$ROOT/project/profiler.mk" "$LK_DIR/project/profiler.mk"
     [ -d "$LK_DIR/app/profiler" ] && find "$LK_DIR/app/profiler" -name "*.sh" -exec chmod +x {} \; || true
+    apply_lk_patches
 }
 
 echo "==> [1/3] Ensuring arm-none-eabi toolchain + qemu-system-arm ..."
 ensure_toolchain
-echo "==> [2/3] Cloning/checking out upstream LK ..."
+echo "==> [2/3] Cloning/updating upstream LK (latest, no pin) ..."
 clone_lk
 echo "==> [3/3] Applying profiler overlay ..."
 apply_overlay

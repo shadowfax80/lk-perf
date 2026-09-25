@@ -1,0 +1,29 @@
+diff --git a/dev/interrupt/arm_gic/gic_v2.c b/dev/interrupt/arm_gic/gic_v2.c
+index b72a88ae..3879f917 100644
+--- a/dev/interrupt/arm_gic/gic_v2.c
++++ b/dev/interrupt/arm_gic/gic_v2.c
+@@ -133,6 +133,15 @@ status_t arm_gicv2_sgi(u_int irq, u_int flags, u_int cpu_mask) {
+     return NO_ERROR;
+ }
+ 
++// lk-perf hook: the generic register_int_handler() callback signature is
++// (void *arg) only -- no access to the interrupted register state. A
++// sampling profiler needs the interrupted PC, which is only available here,
++// where `frame` is still in scope. Weak default costs one cheap call (very
++// likely inlined to nothing) when app/profiler isn't linked in; the real
++// implementation overrides this and does its own vector check internally,
++// so no other IRQ's dispatch is affected.
++__WEAK void profiler_on_tick(struct iframe *frame, unsigned int vector) {}
++
+ enum handler_return arm_gicv2_platform_irq(struct iframe *frame) {
+     // get the current vector
+     uint32_t iar = GICCREG_READ(0, GICC_PRIMARY_IAR);
+@@ -143,6 +152,8 @@ enum handler_return arm_gicv2_platform_irq(struct iframe *frame) {
+         return INT_NO_RESCHEDULE;
+     }
+ 
++    profiler_on_tick(frame, vector);
++
+     THREAD_STATS_INC(interrupts);
+     KEVLOG_IRQ_ENTER(vector);
+ 

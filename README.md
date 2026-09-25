@@ -29,13 +29,17 @@ At the LK shell: `profiler` (stage 0 — proves the pipeline; no sampling yet).
 ## Layout
 
 ```
-LK_PIN               pinned littlekernel/lk commit
-setup.sh             toolchain install + LK clone/pin + overlay apply
-app/profiler/         the profiler LK module (grows through the staged plan)
-project/profiler.mk   LK project file (app/shell + app/profiler on qemu-virt-arm32)
-docs/DESIGN.md        full design: constraints, staged plan, SMP bookkeeping
-scripts/              host-side tooling (symbolizer, offline unwinder, flamegraph glue) — TODO
+setup.sh              toolchain install + LK clone (latest, no pin) + overlay apply
+overlay/lk/*.patch     small, additive core-LK patches (e.g. the GIC tick hook)
+app/profiler/          the profiler LK module (grows through the staged plan)
+project/profiler.mk    LK project file (app/shell + app/profiler on qemu-virt-arm32)
+docs/DESIGN.md         full design: constraints, staged plan, SMP bookkeeping
+scripts/               host-side tooling (symbolizer, offline unwinder, flamegraph glue)
 ```
+
+LK is **not pinned** — deliberately tracks upstream `littlekernel/lk`'s
+current default-branch tip on every `setup.sh` run. `setup.sh` prints the
+resolved commit each time for traceability, but doesn't enforce it.
 
 ## Status
 
