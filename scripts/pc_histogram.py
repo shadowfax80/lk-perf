@@ -192,18 +192,24 @@ def main() -> int:
         "--bench-iters",
         type=int,
         default=20000000,
-        help="iters/function passed to the on-target 'profiler bench' command",
+        help="iters/function passed to the on-target 'profiler bench'/'nest' command",
     )
     ap.add_argument("--bench-timeout", type=float, default=60.0)
+    ap.add_argument(
+        "--nest",
+        action="store_true",
+        help="drive 'profiler nest' (3-level call chain) instead of 'profiler bench'",
+    )
     args = ap.parse_args()
 
     buf_size = 4096  # PROFILER_BUF_SIZE -- keep in sync with profiler.c
     head_addr = nm_symbol_addr(args.nm, args.elf, "profiler_head")
     total_addr = nm_symbol_addr(args.nm, args.elf, "profiler_total")
     buf_addr = nm_symbol_addr(args.nm, args.elf, "profiler_pc_buf")
+    lr_buf_addr = nm_symbol_addr(args.nm, args.elf, "profiler_lr_buf")
     print(
-        f"profiler_pc_buf @ 0x{buf_addr:x}  profiler_head @ 0x{head_addr:x}  "
-        f"profiler_total @ 0x{total_addr:x}",
+        f"profiler_pc_buf @ 0x{buf_addr:x}  profiler_lr_buf @ 0x{lr_buf_addr:x}  "
+        f"profiler_head @ 0x{head_addr:x}  profiler_total @ 0x{total_addr:x}",
         file=sys.stderr,
     )
 
@@ -243,10 +249,11 @@ def main() -> int:
         console.send("profiler start")
         time.sleep(0.3)
         before = len(console.snapshot())
-        console.send(f"profiler bench {args.bench_iters}")
-        if not console.wait_for("bench done", args.bench_timeout):
+        sub = "nest" if args.nest else "bench"
+        console.send(f"profiler {sub} {args.bench_iters}")
+        if not console.wait_for(f"{sub} done", args.bench_timeout):
             print(console.snapshot()[before:], file=sys.stderr)
-            sys.exit("error: 'profiler bench' never reported done")
+            sys.exit(f"error: 'profiler {sub}' never reported done")
         console.send("profiler stop")
         time.sleep(0.3)
         console.send("profiler status")
@@ -263,7 +270,9 @@ def main() -> int:
 
         n = min(total, buf_size)
         buf_bytes = qmp_read_mem(qmp, buf_addr, buf_size * 4, tmp, "buf")
+        lr_bytes = qmp_read_mem(qmp, lr_buf_addr, buf_size * 4, tmp, "lr_buf")
         pcs = list(struct.unpack(f"<{buf_size}I", buf_bytes))[:n]
+        lrs = list(struct.unpack(f"<{buf_size}I", lr_bytes))[:n]
     finally:
         qemu.terminate()
         try:
@@ -273,15 +282,25 @@ def main() -> int:
 
     syms = find_symbol_table(args.elf, args.nm)
     hist: dict[str, int] = {}
-    for pc in pcs:
+    callers: dict[str, dict[str, int]] = {}
+    for pc, lr in zip(pcs, lrs):
         name = symbolize(pc, syms)
         hist[name] = hist.get(name, 0) + 1
+        # LR is a caller's return address (post-call instruction), not the
+        # call site itself, and isn't ground truth once `name` has made its
+        # own calls (AAPCS lets it reuse LR as scratch) -- an approximate,
+        # cheap upgrade over Stage 1, not a real stack (see docs/DESIGN.md).
+        caller = symbolize(lr, syms)
+        callers.setdefault(name, {})
+        callers[name][caller] = callers[name].get(caller, 0) + 1
 
     print(f"\n{'samples':>8}  {'%':>6}  function")
     print("-" * 50)
     for name, count in sorted(hist.items(), key=lambda kv: -kv[1]):
         pct = 100.0 * count / n
         print(f"{count:>8}  {pct:>5.1f}%  {name}")
+        for caller, ccount in sorted(callers[name].items(), key=lambda kv: -kv[1]):
+            print(f"{'':>8}  {'':>6}    <- {caller}  ({ccount}/{count})")
 
     return 0
 

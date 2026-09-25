@@ -1,12 +1,21 @@
 /*
  * Bare-metal statistical sampling profiler for LK, AArch32.
  *
- * Stage 1: PC-only histogram. A periodic timer IRQ samples the interrupted
- * PC into a ring buffer; the host reads the buffer out over QMP and
- * symbolizes it into a flat self-time histogram. See docs/DESIGN.md for
- * why this is a flat histogram, not a flame graph -- a bare PC carries no
- * calling-context information, so stages 2/3 (PC+LR, then frame-pointer
- * offline unwind) are what get you an actual call stack.
+ * Stage 2: PC+LR histogram. A periodic timer IRQ samples the interrupted
+ * PC and LR into parallel ring buffers; the host symbolizes both and
+ * reports self time plus a best-effort immediate-caller breakdown. LR is
+ * free to capture (already in the exception frame) but is not ground
+ * truth -- AAPCS lets a function reuse LR as scratch once it has made its
+ * own calls, so treat this as a cheap, imperfect upgrade over Stage 1's
+ * flat histogram, not a real call stack. Empirically confirmed, not just
+ * theoretical: profiler_workload_inner (a leaf, no calls at all) gets
+ * compiled at -O2 as `str.w lr,[sp,#-4]!` / `movw/movt lr,#0x9e3779b9` --
+ * GCC spills the real return address to the stack and reuses the lr
+ * *register* as a scratch temp for the loop body's whole duration purely
+ * because the loop needs two live 32-bit immediates and register
+ * pressure is high. Sampling mid-loop reads that immediate, not a
+ * caller. Stage 3 (frame-pointer offline unwind) is what gets an actual
+ * call chain.
  *
  * The sample source is dev/interrupt/arm_gic/gic_v2.c's profiler_on_tick()
  * hook (overlay/lk/0001-add-profiler-tick-hook.patch) -- the only place the
@@ -42,8 +51,11 @@
 
 // Plain external linkage, no custom linker section: the host finds these
 // by ordinary ELF symbol lookup (arm-none-eabi-nm), the same way earlier
-// project work found bolt_bench's counters.
+// project work found bolt_bench's counters. Parallel arrays (not a struct
+// array) so the host can nm-locate and size each column independently
+// without computing struct-layout/padding offsets itself.
 uint32_t profiler_pc_buf[PROFILER_BUF_SIZE];
+uint32_t profiler_lr_buf[PROFILER_BUF_SIZE];
 volatile uint32_t profiler_head;
 volatile uint32_t profiler_total;
 volatile uint32_t profiler_enabled;
@@ -60,6 +72,7 @@ void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
 
     uint32_t idx = profiler_head;
     profiler_pc_buf[idx] = frame->pc;
+    profiler_lr_buf[idx] = frame->lr;
     profiler_head = (idx + 1) % PROFILER_BUF_SIZE;
     profiler_total++;
 }
@@ -86,9 +99,28 @@ __NO_INLINE static void profiler_workload_b(uint32_t iters) {
     profiler_sink = acc;
 }
 
+// Three-level call chain purely to give Stage 3's offline FP-chain
+// unwinder something with real depth to reconstruct -- workload_a/b above
+// are both leaves, useless for testing call-stack recovery.
+__NO_INLINE static void profiler_workload_inner(uint32_t iters) {
+    uint32_t acc = 0;
+    for (uint32_t i = 0; i < iters; i++) {
+        acc += (i ^ 0x9e3779b9u) * 2246822519u;  // xxhash-ish mix, arbitrary busy work
+    }
+    profiler_sink = acc;
+}
+
+__NO_INLINE static void profiler_workload_mid(uint32_t iters) {
+    profiler_workload_inner(iters);
+}
+
+__NO_INLINE static void profiler_workload_outer(uint32_t iters) {
+    profiler_workload_mid(iters);
+}
+
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
-        printf("usage: profiler <start|stop|status|clear|bench>\n");
+        printf("usage: profiler <start|stop|status|clear|bench|nest>\n");
         return -1;
     }
 
@@ -106,6 +138,7 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         profiler_head = 0;
         profiler_total = 0;
         memset(profiler_pc_buf, 0, sizeof(profiler_pc_buf));
+        memset(profiler_lr_buf, 0, sizeof(profiler_lr_buf));
         printf("profiler: buffer cleared\n");
     } else if (!strcmp(sub, "bench")) {
         uint32_t iters = argc >= 3 ? (uint32_t)argv[2].u : 20000000;
@@ -115,6 +148,12 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
             profiler_workload_b(iters);
         }
         printf("profiler: bench done (sink=%u, ignore -- just prevents dead-code elim)\n",
+               profiler_sink);
+    } else if (!strcmp(sub, "nest")) {
+        uint32_t iters = argc >= 3 ? (uint32_t)argv[2].u : 20000000;
+        printf("profiler: running nested-call workload (%u iters) ...\n", iters);
+        profiler_workload_outer(iters);
+        printf("profiler: nest done (sink=%u, ignore -- just prevents dead-code elim)\n",
                profiler_sink);
     } else if (!strcmp(sub, "status")) {
         printf("profiler: enabled=%u total_samples=%u head=%u capacity=%d%s\n",
