@@ -28,7 +28,19 @@ clone_lk() {
         git clone -q https://github.com/littlekernel/lk.git "$LK_DIR"
     else
         echo "Pulling latest littlekernel/lk into $LK_DIR ..."
-        git -C "$LK_DIR" checkout -q -- . 2>/dev/null || true
+        # git reset --hard, not `checkout -- .`: the latter restores
+        # tracked files from the INDEX, not HEAD, and silently does the
+        # wrong thing if anything was ever `git add`ed without a
+        # following commit (real bug found and fixed during this
+        # project's own development -- a stray staged file left
+        # apply_lk_patches() re-applying patches on top of a
+        # half-applied baseline instead of pristine HEAD). Deliberately
+        # NOT `git clean -fd` alongside it: that would also delete the
+        # untracked app/profiler/ and project/profiler.mk overlay files
+        # apply_overlay() is about to re-copy anyway, and (more
+        # importantly) build-profiler/ output, forcing a needless full
+        # rebuild on every setup.sh re-run for no correctness benefit.
+        git -C "$LK_DIR" reset -q --hard HEAD 2>/dev/null || true
         git -C "$LK_DIR" pull -q --ff-only
     fi
     echo "LK at: $(git -C "$LK_DIR" rev-parse --short HEAD) ($(git -C "$LK_DIR" log -1 --format=%s))"
@@ -57,15 +69,34 @@ apply_overlay() {
     apply_lk_patches
 }
 
-echo "==> [1/3] Ensuring arm-none-eabi toolchain + qemu-system-arm ..."
+# Fetched, not vendored -- same policy as LK itself (cloned fresh, not
+# committed into this repo). Single standalone script, no build step,
+# verified end-to-end against this project's own .folded output
+# (real function names render as distinct SVG frames, exit 0).
+ensure_flamegraph() {
+    local dest="$ROOT/scripts/flamegraph.pl"
+    if [ -e "$dest" ]; then
+        echo "scripts/flamegraph.pl already present"
+        return 0
+    fi
+    echo "Fetching flamegraph.pl (brendangregg/FlameGraph) ..."
+    curl -sL -o "$dest" \
+        https://raw.githubusercontent.com/brendangregg/FlameGraph/master/flamegraph.pl
+}
+
+echo "==> [1/4] Ensuring arm-none-eabi toolchain + qemu-system-arm ..."
 ensure_toolchain
-echo "==> [2/3] Cloning/updating upstream LK (latest, no pin) ..."
+echo "==> [2/4] Cloning/updating upstream LK (latest, no pin) ..."
 clone_lk
-echo "==> [3/3] Applying profiler overlay ..."
+echo "==> [3/4] Applying profiler overlay ..."
 apply_overlay
+echo "==> [4/4] Ensuring flamegraph.pl ..."
+ensure_flamegraph
 
 echo ""
 echo "Toolchain:     $(command -v arm-none-eabi-gcc)"
 echo "LK tree ready: $LK_DIR"
 echo "Build:  cd $LK_DIR && make profiler -j\$(nproc)"
 echo "Boot:   qemu-system-arm -machine virt -cpu cortex-a15 -smp 1 -m 512 -nographic -kernel $LK_DIR/build-profiler/lk.elf"
+echo "Profile+unwind: python3 scripts/pc_histogram.py --elf \$LK_DIR/build-profiler/lk.elf"
+echo "Render flame graph: perl scripts/flamegraph.pl \$LK_DIR/build-profiler/lk.folded > flame.svg"

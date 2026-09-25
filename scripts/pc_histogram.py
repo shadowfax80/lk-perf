@@ -466,7 +466,12 @@ def main() -> int:
     with open(merged_path, "w") as fh:
         for key, count in sorted(folded_merged.items(), key=lambda kv: -kv[1]):
             fh.write(f"{key} {count}\n")
-    print(f"\nmerged folded-stack output (FlameGraph-compatible): {merged_path}", file=sys.stderr)
+    print(f"\nmerged folded-stack output: {merged_path}", file=sys.stderr)
+    print(
+        f"render: perl scripts/flamegraph.pl {merged_path} > "
+        f"{os.path.splitext(merged_path)[0]}.svg",
+        file=sys.stderr,
+    )
 
     for cpu in range(num_cpus):
         if not folded_per_cpu[cpu]:
