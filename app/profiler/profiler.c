@@ -1,21 +1,21 @@
 /*
  * Bare-metal statistical sampling profiler for LK, AArch32.
  *
- * Stage 2: PC+LR histogram. A periodic timer IRQ samples the interrupted
- * PC and LR into parallel ring buffers; the host symbolizes both and
- * reports self time plus a best-effort immediate-caller breakdown. LR is
- * free to capture (already in the exception frame) but is not ground
- * truth -- AAPCS lets a function reuse LR as scratch once it has made its
- * own calls, so treat this as a cheap, imperfect upgrade over Stage 1's
- * flat histogram, not a real call stack. Empirically confirmed, not just
- * theoretical: profiler_workload_inner (a leaf, no calls at all) gets
- * compiled at -O2 as `str.w lr,[sp,#-4]!` / `movw/movt lr,#0x9e3779b9` --
- * GCC spills the real return address to the stack and reuses the lr
- * *register* as a scratch temp for the loop body's whole duration purely
- * because the loop needs two live 32-bit immediates and register
- * pressure is high. Sampling mid-loop reads that immediate, not a
- * caller. Stage 3 (frame-pointer offline unwind) is what gets an actual
- * call chain.
+ * Stage 3: frame-pointer offline unwind. Adds an FP capture (r7 in Thumb
+ * state, r11 in ARM state, picked per-sample from the interrupted SPSR's
+ * T-bit) to Stage 2's PC+LR. The FP register itself is NOT saved by the
+ * generic IRQ entry path (arch/arm/arm/exceptions.S's `save` macro only
+ * touches r0-r3/r12/lr/sp) so overlay/lk/0002-capture-interrupted-fp.patch
+ * stashes r7/r11 into two always-present core-LK globals right at IRQ
+ * entry, before any C code can repurpose them. The host walks the FP
+ * chain offline from a QMP memory dump: this build is compiled with
+ * -fno-omit-frame-pointer (project/profiler.mk), and empirically (via
+ * objdump, not assumed) GCC's Thumb prologue for that flag is
+ * `strd r7,lr,[sp,#-8]!` / `add r7,sp,#0` -- so at any live fp,
+ * [fp+0]=caller's saved fp and [fp+4]=the *stack-saved* return address,
+ * which is reliable where Stage 2's live-register LR read was not (see
+ * that stage's own comment: GCC happily reuses the live lr register as
+ * scratch mid-function; it can't touch the copy it already pushed).
  *
  * The sample source is dev/interrupt/arm_gic/gic_v2.c's profiler_on_tick()
  * hook (overlay/lk/0001-add-profiler-tick-hook.patch) -- the only place the
@@ -49,6 +49,18 @@
 
 #define PROFILER_BUF_SIZE 4096
 
+// SPSR T-bit (Thumb state) -- CPSR/SPSR bit 5, per the ARM architecture
+// reference manual. Picks which of profiler_fp_r7/profiler_fp_r11 was the
+// interrupted code's actual frame-pointer register.
+#define PROFILER_SPSR_T_BIT (1u << 5)
+
+// Defined in arch/arm/arm/exceptions.S by
+// overlay/lk/0002-capture-interrupted-fp.patch -- always present in core
+// LK (not app/profiler-owned), so linking without app/profiler still
+// works; these just sit unread.
+extern uint32_t profiler_fp_r7;
+extern uint32_t profiler_fp_r11;
+
 // Plain external linkage, no custom linker section: the host finds these
 // by ordinary ELF symbol lookup (arm-none-eabi-nm), the same way earlier
 // project work found bolt_bench's counters. Parallel arrays (not a struct
@@ -56,6 +68,7 @@
 // without computing struct-layout/padding offsets itself.
 uint32_t profiler_pc_buf[PROFILER_BUF_SIZE];
 uint32_t profiler_lr_buf[PROFILER_BUF_SIZE];
+uint32_t profiler_fp_buf[PROFILER_BUF_SIZE];
 volatile uint32_t profiler_head;
 volatile uint32_t profiler_total;
 volatile uint32_t profiler_enabled;
@@ -70,9 +83,12 @@ void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
         return;
     }
 
+    bool thumb = (frame->spsr & PROFILER_SPSR_T_BIT) != 0;
+
     uint32_t idx = profiler_head;
     profiler_pc_buf[idx] = frame->pc;
     profiler_lr_buf[idx] = frame->lr;
+    profiler_fp_buf[idx] = thumb ? profiler_fp_r7 : profiler_fp_r11;
     profiler_head = (idx + 1) % PROFILER_BUF_SIZE;
     profiler_total++;
 }
@@ -120,7 +136,7 @@ __NO_INLINE static void profiler_workload_outer(uint32_t iters) {
 
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
-        printf("usage: profiler <start|stop|status|clear|bench|nest>\n");
+        printf("usage: profiler <start|stop|status|clear|bench|nest|fpcheck>\n");
         return -1;
     }
 
@@ -139,6 +155,7 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         profiler_total = 0;
         memset(profiler_pc_buf, 0, sizeof(profiler_pc_buf));
         memset(profiler_lr_buf, 0, sizeof(profiler_lr_buf));
+        memset(profiler_fp_buf, 0, sizeof(profiler_fp_buf));
         printf("profiler: buffer cleared\n");
     } else if (!strcmp(sub, "bench")) {
         uint32_t iters = argc >= 3 ? (uint32_t)argv[2].u : 20000000;
@@ -155,6 +172,26 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         profiler_workload_outer(iters);
         printf("profiler: nest done (sink=%u, ignore -- just prevents dead-code elim)\n",
                profiler_sink);
+    } else if (!strcmp(sub, "fpcheck")) {
+        // Diagnostic: dereference the ring buffer's OWN last-recorded fp
+        // directly on target, no QMP involved. Deliberately NOT
+        // profiler_fp_r7/r11 directly -- those are continuously
+        // overwritten on every tick regardless of profiler_enabled, so by
+        // the time a shell command reads them they reflect whatever last
+        // interrupted the *idle* shell loop, not the sample actually
+        // stored in profiler_fp_buf[] while the workload ran.
+        if (profiler_total == 0) {
+            printf("fpcheck: no samples yet\n");
+        } else {
+            uint32_t idx = (profiler_head + PROFILER_BUF_SIZE - 1) % PROFILER_BUF_SIZE;
+            uint32_t pc = profiler_pc_buf[idx];
+            uint32_t fp = profiler_fp_buf[idx];
+            printf("fpcheck: last sample idx=%u pc=0x%08x fp=0x%08x\n", idx, pc, fp);
+            if (fp >= 0x1000) {
+                volatile uint32_t *p = (volatile uint32_t *)fp;
+                printf("*(fp+0)=0x%08x *(fp+4)=0x%08x\n", p[0], p[1]);
+            }
+        }
     } else if (!strcmp(sub, "status")) {
         printf("profiler: enabled=%u total_samples=%u head=%u capacity=%d%s\n",
                profiler_enabled, profiler_total, profiler_head, PROFILER_BUF_SIZE,

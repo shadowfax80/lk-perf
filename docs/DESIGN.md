@@ -59,16 +59,50 @@ Each stage is independently useful; don't skip ahead.
    treat this as a cheap, imperfect upgrade, not ground truth.
 3. **Frame-pointer-chain offline unwind — the real target for flame
    graphs**, now that EHABI is ruled out. Build the profiled image with
-   `-fno-omit-frame-pointer`. ISR still only latches PC/SP/LR (kept
-   minimal, same discipline as bolt-aarch32's counter-bump-stub atomicity
-   lessons). All unwinding happens **offline on the host**: given a QMP
-   memory dump, walk the FP chain by reading two words at a fixed offset
-   per frame, repeat until FP is zero/out of range. Must check ARM-vs-Thumb
-   mode per frame (r7 in Thumb, r11 in ARM per AAPCS) — reuses the same
-   `$a`/`$t` mapping-symbol logic already implemented in
-   `fix-kernel-elf-sections.py` (bolt-aarch32). Simpler to implement than
-   an EHABI bytecode interpreter would have been; the cost moved to one
-   deliberate, bounded build-flag tradeoff instead.
+   `-fno-omit-frame-pointer`. The ISR latches PC/LR (Stage 2) plus FP (r7
+   in Thumb, r11 in ARM, picked per-sample from the interrupted SPSR's
+   T-bit) via a small additive exceptions.S patch, since the generic IRQ
+   entry path doesn't save r4-r11 at all. All unwinding happens
+   **offline on the host**: given a QMP memory dump, walk the FP chain by
+   reading two words at a fixed offset per frame ([fp+0]=caller's saved
+   fp, [fp+4]=saved return address, confirmed via objdump against this
+   toolchain's actual Thumb `-fno-omit-frame-pointer` prologue, not
+   assumed), repeat until FP is non-increasing or the candidate return
+   address falls outside the ELF's own `.text` range. That range check is
+   load-bearing, not defensive fluff: not every such frame has a valid
+   `[fp+4]` slot at all -- GCC only spills `{fp, lr}` as a pair when it
+   actually needs to (a real call to preserve lr across, or register
+   pressure in an otherwise-leaf loop); a pure leaf with neither keeps lr
+   live and returns via `bx lr` instead, pushing `{fp}` alone, so
+   `[fp+4]` there is unrelated stack content, not a return address --
+   confirmed via objdump on this project's own two-leaf-function bench
+   workload. Implemented Stage 2's LR read as the fallback for exactly
+   this case, not a redundant leftover.
+
+   **The harder, more general finding**: the stack memory this walk reads
+   must still belong to a call chain that hasn't returned yet. Once the
+   sampled function returns -- which, for a short synthetic test
+   workload, is typically well before its own "done" print is even
+   visible to the host, since the *next* function called (here, printf,
+   built with the same frame-pointer flag) immediately reuses that exact
+   stack slot for its own frame -- the recorded fp still points at real
+   memory, but that memory's *content* is gone, silently, synchronously,
+   inside the guest, before any host-side reaction (even `qmp stop`
+   issued the instant a completion marker is observed) can beat it.
+   Verified two ways: on-target, `printf`-based readback of the same
+   address (going through the exact same shell round-trip) can look
+   completely plausible -- another real function's own frame just
+   happens to be there -- so a sane-looking result is not by itself proof
+   of a correct one. The robust fix, and the one this project's own host
+   tooling now uses: don't wait for a completion marker before dumping
+   memory at all. Poll a stable, ever-increasing BSS counter
+   (`profiler_total`, safe to read via QMP while the guest keeps running,
+   unlike reused stack memory) until enough samples exist, then pause the
+   whole VM via QMP `stop` while the sampled call chain is still
+   genuinely live. This generalizes beyond this test harness: any
+   profiling session that reads a walk target's stack after that target
+   has already moved on needs the same discipline, not just this repo's
+   verification script.
 4. **SMP.** See below — mostly bookkeeping around stages 1-3, not new
    unwind logic.
 5. **(Later, real hardware only) PMU-event-triggered sampling** instead of

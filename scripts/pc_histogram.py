@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Stage 1: boot lk-perf under QEMU, drive the profiler shell command over
-the serial console, dump the PC-sample ring buffer over QMP, and
-symbolize it into a flat self-time histogram.
-
-This is deliberately NOT a flame graph -- a bare PC sample carries no
-calling-context information (see docs/DESIGN.md). It's a function-level
-"where does time go" breakdown, and a sanity check that the sampling
-pipeline captures real, varying PCs rather than a stuck constant.
+"""Boot lk-perf under QEMU, drive the profiler shell command over the
+serial console, dump the sample ring buffers over QMP, and produce both
+a flat self-time histogram (Stage 1) and, per sample, an offline
+frame-pointer-chain call stack (Stage 3) -- collapsed-stack output
+compatible with standard FlameGraph tooling.
 
 Two things reused directly from bolt-aarch32's dump-bolt-counters.py,
 proven working there many times:
@@ -20,6 +17,17 @@ subprocess's own stdin/stdout as pipes, so this script can *type* shell
 commands (start/bench/stop) the same way the Stage 0 verification did
 manually via a bash `(sleep; printf ...) | qemu-system-arm` pipe -- this
 is that same technique, driven from Python instead.
+
+The FP-chain walk reads two words at each frame's fp (Thumb: r7,
+ARM: r11 -- picked per-sample from the interrupted SPSR's T-bit, see
+profiler.c): [fp+0]=caller's saved fp, [fp+4]=the *stack-saved* return
+address (reliable, unlike Stage 2's live-LR read -- see profiler.c's own
+comment on why GCC can repurpose live lr as scratch mid-function but
+can't touch the copy it already pushed to the stack). Walk stops on a
+non-increasing fp (stacks grow down, so a legitimate caller frame is
+always at a higher address than its callee) -- a cheap, dependency-free
+corruption/cycle guard that doesn't need to know the stack's actual
+address range.
 
 Usage:
     python3 pc_histogram.py --elf build/lk/build-profiler/lk.elf \
@@ -128,6 +136,46 @@ class Qmp:
         )
 
 
+def walk_fp_chain(
+    qmp: Qmp,
+    fp: int,
+    tmp_dir: str,
+    text_lo: int,
+    text_hi: int,
+    max_depth: int = 12,
+) -> list[int]:
+    """Return caller return addresses, immediate caller first, by walking
+    the FP chain (see module docstring for the frame layout and the
+    non-increasing-fp stop condition).
+
+    Not every -fno-omit-frame-pointer frame has a [fp+4] return-address
+    slot: GCC only spills {fp, lr} as a pair when it actually needs to
+    (a real call to preserve lr across, or -- empirically confirmed via
+    objdump, not assumed -- register pressure in an otherwise-leaf loop).
+    A pure leaf with no such pressure pushes {fp} alone and returns via
+    the still-live lr register instead, so [fp+4] there is unrelated
+    stack content, not a return address. Without unwind-table metadata
+    (deliberately not available here -- see docs/DESIGN.md) there's no
+    way to know which kind of frame this is from fp alone, so this
+    validates [fp+4] against the ELF's actual .text range before
+    trusting it and stops the walk rather than fabricate a frame."""
+    frames: list[int] = []
+    seen: set[int] = set()
+    depth = 0
+    while fp and (fp & 3) == 0 and depth < max_depth and fp not in seen:
+        seen.add(fp)
+        blob = qmp_read_mem(qmp, fp, 8, tmp_dir, f"fpwalk_{depth}_{fp:x}")
+        saved_fp, ret_addr = struct.unpack("<II", blob)
+        if not (text_lo <= (ret_addr & ~1) <= text_hi):
+            break
+        frames.append(ret_addr)
+        if saved_fp <= fp:
+            break
+        fp = saved_fp
+        depth += 1
+    return frames
+
+
 def qmp_read_mem(qmp: Qmp, addr: int, size: int, tmp_dir: str, tag: str) -> bytes:
     """memsave (virtual, via CPU0's translation) with pmemsave (physical)
     fallback -- same two-step dump-bolt-counters.py already relies on."""
@@ -207,9 +255,11 @@ def main() -> int:
     total_addr = nm_symbol_addr(args.nm, args.elf, "profiler_total")
     buf_addr = nm_symbol_addr(args.nm, args.elf, "profiler_pc_buf")
     lr_buf_addr = nm_symbol_addr(args.nm, args.elf, "profiler_lr_buf")
+    fp_buf_addr = nm_symbol_addr(args.nm, args.elf, "profiler_fp_buf")
     print(
         f"profiler_pc_buf @ 0x{buf_addr:x}  profiler_lr_buf @ 0x{lr_buf_addr:x}  "
-        f"profiler_head @ 0x{head_addr:x}  profiler_total @ 0x{total_addr:x}",
+        f"profiler_fp_buf @ 0x{fp_buf_addr:x}  profiler_head @ 0x{head_addr:x}  "
+        f"profiler_total @ 0x{total_addr:x}",
         file=sys.stderr,
     )
 
@@ -251,28 +301,56 @@ def main() -> int:
         before = len(console.snapshot())
         sub = "nest" if args.nest else "bench"
         console.send(f"profiler {sub} {args.bench_iters}")
-        if not console.wait_for(f"{sub} done", args.bench_timeout):
-            print(console.snapshot()[before:], file=sys.stderr)
-            sys.exit(f"error: 'profiler {sub}' never reported done")
-        console.send("profiler stop")
-        time.sleep(0.3)
-        console.send("profiler status")
-        time.sleep(0.3)
-        print(console.snapshot()[before:], file=sys.stderr)
 
-        total_bytes = qmp_read_mem(qmp, total_addr, 4, tmp, "total")
+        # Deliberately do NOT wait for '{sub} done' before reading memory.
+        # By the time that text is even visible, the sampled function has
+        # already returned -- profiler_workload_inner's own epilogue pops
+        # its {fp, lr} pair the instant profiler_workload_outer() returns,
+        # and the *following* printf call (same -fno-omit-frame-pointer
+        # build) immediately reuses that exact stack slot for its own
+        # frame, synchronously inside the guest, before any host-side
+        # reaction -- however fast -- is possible. Empirically confirmed:
+        # even qmp.execute("stop") issued the instant 'done' was detected
+        # still read zeros there. Instead poll the ever-increasing
+        # profiler_total counter (a stable BSS word, not reused stack
+        # memory, safe to read while running) until enough samples exist,
+        # then pause via QMP mid-workload, while the sampled call chain's
+        # stack frames are still genuinely live. This is what makes the
+        # captured fp values point at memory the walk can still trust.
+        min_samples = 8
+        deadline = time.time() + args.bench_timeout
+        total = 0
+        while time.time() < deadline:
+            total_bytes = qmp_read_mem(qmp, total_addr, 4, tmp, "poll_total")
+            total = struct.unpack("<I", total_bytes)[0]
+            if total >= min_samples:
+                break
+            time.sleep(0.05)
+        qmp.execute("stop")
+        print(f"paused mid-workload after {total} samples", file=sys.stderr)
+        if total == 0:
+            print(console.snapshot()[before:], file=sys.stderr)
+            sys.exit("error: zero samples captured before pause -- sampling pipeline did not fire")
+
         head_bytes = qmp_read_mem(qmp, head_addr, 4, tmp, "head")
+        total_bytes = qmp_read_mem(qmp, total_addr, 4, tmp, "total")
         total = struct.unpack("<I", total_bytes)[0]
         head = struct.unpack("<I", head_bytes)[0]
         print(f"total samples: {total}  head: {head}", file=sys.stderr)
-        if total == 0:
-            sys.exit("error: zero samples captured -- sampling pipeline did not fire")
 
         n = min(total, buf_size)
         buf_bytes = qmp_read_mem(qmp, buf_addr, buf_size * 4, tmp, "buf")
         lr_bytes = qmp_read_mem(qmp, lr_buf_addr, buf_size * 4, tmp, "lr_buf")
+        fp_bytes = qmp_read_mem(qmp, fp_buf_addr, buf_size * 4, tmp, "fp_buf")
         pcs = list(struct.unpack(f"<{buf_size}I", buf_bytes))[:n]
         lrs = list(struct.unpack(f"<{buf_size}I", lr_bytes))[:n]
+        fps = list(struct.unpack(f"<{buf_size}I", fp_bytes))[:n]
+
+        syms = find_symbol_table(args.elf, args.nm)
+        text_lo, text_hi = syms[0][0] & ~1, syms[-1][0] & ~1
+
+        print(f"walking FP chains for {n} samples ...", file=sys.stderr)
+        stacks = [walk_fp_chain(qmp, fp, tmp, text_lo, text_hi) for fp in fps]
     finally:
         qemu.terminate()
         try:
@@ -280,10 +358,11 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             qemu.kill()
 
-    syms = find_symbol_table(args.elf, args.nm)
     hist: dict[str, int] = {}
     callers: dict[str, dict[str, int]] = {}
-    for pc, lr in zip(pcs, lrs):
+    folded: dict[str, int] = {}
+    depths: list[int] = []
+    for pc, lr, frames in zip(pcs, lrs, stacks):
         name = symbolize(pc, syms)
         hist[name] = hist.get(name, 0) + 1
         # LR is a caller's return address (post-call instruction), not the
@@ -294,6 +373,13 @@ def main() -> int:
         callers.setdefault(name, {})
         callers[name][caller] = callers[name].get(caller, 0) + 1
 
+        # Real call stack (Stage 3): outermost caller first, sample's own
+        # PC last -- standard folded-stack order for FlameGraph tooling.
+        stack_syms = [symbolize(addr, syms) for addr in reversed(frames)] + [name]
+        key = ";".join(stack_syms)
+        folded[key] = folded.get(key, 0) + 1
+        depths.append(len(stack_syms))
+
     print(f"\n{'samples':>8}  {'%':>6}  function")
     print("-" * 50)
     for name, count in sorted(hist.items(), key=lambda kv: -kv[1]):
@@ -301,6 +387,23 @@ def main() -> int:
         print(f"{count:>8}  {pct:>5.1f}%  {name}")
         for caller, ccount in sorted(callers[name].items(), key=lambda kv: -kv[1]):
             print(f"{'':>8}  {'':>6}    <- {caller}  ({ccount}/{count})")
+
+    avg_depth = sum(depths) / len(depths) if depths else 0.0
+    print(
+        f"\nFP-chain unwind: {n} samples, avg stack depth {avg_depth:.1f} frames "
+        f"(1 = leaf-only, chain didn't extend)",
+        file=sys.stderr,
+    )
+    print(f"\n{'samples':>8}  call stack (outermost -> innermost, folded)")
+    print("-" * 70)
+    for key, count in sorted(folded.items(), key=lambda kv: -kv[1]):
+        print(f"{count:>8}  {key}")
+
+    folded_path = os.path.splitext(args.elf)[0] + ".folded"
+    with open(folded_path, "w") as fh:
+        for key, count in sorted(folded.items(), key=lambda kv: -kv[1]):
+            fh.write(f"{key} {count}\n")
+    print(f"\nfolded-stack output (FlameGraph-compatible): {folded_path}", file=sys.stderr)
 
     return 0
 

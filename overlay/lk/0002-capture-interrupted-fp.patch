@@ -1,0 +1,31 @@
+diff --git a/arch/arm/arm/exceptions.S b/arch/arm/arm/exceptions.S
+index 74ee3a7c..d0ccf605 100644
+--- a/arch/arm/arm/exceptions.S
++++ b/arch/arm/arm/exceptions.S
+@@ -204,6 +204,17 @@ FUNCTION(arm_irq)
+ 
+     /* r0 now holds pointer to iframe */
+ 
++    /* lk-perf: stash the interrupted r7/r11 (Thumb/ARM frame-pointer
++     * candidates) for the offline FP-chain unwinder -- 'save' above only
++     * touches r0-r3/r12/lr/sp, so r7/r11 here are still exactly what the
++     * interrupted code left them as. Always-present core-LK globals (not
++     * app/profiler-owned) so this costs 4 cheap instructions on every IRQ
++     * regardless of whether app/profiler is linked in. */
++    LOADCONST(r2, profiler_fp_r7)
++    str     r7, [r2]
++    LOADCONST(r2, profiler_fp_r11)
++    str     r11, [r2]
++
+     /* track that we're inside an irq handler */
+     LOADCONST(r2, __arm_in_handler)
+     mov     r1, #1
+@@ -241,3 +252,8 @@ DATA(__irq_cycle_count)
+ .data
+ DATA(__arm_in_handler)
+     .word   0
++
++DATA(profiler_fp_r7)
++    .word   0
++DATA(profiler_fp_r11)
++    .word   0

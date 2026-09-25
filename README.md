@@ -24,10 +24,13 @@ cd ../..
 python3 scripts/pc_histogram.py --elf build/lk/build-profiler/lk.elf
 ```
 
-`pc_histogram.py` boots QEMU, drives `profiler clear` / `start` / `bench` /
-`stop` over the console, pulls the sample ring buffer out via QMP, and
-prints a symbolized self-time histogram. At the LK shell directly:
-`profiler <start|stop|status|clear|bench [iters]>`.
+`pc_histogram.py` boots QEMU, drives `profiler clear`/`start`/`bench`
+(or `--nest` for a 3-level call chain) over the console, pauses the VM
+mid-workload via QMP once enough samples exist, pulls the PC/LR/FP ring
+buffers out, and prints a symbolized self-time histogram plus (Stage 3)
+offline FP-chain-unwound call stacks in FlameGraph-compatible folded
+format. At the LK shell directly:
+`profiler <start|stop|status|clear|bench [iters]|nest [iters]|fpcheck>`.
 
 ## Layout
 
@@ -46,7 +49,18 @@ resolved commit each time for traceability, but doesn't enforce it.
 
 ## Status
 
-Stage 1 (PC-only histogram) verified: `pc_histogram.py` end-to-end on a
-fresh QEMU boot shows real, distinguishable sample variation between two
-synthetic workload functions. See [docs/DESIGN.md](docs/DESIGN.md) for
-stages 2–5.
+Stages 1–3 verified end-to-end on a fresh QEMU boot:
+- Stage 1 (PC histogram): real, distinguishable sample variation between
+  two synthetic workload functions.
+- Stage 2 (PC+LR): immediate-caller breakdown; also empirically caught
+  its own documented limitation (GCC reusing the live lr register as
+  scratch mid-function under register pressure, confirmed via objdump).
+- Stage 3 (FP-chain offline unwind): correctly recovers the full
+  `cmd_profiler;profiler_workload_outer;profiler_workload_mid;
+  profiler_workload_inner` call chain for the 3-level `nest` workload.
+  See [docs/DESIGN.md](docs/DESIGN.md) for the real, generalizable
+  finding this stage surfaced: a walk target's stack must still be live
+  when read, which is why the host tooling pauses the VM mid-workload
+  via QMP rather than waiting for a completion marker.
+
+See [docs/DESIGN.md](docs/DESIGN.md) for stages 4–5.
