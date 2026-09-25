@@ -17,14 +17,17 @@ pattern (pinned LK commit + `setup.sh` + `app/<name>/`), reused directly.
 ## Quick start
 
 ```bash
-./setup.sh                          # installs gcc-arm-none-eabi + qemu-system-arm, clones/pins LK, applies overlay
+./setup.sh                          # installs gcc-arm-none-eabi + qemu-system-arm, clones LK (latest, no pin), applies overlay
 cd build/lk
 make profiler -j$(nproc)
-qemu-system-arm -machine virt -cpu cortex-a15 -smp 1 -m 512 -nographic \
-  -kernel build-profiler/lk.elf
+cd ../..
+python3 scripts/pc_histogram.py --elf build/lk/build-profiler/lk.elf
 ```
 
-At the LK shell: `profiler` (stage 0 — proves the pipeline; no sampling yet).
+`pc_histogram.py` boots QEMU, drives `profiler clear` / `start` / `bench` /
+`stop` over the console, pulls the sample ring buffer out via QMP, and
+prints a symbolized self-time histogram. At the LK shell directly:
+`profiler <start|stop|status|clear|bench [iters]>`.
 
 ## Layout
 
@@ -43,5 +46,7 @@ resolved commit each time for traceability, but doesn't enforce it.
 
 ## Status
 
-Stage 0 only (pipeline skeleton). See [docs/DESIGN.md](docs/DESIGN.md) for
-stages 1–5.
+Stage 1 (PC-only histogram) verified: `pc_histogram.py` end-to-end on a
+fresh QEMU boot shows real, distinguishable sample variation between two
+synthetic workload functions. See [docs/DESIGN.md](docs/DESIGN.md) for
+stages 2–5.
