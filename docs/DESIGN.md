@@ -130,6 +130,30 @@ Each stage is independently useful; don't skip ahead.
    this whole line of work that could show a real, hardware-grounded
    before/after number for BOLT's benefit.
 
+   **Confirmed real-hardware-only, two independent ways, not assumed**
+   (`profiler pmu` in `app/profiler/profiler.c`):
+   1. No PMU interrupt route exists on this QEMU target at all. Dumping
+      this exact `qemu-system-arm -machine virt -cpu cortex-a15`
+      invocation's own generated device tree
+      (`-machine dumpdtb=...` + `dtc`) shows the `pmu {};` node present
+      but **empty** -- no `compatible`, no `interrupts` property. There
+      is no GIC IRQ number to register an overflow handler against.
+   2. PMU coprocessor register access itself is unsafe here, not just
+      the interrupt path. Even the single already-public, already-proven
+      LK accessor `arch_cycle_count()` (reads PMCCNTR, used throughout
+      bolt-aarch32's `bolt_bench`) reliably faults with an "undefined
+      abort" the instant it executes on this bare-metal image --
+      verified directly by isolating it in its own test build, not
+      inferred from the interrupt finding. Real hardware/firmware
+      normally clears the NSACR PMU-access trap during a secure-world
+      boot stage before handing off to the kernel; this minimal image
+      has none. An earlier, more complete version of this command
+      (PMCR/PMCEID/PMSELR/PMXEVTYPER register probing, meant to at least
+      answer "does this TCG model count cache events at all") hit the
+      same fault and was removed rather than shipped in a state that
+      panics the target -- see git history if reviving this on a
+      firmware-backed target later.
+
 ## SMP-specific design
 
 The unwind algorithm itself (stage 3) is per-sample, per-core-independent
@@ -212,9 +236,13 @@ can't.
   concurrent per-core sampling + FP-chain unwinding works correctly.
 - Per-core stack bounds for the offline walker, and thread-migration
   tracking -- not implemented (see SMP-specific design section above).
-- Whether QEMU's `cortex-a15` TCG model implements meaningful PMU event
-  counters (`L1I_CACHE_REFILL` etc.) at all -- relevant only once stage 5
-  is reached; irrelevant to stages 0-4, which only need the generic timer.
+- ~~Whether QEMU's `cortex-a15` TCG model implements meaningful PMU event
+  counters~~ **Moot, confirmed** (Stage 5): PMU coprocessor register
+  access itself faults on this bare-metal image (no secure-monitor boot
+  stage to clear the NSACR trap), and there's no PMU IRQ route in this
+  QEMU target's device tree either way -- see Stage 5 above. Answering
+  "does it count cache events meaningfully" needs real hardware or a
+  firmware-backed QEMU boot, not this minimal image.
 - Whether the eventual real hardware target genuinely lacks ETM (a SoC
   choice) as opposed to it being disabled/fused off -- doesn't change the
   design, worth confirming before spending effort on an ETM path later.

@@ -32,7 +32,7 @@ buffers out, and prints a symbolized self-time histogram plus (Stage 3)
 offline FP-chain-unwound call stacks in FlameGraph-compatible folded
 format -- one merged file and one per core (Stage 4). At the LK shell
 directly:
-`profiler <start|stop|status|clear|bench [iters]|nest [iters]|smp [iters]|fpcheck>`.
+`profiler <start|stop|status|clear|bench [iters]|nest [iters]|smp [iters]|pmu|fpcheck>`.
 
 ## Layout
 
@@ -70,5 +70,12 @@ Stages 1–4 verified end-to-end on a fresh QEMU boot:
   independent, near-balanced per-core sample counts (9/9/9/8) with
   correct 6-level FP-chain unwinding on every core, merged into one
   folded-stack output plus one per core.
+- Stage 5 (PMU-event-triggered sampling): confirmed real-hardware-only,
+  not assumed. `profiler pmu` documents two independently verified
+  reasons: this QEMU target's own device tree has no PMU interrupt route
+  at all, and PMU coprocessor register access itself faults here (no
+  secure-monitor boot stage to clear the relevant trap) -- caught by
+  isolating a crash in an earlier, more ambitious version of this
+  command before it shipped, not left in a panicking state.
 
-See [docs/DESIGN.md](docs/DESIGN.md) for stage 5 (real hardware only).
+See [docs/DESIGN.md](docs/DESIGN.md) for full details.

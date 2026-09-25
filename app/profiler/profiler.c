@@ -1,6 +1,14 @@
 /*
  * Bare-metal statistical sampling profiler for LK, AArch32.
  *
+ * Stage 5 note: PMU-event-triggered sampling (see docs/DESIGN.md) is
+ * confirmed real-hardware-only on this target, not just anticipated --
+ * see the "pmu" branch of cmd_profiler below for the two independently
+ * verified reasons (no PMU IRQ route in this QEMU target's device tree;
+ * PMU coprocessor access itself faults without a secure-monitor boot
+ * stage). Stages 1-4 below are unaffected and remain the working
+ * pipeline.
+ *
  * Stage 4: SMP. Everything from stages 1-3 (PC, LR, FP-chain unwind) now
  * runs correctly with multiple cores concurrently sampling: per-CPU ring
  * buffers (no locking in the ISR -- a lock inside a sampling interrupt
@@ -180,7 +188,7 @@ static int profiler_smp_worker(void *arg) {
 
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
-        printf("usage: profiler <start|stop|status|clear|bench|nest|smp|fpcheck>\n");
+        printf("usage: profiler <start|stop|status|clear|bench|nest|smp|pmu|fpcheck>\n");
         return -1;
     }
 
@@ -233,6 +241,34 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         }
         printf("profiler: smp done (sink=%u, ignore -- just prevents dead-code elim)\n",
                profiler_sink);
+    } else if (!strcmp(sub, "pmu")) {
+        // Stage 5 (PMU-overflow-triggered sampling) is real-hardware-only
+        // on this project -- confirmed two independent ways, not assumed:
+        //
+        // 1. No PMU interrupt route exists to arm at all. Dumping this
+        //    exact QEMU invocation's own generated device tree
+        //    (`qemu-system-arm -machine virt -cpu cortex-a15 -machine
+        //    dumpdtb=...`) shows the `pmu {};` node present but empty --
+        //    no `compatible`, no `interrupts` property.
+        // 2. PMU coprocessor register access itself is unsafe here, not
+        //    just the interrupt path: even the single already-public,
+        //    already-proven LK accessor arch_cycle_count()
+        //    (arch/arm/include/arch/arch_ops.h, `mrc p15,0,%0,c9,c13,0`
+        //    = PMCCNTR, used throughout bolt-aarch32's bolt_bench)
+        //    reliably faults with "undefined abort" the moment it
+        //    executes on this bare-metal image -- verified directly,
+        //    not inferred. Real hardware/firmware normally clears the
+        //    NSACR PMU-access trap during secure-world boot before
+        //    handing off to the kernel; this minimal image has no
+        //    secure-monitor stage to do that. An earlier, more ambitious
+        //    version of this command (PMCR/PMCEID/PMSELR/PMXEVTYPER
+        //    register probing) crashed the same way and was removed
+        //    rather than left in a state that panics the target.
+        printf("pmu: Stage 5 needs real hardware -- see this command's own\n");
+        printf("pmu: source comment for the two independent, verified reasons\n");
+        printf("pmu: (no PMU IRQ route in this QEMU target's device tree, and\n");
+        printf("pmu: PMU coprocessor access itself faults without a secure-\n");
+        printf("pmu: monitor boot stage to clear the NSACR trap).\n");
     } else if (!strcmp(sub, "fpcheck")) {
         // Diagnostic: dereference each core's ring buffer's OWN
         // last-recorded fp directly on target, no QMP involved.
