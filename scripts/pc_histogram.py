@@ -342,11 +342,16 @@ def main() -> int:
         # stack frames are still genuinely live. This is what makes the
         # captured fp values point at memory the walk can still trust.
         # Poll the SUM across all cores' profiler_total[] (still one small
-        # QMP read, still stable BSS, not reused stack memory) so a
-        # workload spread thin across many cores still reaches the
-        # threshold promptly instead of waiting on whichever core is
-        # slowest.
-        min_samples = 8 * num_cpus
+        # QMP read, still stable BSS, not reused stack memory). Fixed,
+        # small threshold, deliberately NOT scaled by num_cpus: this is a
+        # SUM, so a multi-core workload reaches it faster, not slower --
+        # scaling it up regression-tested badly (single-core --nest,
+        # where only cpu0 ever contributes, took 4x longer than the
+        # workload's own ~280ms runtime to reach a *4 threshold, so the
+        # pause fired *after* completion, reproducing the exact Stage 3
+        # stack-reuse bug this whole mechanism exists to avoid -- fixed
+        # by keeping the threshold small and workload-shape-independent).
+        min_samples = 8
         deadline = time.time() + args.bench_timeout
         totals = [0] * num_cpus
         while time.time() < deadline:
