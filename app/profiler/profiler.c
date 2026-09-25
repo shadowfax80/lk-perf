@@ -1,21 +1,43 @@
 /*
  * Bare-metal statistical sampling profiler for LK, AArch32.
  *
- * Stage 3: frame-pointer offline unwind. Adds an FP capture (r7 in Thumb
- * state, r11 in ARM state, picked per-sample from the interrupted SPSR's
- * T-bit) to Stage 2's PC+LR. The FP register itself is NOT saved by the
- * generic IRQ entry path (arch/arm/arm/exceptions.S's `save` macro only
- * touches r0-r3/r12/lr/sp) so overlay/lk/0002-capture-interrupted-fp.patch
- * stashes r7/r11 into two always-present core-LK globals right at IRQ
- * entry, before any C code can repurpose them. The host walks the FP
- * chain offline from a QMP memory dump: this build is compiled with
- * -fno-omit-frame-pointer (project/profiler.mk), and empirically (via
- * objdump, not assumed) GCC's Thumb prologue for that flag is
- * `strd r7,lr,[sp,#-8]!` / `add r7,sp,#0` -- so at any live fp,
- * [fp+0]=caller's saved fp and [fp+4]=the *stack-saved* return address,
- * which is reliable where Stage 2's live-register LR read was not (see
- * that stage's own comment: GCC happily reuses the live lr register as
- * scratch mid-function; it can't touch the copy it already pushed).
+ * Stage 4: SMP. Everything from stages 1-3 (PC, LR, FP-chain unwind) now
+ * runs correctly with multiple cores concurrently sampling: per-CPU ring
+ * buffers (no locking in the ISR -- a lock inside a sampling interrupt
+ * is exactly the kind of perturbation that would corrupt the
+ * measurement), and per-sample CNTPCT-derived timestamps for cross-core
+ * ordering. Confirmed necessary, not just anticipated: the GIC tick IRQ
+ * is a PPI (banked per-core), so with -smp N every core independently
+ * enters profiler_on_tick(), and profiler_fp_r7/r11 (Stage 3's capture
+ * globals) would otherwise race between cores -- fixed by making the
+ * exceptions.S capture itself per-CPU (see
+ * overlay/lk/0003-percpu-fp-capture.patch), indexed by the *exact* same
+ * MPIDR-masking instruction arch_curr_cpu_num() compiles to
+ * (`bic r3, r3, #0xff000000`, read from this build's own
+ * lk.elf.debug.lst, not re-derived from the architecture manual by
+ * hand) so the assembly-computed index can never disagree with the
+ * C-computed one used for the other per-CPU arrays below.
+ *
+ * Timestamp uses current_time_hires() (CNTPCT-backed, microsecond
+ * lk_bigtime_t), not PMCCNTR: PMCCNTR is a per-core PMU cycle counter,
+ * free-running independently since each core's own reset, with no
+ * architectural guarantee of cross-core phase alignment -- using it to
+ * interleave samples from different cores would silently produce a
+ * wrong merged ordering. CNTPCT is architected as a single, SoC-wide
+ * coherent time base, visible identically to every core.
+ *
+ * Stage 3's FP-chain layout ([fp+0]=caller's saved fp, [fp+4]=saved
+ * return address) and its .text-range plausibility gate (see
+ * scripts/pc_histogram.py) are unchanged and per-core-independent: one
+ * shared binary means identical frame-pointer conventions on every core,
+ * and each thread's stack is separate memory regardless of which core
+ * runs it.
+ *
+ * The FP register itself is NOT saved by the generic IRQ entry path
+ * (arch/arm/arm/exceptions.S's `save` macro only touches r0-r3/r12/lr/sp)
+ * so overlay/lk/0002-capture-interrupted-fp.patch (now per-CPU per
+ * 0003) stashes r7/r11 into always-present core-LK globals right at IRQ
+ * entry, before any C code can repurpose them.
  *
  * The sample source is dev/interrupt/arm_gic/gic_v2.c's profiler_on_tick()
  * hook (overlay/lk/0001-add-profiler-tick-hook.patch) -- the only place the
@@ -23,15 +45,19 @@
  * register_int_handler()'s callback signature is (void *arg) only. This
  * file does NOT register its own timer; it piggybacks on whichever IRQ
  * fires the hook (LK's own scheduler tick, IRQ 27 on qemu-virt-arm/
- * cortex-a15, confirmed from this project family's own boot logs), so it
- * adds no timer-programming code and cannot double-program hardware timer
- * registers already owned by kernel/timer.c.
+ * cortex-a15, confirmed a genuine per-core PPI from this build's own SMP
+ * boot log: "Generic timer register irq 27 on cpu 0" repeated per core),
+ * so it adds no timer-programming code and cannot double-program
+ * hardware timer registers already owned by kernel/timer.c.
  */
 
+#include <arch/arch_ops.h>
 #include <arch/arm.h>
+#include <kernel/thread.h>
 #include <lib/console.h>
 #include <lk/compiler.h>
 #include <lk/reg.h>
+#include <platform/time.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -55,42 +81,50 @@
 #define PROFILER_SPSR_T_BIT (1u << 5)
 
 // Defined in arch/arm/arm/exceptions.S by
-// overlay/lk/0002-capture-interrupted-fp.patch -- always present in core
-// LK (not app/profiler-owned), so linking without app/profiler still
-// works; these just sit unread.
-extern uint32_t profiler_fp_r7;
-extern uint32_t profiler_fp_r11;
+// overlay/lk/0002-capture-interrupted-fp.patch +
+// overlay/lk/0003-percpu-fp-capture.patch (per-CPU as of Stage 4) --
+// always present in core LK (not app/profiler-owned), so linking without
+// app/profiler still works; these just sit unread.
+extern uint32_t profiler_fp_r7[SMP_MAX_CPUS];
+extern uint32_t profiler_fp_r11[SMP_MAX_CPUS];
 
 // Plain external linkage, no custom linker section: the host finds these
 // by ordinary ELF symbol lookup (arm-none-eabi-nm), the same way earlier
 // project work found bolt_bench's counters. Parallel arrays (not a struct
 // array) so the host can nm-locate and size each column independently
-// without computing struct-layout/padding offsets itself.
-uint32_t profiler_pc_buf[PROFILER_BUF_SIZE];
-uint32_t profiler_lr_buf[PROFILER_BUF_SIZE];
-uint32_t profiler_fp_buf[PROFILER_BUF_SIZE];
-volatile uint32_t profiler_head;
-volatile uint32_t profiler_total;
+// without computing struct-layout/padding offsets itself. Per-CPU as of
+// Stage 4: [cpu][index], one independent ring per core, no cross-core
+// locking (an ISR is exactly the wrong place to contend a lock).
+uint32_t profiler_pc_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
+uint32_t profiler_lr_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
+uint32_t profiler_fp_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
+uint64_t profiler_ts_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
+volatile uint32_t profiler_head[SMP_MAX_CPUS];
+volatile uint32_t profiler_total[SMP_MAX_CPUS];
 volatile uint32_t profiler_enabled;
 
 // Called from dev/interrupt/arm_gic/gic_v2.c on every IRQ (weak default is
 // a no-op when this file isn't linked in). Keep this minimal and
 // allocation-free -- it runs in interrupt context on every timer tick,
 // the same atomicity discipline as this project family's earlier
-// counter-bump-stub lessons.
+// counter-bump-stub lessons. Runs concurrently on every core (PPI, no
+// cross-core serialization) -- touches only this core's own array slots,
+// so no locking is needed despite running on N cores at once.
 void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
     if (vector != PROFILER_TIMER_IRQ || !profiler_enabled) {
         return;
     }
 
+    uint cpu = arch_curr_cpu_num();
     bool thumb = (frame->spsr & PROFILER_SPSR_T_BIT) != 0;
 
-    uint32_t idx = profiler_head;
-    profiler_pc_buf[idx] = frame->pc;
-    profiler_lr_buf[idx] = frame->lr;
-    profiler_fp_buf[idx] = thumb ? profiler_fp_r7 : profiler_fp_r11;
-    profiler_head = (idx + 1) % PROFILER_BUF_SIZE;
-    profiler_total++;
+    uint32_t idx = profiler_head[cpu];
+    profiler_pc_buf[cpu][idx] = frame->pc;
+    profiler_lr_buf[cpu][idx] = frame->lr;
+    profiler_fp_buf[cpu][idx] = thumb ? profiler_fp_r7[cpu] : profiler_fp_r11[cpu];
+    profiler_ts_buf[cpu][idx] = current_time_hires();
+    profiler_head[cpu] = (idx + 1) % PROFILER_BUF_SIZE;
+    profiler_total[cpu]++;
 }
 
 // Minimal, self-contained synthetic workload purely to give Stage 1
@@ -134,9 +168,19 @@ __NO_INLINE static void profiler_workload_outer(uint32_t iters) {
     profiler_workload_mid(iters);
 }
 
+// Stage 4: run the same nested workload concurrently on SMP_MAX_CPUS
+// worker threads so the SMP scheduler has a reason to actually spread
+// work across every core -- proves per-CPU sampling captures activity
+// on more than just whichever core happens to run the shell thread.
+static int profiler_smp_worker(void *arg) {
+    uint32_t iters = (uint32_t)(uintptr_t)arg;
+    profiler_workload_outer(iters);
+    return 0;
+}
+
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
-        printf("usage: profiler <start|stop|status|clear|bench|nest|fpcheck>\n");
+        printf("usage: profiler <start|stop|status|clear|bench|nest|smp|fpcheck>\n");
         return -1;
     }
 
@@ -144,18 +188,21 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
 
     if (!strcmp(sub, "start")) {
         profiler_enabled = 1;
-        printf("profiler: sampling started (irq %d, buffer %d entries)\n",
-               PROFILER_TIMER_IRQ, PROFILER_BUF_SIZE);
+        printf("profiler: sampling started (irq %d, %d cores, buffer %d entries/core)\n",
+               PROFILER_TIMER_IRQ, SMP_MAX_CPUS, PROFILER_BUF_SIZE);
     } else if (!strcmp(sub, "stop")) {
         profiler_enabled = 0;
-        printf("profiler: sampling stopped (%u samples total, %u since last clear)\n",
-               profiler_total, profiler_total);
+        uint32_t total = 0;
+        for (int c = 0; c < SMP_MAX_CPUS; c++) total += profiler_total[c];
+        printf("profiler: sampling stopped (%u samples total across %d cores)\n",
+               total, SMP_MAX_CPUS);
     } else if (!strcmp(sub, "clear")) {
-        profiler_head = 0;
-        profiler_total = 0;
+        memset(profiler_head, 0, sizeof(profiler_head));
+        memset(profiler_total, 0, sizeof(profiler_total));
         memset(profiler_pc_buf, 0, sizeof(profiler_pc_buf));
         memset(profiler_lr_buf, 0, sizeof(profiler_lr_buf));
         memset(profiler_fp_buf, 0, sizeof(profiler_fp_buf));
+        memset(profiler_ts_buf, 0, sizeof(profiler_ts_buf));
         printf("profiler: buffer cleared\n");
     } else if (!strcmp(sub, "bench")) {
         uint32_t iters = argc >= 3 ? (uint32_t)argv[2].u : 20000000;
@@ -172,30 +219,52 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         profiler_workload_outer(iters);
         printf("profiler: nest done (sink=%u, ignore -- just prevents dead-code elim)\n",
                profiler_sink);
+    } else if (!strcmp(sub, "smp")) {
+        uint32_t iters = argc >= 3 ? (uint32_t)argv[2].u : 20000000;
+        printf("profiler: running nested workload on %d worker threads ...\n", SMP_MAX_CPUS);
+        thread_t *workers[SMP_MAX_CPUS];
+        for (int i = 0; i < SMP_MAX_CPUS; i++) {
+            workers[i] = thread_create("profiler_smp_worker", profiler_smp_worker,
+                                        (void *)(uintptr_t)iters, DEFAULT_PRIORITY, 4096);
+            thread_resume(workers[i]);
+        }
+        for (int i = 0; i < SMP_MAX_CPUS; i++) {
+            thread_join(workers[i], NULL, INFINITE_TIME);
+        }
+        printf("profiler: smp done (sink=%u, ignore -- just prevents dead-code elim)\n",
+               profiler_sink);
     } else if (!strcmp(sub, "fpcheck")) {
-        // Diagnostic: dereference the ring buffer's OWN last-recorded fp
-        // directly on target, no QMP involved. Deliberately NOT
-        // profiler_fp_r7/r11 directly -- those are continuously
-        // overwritten on every tick regardless of profiler_enabled, so by
-        // the time a shell command reads them they reflect whatever last
-        // interrupted the *idle* shell loop, not the sample actually
-        // stored in profiler_fp_buf[] while the workload ran.
-        if (profiler_total == 0) {
-            printf("fpcheck: no samples yet\n");
-        } else {
-            uint32_t idx = (profiler_head + PROFILER_BUF_SIZE - 1) % PROFILER_BUF_SIZE;
-            uint32_t pc = profiler_pc_buf[idx];
-            uint32_t fp = profiler_fp_buf[idx];
-            printf("fpcheck: last sample idx=%u pc=0x%08x fp=0x%08x\n", idx, pc, fp);
+        // Diagnostic: dereference each core's ring buffer's OWN
+        // last-recorded fp directly on target, no QMP involved.
+        // Deliberately NOT profiler_fp_r7/r11 directly -- those are
+        // continuously overwritten on every tick regardless of
+        // profiler_enabled, so by the time a shell command reads them
+        // they reflect whatever last interrupted the *idle* shell loop
+        // on *that* core, not the sample actually stored in
+        // profiler_fp_buf[] while the workload ran.
+        for (int c = 0; c < SMP_MAX_CPUS; c++) {
+            if (profiler_total[c] == 0) {
+                printf("fpcheck: cpu%d no samples yet\n", c);
+                continue;
+            }
+            uint32_t idx = (profiler_head[c] + PROFILER_BUF_SIZE - 1) % PROFILER_BUF_SIZE;
+            uint32_t pc = profiler_pc_buf[c][idx];
+            uint32_t fp = profiler_fp_buf[c][idx];
+            printf("fpcheck: cpu%d last sample idx=%u pc=0x%08x fp=0x%08x\n", c, idx, pc, fp);
             if (fp >= 0x1000) {
                 volatile uint32_t *p = (volatile uint32_t *)fp;
-                printf("*(fp+0)=0x%08x *(fp+4)=0x%08x\n", p[0], p[1]);
+                printf("cpu%d *(fp+0)=0x%08x *(fp+4)=0x%08x\n", c, p[0], p[1]);
             }
         }
     } else if (!strcmp(sub, "status")) {
-        printf("profiler: enabled=%u total_samples=%u head=%u capacity=%d%s\n",
-               profiler_enabled, profiler_total, profiler_head, PROFILER_BUF_SIZE,
-               profiler_total >= PROFILER_BUF_SIZE ? " (WRAPPED)" : "");
+        uint32_t total = 0;
+        for (int c = 0; c < SMP_MAX_CPUS; c++) {
+            total += profiler_total[c];
+            printf("profiler: cpu%d total_samples=%u head=%u%s\n", c, profiler_total[c],
+                   profiler_head[c], profiler_total[c] >= PROFILER_BUF_SIZE ? " (WRAPPED)" : "");
+        }
+        printf("profiler: enabled=%u total_samples(all cpus)=%u capacity=%d/core\n",
+               profiler_enabled, total, PROFILER_BUF_SIZE);
     } else {
         printf("unknown subcommand '%s'\n", sub);
         return -1;

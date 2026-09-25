@@ -25,12 +25,14 @@ python3 scripts/pc_histogram.py --elf build/lk/build-profiler/lk.elf
 ```
 
 `pc_histogram.py` boots QEMU, drives `profiler clear`/`start`/`bench`
-(or `--nest` for a 3-level call chain) over the console, pauses the VM
-mid-workload via QMP once enough samples exist, pulls the PC/LR/FP ring
+(`--nest` for a 3-level call chain, `--smp-workload` for one worker
+thread per core) over the console, pauses the VM mid-workload via QMP
+once enough samples exist, pulls the per-CPU PC/LR/FP/timestamp ring
 buffers out, and prints a symbolized self-time histogram plus (Stage 3)
 offline FP-chain-unwound call stacks in FlameGraph-compatible folded
-format. At the LK shell directly:
-`profiler <start|stop|status|clear|bench [iters]|nest [iters]|fpcheck>`.
+format -- one merged file and one per core (Stage 4). At the LK shell
+directly:
+`profiler <start|stop|status|clear|bench [iters]|nest [iters]|smp [iters]|fpcheck>`.
 
 ## Layout
 
@@ -49,7 +51,7 @@ resolved commit each time for traceability, but doesn't enforce it.
 
 ## Status
 
-Stages 1–3 verified end-to-end on a fresh QEMU boot:
+Stages 1–4 verified end-to-end on a fresh QEMU boot:
 - Stage 1 (PC histogram): real, distinguishable sample variation between
   two synthetic workload functions.
 - Stage 2 (PC+LR): immediate-caller breakdown; also empirically caught
@@ -62,5 +64,11 @@ Stages 1–3 verified end-to-end on a fresh QEMU boot:
   finding this stage surfaced: a walk target's stack must still be live
   when read, which is why the host tooling pauses the VM mid-workload
   via QMP rather than waiting for a completion marker.
+- Stage 4 (SMP): `-smp 4` boot verified (`welcome to lk/MP`, all 4 cores
+  in `threadstats`) before writing any profiler code. Per-CPU ring
+  buffers + CNTPCT timestamps; a concurrent 4-thread workload produced
+  independent, near-balanced per-core sample counts (9/9/9/8) with
+  correct 6-level FP-chain unwinding on every core, merged into one
+  folded-stack output plus one per core.
 
-See [docs/DESIGN.md](docs/DESIGN.md) for stages 4–5.
+See [docs/DESIGN.md](docs/DESIGN.md) for stage 5 (real hardware only).

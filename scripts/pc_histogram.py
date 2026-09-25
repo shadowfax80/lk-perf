@@ -56,6 +56,20 @@ def nm_symbol_addr(nm: str, elf: str, symbol: str) -> int:
     sys.exit(f"error: symbol {symbol!r} not found in {elf} (is app/profiler linked in?)")
 
 
+def nm_symbol_size(nm: str, elf: str, symbol: str) -> int:
+    """Byte size of a symbol via `nm -S` -- used to derive SMP_MAX_CPUS
+    from profiler_total[SMP_MAX_CPUS]'s own array size rather than
+    hardcoding a core count that has to be kept in sync by hand."""
+    out = subprocess.run(
+        [nm, "-S", elf], capture_output=True, text=True, check=True
+    ).stdout
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[3] == symbol:
+            return int(parts[1], 16)
+    sys.exit(f"error: symbol {symbol!r} not found (or has no size) in {elf}")
+
+
 def find_symbol_table(elf: str, nm: str) -> list[tuple[int, str]]:
     out = subprocess.run(
         [nm, "--defined-only", elf], capture_output=True, text=True, check=True
@@ -248,17 +262,27 @@ def main() -> int:
         action="store_true",
         help="drive 'profiler nest' (3-level call chain) instead of 'profiler bench'",
     )
+    ap.add_argument(
+        "--smp-workload",
+        action="store_true",
+        help="drive 'profiler smp' (concurrent worker per core) -- implies --smp > 1",
+    )
     args = ap.parse_args()
 
     buf_size = 4096  # PROFILER_BUF_SIZE -- keep in sync with profiler.c
+    num_cpus = nm_symbol_size(args.nm, args.elf, "profiler_total") // 4
+    if args.smp_workload and args.smp == "1":
+        args.smp = str(num_cpus)  # boot enough cores for the ELF's own SMP_MAX_CPUS
     head_addr = nm_symbol_addr(args.nm, args.elf, "profiler_head")
     total_addr = nm_symbol_addr(args.nm, args.elf, "profiler_total")
     buf_addr = nm_symbol_addr(args.nm, args.elf, "profiler_pc_buf")
     lr_buf_addr = nm_symbol_addr(args.nm, args.elf, "profiler_lr_buf")
     fp_buf_addr = nm_symbol_addr(args.nm, args.elf, "profiler_fp_buf")
+    ts_buf_addr = nm_symbol_addr(args.nm, args.elf, "profiler_ts_buf")
     print(
-        f"profiler_pc_buf @ 0x{buf_addr:x}  profiler_lr_buf @ 0x{lr_buf_addr:x}  "
-        f"profiler_fp_buf @ 0x{fp_buf_addr:x}  profiler_head @ 0x{head_addr:x}  "
+        f"SMP_MAX_CPUS={num_cpus}  profiler_pc_buf @ 0x{buf_addr:x}  "
+        f"profiler_lr_buf @ 0x{lr_buf_addr:x}  profiler_fp_buf @ 0x{fp_buf_addr:x}  "
+        f"profiler_ts_buf @ 0x{ts_buf_addr:x}  profiler_head @ 0x{head_addr:x}  "
         f"profiler_total @ 0x{total_addr:x}",
         file=sys.stderr,
     )
@@ -299,7 +323,7 @@ def main() -> int:
         console.send("profiler start")
         time.sleep(0.3)
         before = len(console.snapshot())
-        sub = "nest" if args.nest else "bench"
+        sub = "smp" if args.smp_workload else ("nest" if args.nest else "bench")
         console.send(f"profiler {sub} {args.bench_iters}")
 
         # Deliberately do NOT wait for '{sub} done' before reading memory.
@@ -317,40 +341,62 @@ def main() -> int:
         # then pause via QMP mid-workload, while the sampled call chain's
         # stack frames are still genuinely live. This is what makes the
         # captured fp values point at memory the walk can still trust.
-        min_samples = 8
+        # Poll the SUM across all cores' profiler_total[] (still one small
+        # QMP read, still stable BSS, not reused stack memory) so a
+        # workload spread thin across many cores still reaches the
+        # threshold promptly instead of waiting on whichever core is
+        # slowest.
+        min_samples = 8 * num_cpus
         deadline = time.time() + args.bench_timeout
-        total = 0
+        totals = [0] * num_cpus
         while time.time() < deadline:
-            total_bytes = qmp_read_mem(qmp, total_addr, 4, tmp, "poll_total")
-            total = struct.unpack("<I", total_bytes)[0]
-            if total >= min_samples:
+            totals_bytes = qmp_read_mem(qmp, total_addr, num_cpus * 4, tmp, "poll_totals")
+            totals = list(struct.unpack(f"<{num_cpus}I", totals_bytes))
+            if sum(totals) >= min_samples:
                 break
             time.sleep(0.05)
         qmp.execute("stop")
-        print(f"paused mid-workload after {total} samples", file=sys.stderr)
-        if total == 0:
+        print(f"paused mid-workload after {totals} samples/core", file=sys.stderr)
+        if sum(totals) == 0:
             print(console.snapshot()[before:], file=sys.stderr)
             sys.exit("error: zero samples captured before pause -- sampling pipeline did not fire")
 
-        head_bytes = qmp_read_mem(qmp, head_addr, 4, tmp, "head")
-        total_bytes = qmp_read_mem(qmp, total_addr, 4, tmp, "total")
-        total = struct.unpack("<I", total_bytes)[0]
-        head = struct.unpack("<I", head_bytes)[0]
-        print(f"total samples: {total}  head: {head}", file=sys.stderr)
+        heads_bytes = qmp_read_mem(qmp, head_addr, num_cpus * 4, tmp, "heads")
+        totals_bytes = qmp_read_mem(qmp, total_addr, num_cpus * 4, tmp, "totals")
+        totals = list(struct.unpack(f"<{num_cpus}I", totals_bytes))
+        heads = list(struct.unpack(f"<{num_cpus}I", heads_bytes))
+        print(f"total samples: {sum(totals)}  per-core: {totals}", file=sys.stderr)
 
-        n = min(total, buf_size)
-        buf_bytes = qmp_read_mem(qmp, buf_addr, buf_size * 4, tmp, "buf")
-        lr_bytes = qmp_read_mem(qmp, lr_buf_addr, buf_size * 4, tmp, "lr_buf")
-        fp_bytes = qmp_read_mem(qmp, fp_buf_addr, buf_size * 4, tmp, "fp_buf")
-        pcs = list(struct.unpack(f"<{buf_size}I", buf_bytes))[:n]
-        lrs = list(struct.unpack(f"<{buf_size}I", lr_bytes))[:n]
-        fps = list(struct.unpack(f"<{buf_size}I", fp_bytes))[:n]
+        # profiler_pc_buf etc. are C row-major [cpu][index] arrays -- one
+        # read of the whole 2D array, sliced per-core in Python, instead
+        # of num_cpus separate small QMP round-trips.
+        buf_bytes = qmp_read_mem(qmp, buf_addr, num_cpus * buf_size * 4, tmp, "buf")
+        lr_bytes = qmp_read_mem(qmp, lr_buf_addr, num_cpus * buf_size * 4, tmp, "lr_buf")
+        fp_bytes = qmp_read_mem(qmp, fp_buf_addr, num_cpus * buf_size * 4, tmp, "fp_buf")
+        ts_bytes = qmp_read_mem(qmp, ts_buf_addr, num_cpus * buf_size * 8, tmp, "ts_buf")
+        all_pcs = struct.unpack(f"<{num_cpus * buf_size}I", buf_bytes)
+        all_lrs = struct.unpack(f"<{num_cpus * buf_size}I", lr_bytes)
+        all_fps = struct.unpack(f"<{num_cpus * buf_size}I", fp_bytes)
+        all_ts = struct.unpack(f"<{num_cpus * buf_size}Q", ts_bytes)
 
         syms = find_symbol_table(args.elf, args.nm)
         text_lo, text_hi = syms[0][0] & ~1, syms[-1][0] & ~1
 
-        print(f"walking FP chains for {n} samples ...", file=sys.stderr)
-        stacks = [walk_fp_chain(qmp, fp, tmp, text_lo, text_hi) for fp in fps]
+        # Per-core sample lists: (pc, lr, fp, ts, cpu) tuples, n = min(total, capacity)
+        # per core since each core's ring buffer wraps independently.
+        samples: list[tuple[int, int, int, int, int]] = []
+        for cpu in range(num_cpus):
+            n_cpu = min(totals[cpu], buf_size)
+            base = cpu * buf_size
+            for i in range(n_cpu):
+                samples.append(
+                    (all_pcs[base + i], all_lrs[base + i], all_fps[base + i],
+                     all_ts[base + i], cpu)
+                )
+        n = len(samples)
+
+        print(f"walking FP chains for {n} samples across {num_cpus} cores ...", file=sys.stderr)
+        stacks = [walk_fp_chain(qmp, fp, tmp, text_lo, text_hi) for _, _, fp, _, _ in samples]
     finally:
         qemu.terminate()
         try:
@@ -360,9 +406,10 @@ def main() -> int:
 
     hist: dict[str, int] = {}
     callers: dict[str, dict[str, int]] = {}
-    folded: dict[str, int] = {}
+    folded_merged: dict[str, int] = {}
+    folded_per_cpu: list[dict[str, int]] = [dict() for _ in range(num_cpus)]
     depths: list[int] = []
-    for pc, lr, frames in zip(pcs, lrs, stacks):
+    for (pc, lr, _fp, ts, cpu), frames in zip(samples, stacks):
         name = symbolize(pc, syms)
         hist[name] = hist.get(name, 0) + 1
         # LR is a caller's return address (post-call instruction), not the
@@ -375,9 +422,19 @@ def main() -> int:
 
         # Real call stack (Stage 3): outermost caller first, sample's own
         # PC last -- standard folded-stack order for FlameGraph tooling.
+        # Merged view is what BOLT's own function/block reordering
+        # optimizes for (a global layout decision independent of which
+        # core executes it); per-core is the diagnostic "which core is
+        # the bottleneck" view. CNTPCT-derived ts (not used for ordering
+        # here -- folded format is unordered/aggregated by design -- but
+        # carried through per-sample since a future timeline view needs
+        # cross-core-comparable timestamps, which is exactly what CNTPCT,
+        # not PMCCNTR, guarantees; see docs/DESIGN.md and profiler.c).
+        del ts
         stack_syms = [symbolize(addr, syms) for addr in reversed(frames)] + [name]
         key = ";".join(stack_syms)
-        folded[key] = folded.get(key, 0) + 1
+        folded_merged[key] = folded_merged.get(key, 0) + 1
+        folded_per_cpu[cpu][key] = folded_per_cpu[cpu].get(key, 0) + 1
         depths.append(len(stack_syms))
 
     print(f"\n{'samples':>8}  {'%':>6}  function")
@@ -390,20 +447,30 @@ def main() -> int:
 
     avg_depth = sum(depths) / len(depths) if depths else 0.0
     print(
-        f"\nFP-chain unwind: {n} samples, avg stack depth {avg_depth:.1f} frames "
-        f"(1 = leaf-only, chain didn't extend)",
+        f"\nFP-chain unwind: {n} samples across {num_cpus} cores, "
+        f"avg stack depth {avg_depth:.1f} frames (1 = leaf-only, chain didn't extend)",
         file=sys.stderr,
     )
-    print(f"\n{'samples':>8}  call stack (outermost -> innermost, folded)")
+    print(f"\n{'samples':>8}  call stack, all cores merged (outermost -> innermost, folded)")
     print("-" * 70)
-    for key, count in sorted(folded.items(), key=lambda kv: -kv[1]):
+    for key, count in sorted(folded_merged.items(), key=lambda kv: -kv[1]):
         print(f"{count:>8}  {key}")
 
-    folded_path = os.path.splitext(args.elf)[0] + ".folded"
-    with open(folded_path, "w") as fh:
-        for key, count in sorted(folded.items(), key=lambda kv: -kv[1]):
+    base_path = os.path.splitext(args.elf)[0]
+    merged_path = base_path + ".folded"
+    with open(merged_path, "w") as fh:
+        for key, count in sorted(folded_merged.items(), key=lambda kv: -kv[1]):
             fh.write(f"{key} {count}\n")
-    print(f"\nfolded-stack output (FlameGraph-compatible): {folded_path}", file=sys.stderr)
+    print(f"\nmerged folded-stack output (FlameGraph-compatible): {merged_path}", file=sys.stderr)
+
+    for cpu in range(num_cpus):
+        if not folded_per_cpu[cpu]:
+            continue
+        cpu_path = f"{base_path}.cpu{cpu}.folded"
+        with open(cpu_path, "w") as fh:
+            for key, count in sorted(folded_per_cpu[cpu].items(), key=lambda kv: -kv[1]):
+                fh.write(f"{key} {count}\n")
+        print(f"cpu{cpu} folded-stack output: {cpu_path}", file=sys.stderr)
 
     return 0
 

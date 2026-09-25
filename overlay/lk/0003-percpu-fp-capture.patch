@@ -1,0 +1,46 @@
+diff --git a/arch/arm/arm/exceptions.S b/arch/arm/arm/exceptions.S
+index d0ccf60..e32a18f 100644
+--- a/arch/arm/arm/exceptions.S
++++ b/arch/arm/arm/exceptions.S
+@@ -204,15 +204,26 @@ FUNCTION(arm_irq)
+ 
+     /* r0 now holds pointer to iframe */
+ 
+-    /* lk-perf: stash the interrupted r7/r11 (Thumb/ARM frame-pointer
+-     * candidates) for the offline FP-chain unwinder -- 'save' above only
++    /* lk-perf (stage 4): compute this core's index using the exact
++     * same MPIDR-masking instruction arch_curr_cpu_num() compiles to
++     * (arch/arm/include/arch/arch_ops.h) -- read from this build's own
++     * lk.elf.debug.lst, not re-derived by hand, so this can never
++     * disagree with the C-side per-CPU array indexing. */
++    mrc     p15, 0, r3, c0, c0, 5      /* MPIDR */
++    bic     r3, r3, #0xff000000        /* matches arch_curr_cpu_num() exactly */
++    lsl     r3, r3, #2                 /* word index -> byte offset */
++
++    /* stash the interrupted r7/r11 (Thumb/ARM frame-pointer candidates)
++     * for the offline FP-chain unwinder, per-CPU -- 'save' above only
+      * touches r0-r3/r12/lr/sp, so r7/r11 here are still exactly what the
+      * interrupted code left them as. Always-present core-LK globals (not
+-     * app/profiler-owned) so this costs 4 cheap instructions on every IRQ
+-     * regardless of whether app/profiler is linked in. */
++     * app/profiler-owned) so this costs a handful of cheap instructions
++     * on every IRQ regardless of whether app/profiler is linked in. */
+     LOADCONST(r2, profiler_fp_r7)
++    add     r2, r2, r3
+     str     r7, [r2]
+     LOADCONST(r2, profiler_fp_r11)
++    add     r2, r2, r3
+     str     r11, [r2]
+ 
+     /* track that we're inside an irq handler */
+@@ -254,6 +265,10 @@ DATA(__arm_in_handler)
+     .word   0
+ 
+ DATA(profiler_fp_r7)
++    .rept SMP_MAX_CPUS
+     .word   0
++    .endr
+ DATA(profiler_fp_r11)
++    .rept SMP_MAX_CPUS
+     .word   0
++    .endr

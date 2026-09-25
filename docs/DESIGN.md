@@ -104,7 +104,22 @@ Each stage is independently useful; don't skip ahead.
    has already moved on needs the same discipline, not just this repo's
    verification script.
 4. **SMP.** See below — mostly bookkeeping around stages 1-3, not new
-   unwind logic.
+   unwind logic. **Verified**, not just designed: `-smp 4` boot reaches
+   "welcome to lk/MP" with all 4 cores up (confirmed via `threadstats`
+   before writing any profiler code), and a concurrent-worker test
+   (`profiler smp`, one thread per core) captured independent,
+   near-perfectly-balanced per-core sample counts (35 total, 9/9/9/8)
+   with the FP-chain walker correctly recovering a 6-level chain on every
+   core, merged into one correct folded-stack output. The one thing
+   Stage 3 got right "for free" and Stage 4 had to fix for real: the
+   exceptions.S FP capture (profiler_fp_r7/r11) was a *single* global
+   through Stage 3, fine for one core but a genuine cross-core race once
+   multiple PPIs fire concurrently -- fixed by indexing it per-CPU in
+   assembly using the *exact* MPIDR-masking instruction
+   `arch_curr_cpu_num()` itself compiles to (`bic r3, r3, #0xff000000`,
+   read from this build's own `lk.elf.debug.lst`, not re-derived from the
+   architecture manual by hand), so the assembly-computed index can never
+   disagree with the C-side per-CPU array indexing.
 5. **(Later, real hardware only) PMU-event-triggered sampling** instead of
    fixed-period timer — arm the interrupt on a PMU overflow (e.g.
    `L1I_CACHE_REFILL`, `BR_MIS_PRED`) instead of the generic timer. This is
@@ -164,6 +179,16 @@ thread's stack is separate memory. SMP is bookkeeping, not new logic:
   verified against LK's actual scheduler source), track thread ID
   separately from CPU ID too.
 
+**Status**: per-CPU timer/ring-buffers/CNTPCT-timestamp/merged+per-core
+output are implemented and verified (`app/profiler/profiler.c`,
+`scripts/pc_histogram.py`). Per-core stack-bounds sanity-checking and
+thread-migration tracking are **not** implemented -- real gaps, not
+overlooked; the plausibility-gated FP-chain walk (Stage 3) already
+rejects most corruption without needing stack bounds, which is why this
+wasn't blocking, but a bounds table would catch a stricter class of
+"looks-valid-but-isn't" corruption that the .text-range check alone
+can't.
+
 ## What's reused from bolt-aarch32, not reinvented
 
 - QMP `dump-guest-memory` + host-side extraction, the exact mechanism in
@@ -182,8 +207,11 @@ thread's stack is separate memory. SMP is bookkeeping, not new logic:
 
 ## Open questions / not yet verified
 
-- Real SMP LK bring-up on this target (secondary core release, per-core
-  stacks, scheduler runqueues) -- prerequisite, not yet demonstrated here.
+- ~~Real SMP LK bring-up on this target~~ **Verified** (Stage 4): `-smp 4`
+  reaches "welcome to lk/MP", all 4 cores show up in `threadstats`, and
+  concurrent per-core sampling + FP-chain unwinding works correctly.
+- Per-core stack bounds for the offline walker, and thread-migration
+  tracking -- not implemented (see SMP-specific design section above).
 - Whether QEMU's `cortex-a15` TCG model implements meaningful PMU event
   counters (`L1I_CACHE_REFILL` etc.) at all -- relevant only once stage 5
   is reached; irrelevant to stages 0-4, which only need the generic timer.
