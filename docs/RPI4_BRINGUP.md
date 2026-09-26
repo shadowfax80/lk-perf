@@ -434,9 +434,9 @@ for the fixes and commit `7bcd92a` for the full writeup.
    (QEMU-only) and has no real-hardware equivalent -- it needs to
    become a serial dump instead.
 4. **EXIDX unwinding**, replacing the FP-chain walker
-   (`walk_fp_chain` in `scripts/pc_histogram.py`). No hardware
-   dependency -- can be built and tested on the existing QEMU setup
-   independently of the steps above.
+   (`walk_fp_chain` in `scripts/pc_histogram.py`). Developed and
+   tested directly on the Pi 4B home-lab hardware, same as everything
+   else here -- QEMU is not used for this project going forward.
 5. **Real PMU event validation.** Read `PMCEID0`/`PMCEID1` on hardware
    to see what's actually implemented on this SoC's cores, then try
    counting a real event (e.g. `L1D_CACHE_REFILL`) across a known
