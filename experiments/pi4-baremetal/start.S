@@ -1,11 +1,14 @@
 /*
  * Minimal AArch32 boot stub for Raspberry Pi 4B (BCM2711).
  *
- * With arm_64bit=0 in config.txt, Pi 4's firmware releases all 4
- * Cortex-A72 cores simultaneously in AArch32 SVC mode at this entry
- * point (0x8000) -- unlike QEMU's -cpu cortex-a15, which only ever
- * starts core 0 unless -smp is passed. Every other core must be
- * parked here, or all 4 will race into main() on the same stack.
+ * With arm_64bit=0 in config.txt, the firmware's 32-bit armstub
+ * normally enters only core 0 here (0x8000), in HYP mode, not SVC.
+ * Cores 1-3 stay in the armstub, spinning on their ARM-local mailbox 3
+ * until the kernel writes an entry address there -- that is the
+ * secondary-release mechanism an LK port has to use, and LK's entry
+ * path has to drop from HYP to SVC. The MPIDR check below is kept as a
+ * safety net (a custom armstub or kernel_old=1 can release all cores
+ * at once); it costs nothing if only core 0 arrives.
  */
 
 .section ".text.boot"

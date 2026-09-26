@@ -46,7 +46,47 @@ And Raspberry Pi's own vendor firmware solves the AArch32 boot-state
 question via a plain `config.txt` setting (`arm_64bit=0`) — no TF-A
 integration needed, unlike the FVP.
 
-## Current status (as of this doc)
+## Update 2026-09-26: first hardware milestone passed (steps 1-2 done)
+
+Moved to the home PC, which has the SD card and serial adapter attached and
+can write to the card normally. `experiments/pi4-baremetal/kernel7l.img`
+booted on the real Pi 4B, and the serial console showed the banner and a
+steadily incrementing heartbeat, with one boot and no reset loop:
+
+```
+pi4-baremetal: AArch32 boot OK, PL011 UART live
+core: 0 (others parked)
+heartbeat 0
+heartbeat 1
+...
+```
+
+Things found along the way that the plan below didn't anticipate:
+
+- **PL011 is routed to Bluetooth on Pi 4 by default.** `enable_uart=1`
+  alone puts the *mini-UART* on GPIO14/15, so the original image would have
+  booted and printed nothing. The fix is applied twice: `dtoverlay=disable-bt`
+  in `config.txt`, and `main.c` now muxes GPIO14/15 to ALT0 and clears their
+  pulls itself (BCM2711 `GPIO_PUP_PDN_CNTRL_REG0`, not the BCM283x
+  `GPPUD` sequence). An LK `rpi4` target needs the same pin setup.
+- **The firmware normally enters only core 0, in HYP mode.** The 32-bit
+  armstub keeps cores 1-3 spinning on their ARM-local mailbox 3 (so it's
+  not PSCI). That answers the secondary-release question under "Open risks"
+  below, and it means LK's entry path has to drop from HYP to SVC. Both
+  still need confirming on hardware during the LK port.
+- **PL2303TA serial adapters are blocked on Windows 11.** Prolific's
+  3.9.6.0 and 3.8.43.0 drivers both refuse the chip at runtime. Driver
+  3.8.28.0 (Oct 2018, Microsoft Update Catalog, Microsoft-signed) works.
+  Windows Update may upgrade it again later.
+- The card actually holds Raspberry Pi OS **2021-05-07** (full image, boot
+  label `boot`), not a current Lite image. Its firmware boots this board,
+  but a newer board revision (1.5+) would need newer firmware.
+- The original files are kept on the card as `kernel7l-linux-backup.img` and
+  `config-linux-backup.txt`.
+
+**Next up: step 3 (LK `TARGET=rpi4` port).**
+
+## Status before the 2026-09-26 update
 
 **Physical setup, on the *office* PC (write-blocked, see below):**
 - Raspberry Pi 4B, official USB-C PSU, microSD card

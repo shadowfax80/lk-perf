@@ -1,2 +1,6 @@
 # LK tree produced by setup.sh
 /build/
+
+# pi4-baremetal build intermediates (kernel7l.img itself is committed)
+experiments/pi4-baremetal/*.o
+experiments/pi4-baremetal/*.elf

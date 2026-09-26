@@ -24,7 +24,11 @@ incrementing heartbeat over serial forever.
    ```
    arm_64bit=0
    enable_uart=1
+   dtoverlay=disable-bt
    ```
+   `disable-bt` matters: on Pi 4 the PL011 is wired to Bluetooth by
+   default and GPIO14/15 carry the mini-UART. `main.c` also muxes
+   GPIO14/15 to ALT0 itself, so either one alone should be enough.
 3. Copy this directory's `kernel7l.img` onto the boot partition,
    overwriting the original.
 4. Wire a 3.3V USB-to-TTL adapter: adapter RX -> Pi GPIO14, adapter TX

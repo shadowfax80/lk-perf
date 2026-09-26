@@ -23,6 +23,10 @@
 #define MBOX_EMPTY  0x40000000u
 #define MBOX_CH_PROP 8u
 
+#define GPIO_BASE   (PERIPHERAL_BASE + 0x200000u)
+#define GPFSEL1     (*(volatile uint32_t *)(GPIO_BASE + 0x04))
+#define GPIO_PUP_PDN_CNTRL_REG0 (*(volatile uint32_t *)(GPIO_BASE + 0xE4))
+
 #define UART0_BASE  (PERIPHERAL_BASE + 0x201000u)
 #define UART0_DR    (*(volatile uint32_t *)(UART0_BASE + 0x00))
 #define UART0_FR    (*(volatile uint32_t *)(UART0_BASE + 0x18))
@@ -63,9 +67,29 @@ static void mbox_set_uart_clock(void) {
     }
 }
 
+// On Pi 4, PL011 is wired to the onboard Bluetooth by default and
+// GPIO14/15 carry the mini-UART (ALT5) -- enable_uart=1 alone does not
+// change that. Mux GPIO14/15 to ALT0 (PL011 TXD0/RXD0) here so output
+// reaches the header regardless of whether dtoverlay=disable-bt took
+// effect in firmware.
+static void gpio_uart0_pins(void) {
+    uint32_t sel = GPFSEL1;
+    sel &= ~((7u << 12) | (7u << 15));  // FSEL14, FSEL15
+    sel |= (4u << 12) | (4u << 15);     // ALT0
+    GPFSEL1 = sel;
+
+    // BCM2711 pull control (replaces the BCM283x GPPUD/GPPUDCLK dance):
+    // 2 bits per pin, 00 = no pull. GPIO14 -> [29:28], GPIO15 -> [31:30].
+    uint32_t pull = GPIO_PUP_PDN_CNTRL_REG0;
+    pull &= ~((3u << 28) | (3u << 30));
+    GPIO_PUP_PDN_CNTRL_REG0 = pull;
+}
+
 static void uart_init(void) {
     UART0_CR = 0;               // disable UART while configuring
     UART0_ICR = 0x7FF;          // clear pending interrupts
+
+    gpio_uart0_pins();
 
     mbox_set_uart_clock();      // UART clock = 3MHz, fixed
 
