@@ -120,7 +120,26 @@ Everything below the next heading is history.
 2. **The serial side runs on whichever PC the Pi's USB-serial cable is
    plugged into.** That PC needs Python with `pyserial`. On Windows 11 the
    PL2303TA adapter also needs Prolific driver **3.8.28.0**, because newer
-   ones refuse the chip (see the 2026-09-26 update above). Wiring: adapter
+   ones refuse the chip (see the 2026-09-26 update above). You can tell
+   it's blocked when Device Manager names the adapter "PL2303TA DO NOT
+   SUPPORT WINDOWS 11 OR LATER" and no COM port appears. The fix, from an
+   elevated PowerShell:
+   - Download the Microsoft-signed package (Update Catalog, "Prolific -
+     Ports - 3.8.28.0"):
+     `https://catalog.s.download.windowsupdate.com/d/msdownload/update/driver/drvs/2019/04/959b8377-7fe8-4ac6-8893-6a3e95b0e8fe_c88b1f07c9075bbfa998a67df0511e2e6d98af10.cab`
+     (its SHA1 is the hex after the `_`).
+   - Unpack it: `expand driver.cab -F:* .`
+   - Install it: `pnputil /add-driver ser2pl.inf`.
+   - `pnputil /enum-drivers`, then delete every *newer* Prolific
+     `ser2pl` package with `pnputil /delete-driver oemNN.inf /uninstall`.
+     Windows always prefers the newest version, so leaving one behind
+     means it wins again.
+   - `pnputil /remove-device <USB\VID_067B&PID_2303\...>` then
+     `pnputil /scan-devices`. The adapter comes back as "Prolific
+     USB-to-Serial Comm Port (COMn)".
+
+   Windows Update may later re-upgrade the driver; the same steps undo
+   that. Wiring: adapter
    RX to GPIO14 (pin 8), adapter TX to GPIO15 (pin 10), GND to pin 6.
    115200 8N1.
 3. **The build runs on Linux: a RunPod CPU pod, WSL or any Linux box.** The
