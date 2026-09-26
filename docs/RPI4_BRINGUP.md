@@ -104,6 +104,35 @@ next section.**
 This section is the handoff for picking the work up on another machine.
 Everything below the next heading is history.
 
+### Resuming with Claude Code
+
+Clone or pull the repo, start `claude` in its root, and paste the prompt
+below. The session also loads `CLAUDE.md` automatically, which has the
+working rules: RunPod handling, ask-first actions, commit identity and
+environment gotchas.
+
+```
+Continue the Raspberry Pi 4B bring-up of lk-perf on this PC; the Pi
+and its USB-serial adapter are plugged in here. Read CLAUDE.md and
+the "Start here" section of docs/RPI4_BRINGUP.md first.
+1. Prove the serial path: pip-install pyserial, run
+   scripts/pi4_doctor.py --no-pi, then --boot-test (tell me when to
+   power-cycle the Pi). Fix failures from the doc's setup table, asking
+   me before driver installs or admin actions. Don't continue until
+   the heartbeat shows.
+2. Set up the Linux build box: I'll create a RunPod CPU pod. Give me
+   this PC's SSH public key to add, wait for my "SSH over exposed TCP"
+   command, then clone the repo there, run ./setup.sh and confirm the
+   QEMU `make profiler` baseline builds and boots.
+3. Start the LK TARGET=rpi4 port per the doc's step 3 plan, as
+   overlay/lk/0004-bcm28xx-add-rpi4.patch, single-core first, aiming
+   for M1 then M2. Verify the GIC IDs and the boot-args symbol against
+   the sources as the doc says. Commit and push at each milestone.
+```
+
+If the new machine runs Linux, the Windows driver steps don't apply, and
+it can build LK itself with `./setup.sh`, so step 2 needs no RunPod.
+
 ### What exists and works (all verified on the real Pi 4B)
 
 | Piece | Where | State |
