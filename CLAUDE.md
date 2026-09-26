@@ -33,11 +33,13 @@ Don't start porting work until `--boot-test` shows the heartbeat.
 
 ## Rules the user has set
 
-- **RunPod (the Linux build box):** the user creates and stops pods
-  themselves. Claude supplies an SSH public key to add under RunPod
-  Settings -> SSH Public Keys and uses the "SSH over exposed TCP" command
-  the user pastes. **Never ask for or handle the RunPod API key.** Any
-  Linux box or WSL works the same way (`./setup.sh` expects apt).
+- **RunPod (the Linux build box):** controlled programmatically. The API
+  key lives in the `RUNPOD_API_KEY` Windows user environment variable on
+  this machine (not in any repo file, not in Claude's memory files) --
+  read it from there for pod create/stop/balance checks via the RunPod
+  GraphQL API (`https://api.runpod.io/graphql`). Never write the key's
+  value into a file, commit, or memory entry. Any Linux box or WSL works
+  the same way (`./setup.sh` expects apt).
 - **Ask first** before driver installs, anything needing admin/UAC,
   writing to the SD card, or anything that costs money.
 - **Commits:** author `Somraj Mani <somraj.mani@gmail.com>`. Set it
