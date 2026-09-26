@@ -21,6 +21,21 @@
 .global _start
 
 _start:
+    /* Force both caches off unconditionally. Without this, a payload
+     * large enough to overlap cache lines from this loader's own
+     * earlier execution at this same address (before it relocated
+     * away) can be fetched stale after the jump -- confirmed: a known-
+     * good small payload padded to ~93KB reproduces total silence
+     * after a clean CRC-verified transfer and jump, while the same
+     * bytes unpadded work. The receive loop's data writes always land
+     * correctly (that path is architecturally uncached with the MMU
+     * off), so this is instruction-side staleness, not a transfer bug. */
+    mrc     p15, 0, r7, c1, c0, 0   @ SCTLR
+    bic     r7, r7, #(1 << 12)      @ I bit
+    bic     r7, r7, #(1 << 2)       @ C bit
+    mcr     p15, 0, r7, c1, c0, 0   @ SCTLR
+    isb
+
     adr     r3, _start              @ where we are running (0x8000)
     ldr     r4, =__image_start      @ where we are linked
     ldr     r5, =__image_end
