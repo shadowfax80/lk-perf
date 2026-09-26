@@ -14,6 +14,8 @@
  *   host -> <size> payload bytes
  *   Pi   -> "CRC OK, jumping to 0x00008000\n" and jumps,
  *           or "ER ..." and goes back to waiting
+ * "CRC OK" means the CRC matched twice: over the bytes as received,
+ * and re-read from payload memory just before the jump.
  * crc32 is the standard IEEE CRC-32 (zlib.crc32 / binascii.crc32).
  */
 #include <stdint.h>
@@ -309,6 +311,25 @@ void boot_main(uint32_t r0, uint32_t r1, uint32_t r2) {
             uart_puts(" want ");
             uart_puthex(want_crc);
             uart_puts("\n");
+            continue;
+        }
+
+        // The CRC above covers the bytes as they arrived. Recompute it
+        // from memory too: a mismatch here means something changed the
+        // payload region after it was written, which the stream CRC
+        // can't see and which looks exactly like a cache problem from
+        // the outside.
+        uint32_t mem_crc = 0xFFFFFFFFu;
+        for (uint32_t i = 0; i < size; i++) {
+            mem_crc = crc32_update(mem_crc, dst[i]);
+        }
+        mem_crc = ~mem_crc;
+        if (mem_crc != want_crc) {
+            uart_puts("ER readback crc got ");
+            uart_puthex(mem_crc);
+            uart_puts(" want ");
+            uart_puthex(want_crc);
+            uart_puts(" -- payload memory changed after receive\n");
             continue;
         }
 

@@ -129,7 +129,10 @@ def send_image(port: serial.Serial, console: Console, image: bytes,
     port.flush()
     print()
 
-    reply = wait_for(port, console, ("CRC OK", "ER"), 10.0)
+    # The loader re-reads the whole payload from memory for a second CRC
+    # before answering; with its caches off that takes seconds on a
+    # large image.
+    reply = wait_for(port, console, ("CRC OK", "ER"), 60.0)
     if reply.startswith("ER"):
         sys.exit(f"error: transfer failed: {reply}")
     console.write((reply + "\n").encode())
