@@ -29,8 +29,23 @@ _start:
      * after a clean CRC-verified transfer and jump, while the same
      * bytes unpadded work. The receive loop's data writes always land
      * correctly (that path is architecturally uncached with the MMU
-     * off), so this is instruction-side staleness, not a transfer bug. */
-    mrc     p15, 0, r7, c1, c0, 0   @ SCTLR
+     * off), so this is instruction-side staleness, not a transfer bug.
+     *
+     * Pi 4 enters us in HYP, where HSCTLR -- not SCTLR -- controls
+     * caching of our own fetches and of a payload that stays in HYP.
+     * SCTLR still matters for a payload that drops to SVC (LK does),
+     * so clear both. HSCTLR is only accessible from HYP (UNDEFINED
+     * from PL1), hence the mode check. */
+    mrs     r7, cpsr
+    and     r7, r7, #0x1f
+    cmp     r7, #0x1a               @ HYP?
+    bne     3f
+    mrc     p15, 4, r7, c1, c0, 0   @ HSCTLR
+    bic     r7, r7, #(1 << 12)      @ I bit
+    bic     r7, r7, #(1 << 2)       @ C bit
+    mcr     p15, 4, r7, c1, c0, 0   @ HSCTLR
+    isb
+3:  mrc     p15, 0, r7, c1, c0, 0   @ SCTLR
     bic     r7, r7, #(1 << 12)      @ I bit
     bic     r7, r7, #(1 << 2)       @ C bit
     mcr     p15, 0, r7, c1, c0, 0   @ SCTLR
