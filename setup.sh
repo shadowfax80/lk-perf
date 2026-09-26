@@ -66,6 +66,12 @@ apply_overlay() {
     rsync -a "$ROOT/app/profiler/" "$LK_DIR/app/profiler/"
     cp "$ROOT/project/profiler.mk" "$LK_DIR/project/profiler.mk"
     [ -d "$LK_DIR/app/profiler" ] && find "$LK_DIR/app/profiler" -name "*.sh" -exec chmod +x {} \; || true
+
+    echo "Applying rpi4 target overlay ..."
+    mkdir -p "$LK_DIR/target/rpi4"
+    cp "$ROOT/project/rpi4-test.mk" "$LK_DIR/project/rpi4-test.mk"
+    cp "$ROOT/target/rpi4/rules.mk" "$LK_DIR/target/rpi4/rules.mk"
+
     apply_lk_patches
 }
 

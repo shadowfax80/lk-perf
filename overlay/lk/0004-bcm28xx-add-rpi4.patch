@@ -1,0 +1,261 @@
+diff --git a/platform/bcm28xx/include/platform/bcm28xx.h b/platform/bcm28xx/include/platform/bcm28xx.h
+index f4b06f06..fc7c3f0b 100644
+--- a/platform/bcm28xx/include/platform/bcm28xx.h
++++ b/platform/bcm28xx/include/platform/bcm28xx.h
+@@ -9,7 +9,11 @@
+ 
+ #define SDRAM_BASE 0
+ /* Note: BCM2836/BCM2837 use different peripheral base than BCM2835 */
++#if BCM2711
++#define BCM_PERIPH_BASE_PHYS    (0xFE000000U)
++#else
+ #define BCM_PERIPH_BASE_PHYS    (0x3f000000U)
++#endif
+ #define BCM_PERIPH_SIZE         (0x01100000U)
+ 
+ #if BCM2836
+@@ -17,6 +21,21 @@
+ #elif BCM2837
+ #define BCM_PERIPH_BASE_VIRT    (0xffffffffc0000000ULL)
+ #define MEMORY_APERTURE_SIZE    (1024 * 1024 * 1024)
++#elif BCM2711
++/* BCM2711 (Pi 4) low-peripheral mode: main peripherals, ARM-local
++ * peripherals and the GIC-400 all live inside one 64MB physical
++ * window [0xFC000000, 0xFFFFFFFF] -- confirmed via bcm2711.dtsi, not
++ * the BCM2836/2837 layout (whose ARM-local window sits exactly
++ * 0x01000000 above the main peripheral base; BCM2711's gap is
++ * 0x01800000, so that generic derivation below does not apply and is
++ * overridden explicitly here). One mapping covers all three.
++ */
++#define BCM2711_LOW_PERIPH_PHYS (0xFC000000U)
++#define BCM2711_LOW_PERIPH_VIRT (0xe0000000U)
++#define BCM2711_LOW_PERIPH_SIZE (0x04000000U) /* 64MB */
++#define BCM_PERIPH_BASE_VIRT    (BCM2711_LOW_PERIPH_VIRT + (0xFE000000U - BCM2711_LOW_PERIPH_PHYS))
++#define BCM_LOCAL_PERIPH_BASE_VIRT (BCM2711_LOW_PERIPH_VIRT + (0xFF800000U - BCM2711_LOW_PERIPH_PHYS))
++#define BCM_GIC_BASE_VIRT       (BCM2711_LOW_PERIPH_VIRT + (0xFF840000U - BCM2711_LOW_PERIPH_PHYS))
+ #else
+ #error Unknown BCM28XX Variant
+ #endif
+@@ -25,7 +44,9 @@
+ #define BCM_SDRAM_BUS_ADDR_BASE (BCM_SDRAM_BUS_ADDR_BASE_NO_L2)
+ 
+ /* pointer to 'local' peripherals at 0x40000000 */
++#ifndef BCM_LOCAL_PERIPH_BASE_VIRT /* BCM2711 already defined this above */
+ #define BCM_LOCAL_PERIPH_BASE_VIRT (BCM_PERIPH_BASE_VIRT + 0x01000000)
++#endif
+ 
+ #define IC0_BASE                (BCM_PERIPH_BASE_VIRT + 0x2000)
+ #define ST_BASE                 (BCM_PERIPH_BASE_VIRT + 0x3000)
+@@ -62,6 +83,9 @@
+ #define ARM0_MAILBOX_STATUS     (ARM0_MAILBOX_BASE + 0x18)
+ #define ARM0_MAILBOX_WRITE      (ARM0_MAILBOX_BASE + 0x20)
+ 
++#ifndef BCM_LOCAL_PERIPH_BASE_VIRT
++#define BCM_LOCAL_PERIPH_BASE_VIRT (BCM_PERIPH_BASE_VIRT + 0x01000000)
++#endif
+ #define ARM_LOCAL_BASE          (BCM_LOCAL_PERIPH_BASE_VIRT)
+ 
+ /* interrupts */
+@@ -171,7 +195,26 @@
+ #define INTERRUPT_ARM_LOCAL_ZERO       (ARM_IRQ_LOCAL_BASE + 10)
+ #define INTERRUPT_ARM_LOCAL_TIMER      (ARM_IRQ_LOCAL_BASE + 11)
+ 
++#if BCM2711
++/* Using dev/interrupt/arm_gic instead of this file's own vector
++ * numbering (see below) -- GIC SPI IDs go well past 107
++ * (INTERRUPT_ARM_LOCAL_TIMER), e.g. UART0 is GIC ID 153. */
++#undef MAX_INT
++#define MAX_INT 256
++/* Redefine the two vector-number macros uart.c and platform.c already
++ * use (INTERRUPT_VC_UART, INTERRUPT_ARM_LOCAL_CNTPNSIRQ) to the real
++ * GIC IDs for BCM2711, confirmed against bcm2711.dtsi: non-secure
++ * physical timer = PPI 14 = GIC ID 30, PL011 UART0 = SPI 121 = GIC ID
++ * 153. This is what makes uart.c reusable unmodified: it already
++ * calls register_int_handler(INTERRUPT_VC_UART + i, ...); redefining
++ * the macro is enough, no source edit needed. */
++#undef INTERRUPT_VC_UART
++#define INTERRUPT_VC_UART 153
++#undef INTERRUPT_ARM_LOCAL_CNTPNSIRQ
++#define INTERRUPT_ARM_LOCAL_CNTPNSIRQ 30
++#else
+ #define MAX_INT INTERRUPT_ARM_LOCAL_TIMER
++#endif
+ 
+ /* GPIO */
+ 
+diff --git a/platform/bcm28xx/include/platform/gic.h b/platform/bcm28xx/include/platform/gic.h
+new file mode 100644
+index 00000000..01bf62a3
+--- /dev/null
++++ b/platform/bcm28xx/include/platform/gic.h
+@@ -0,0 +1,10 @@
++/*
++ * dev/interrupt/arm_gic/arm_gic.c unconditionally includes
++ * <platform/gic.h> -- every platform using that module must supply
++ * one, even a thin stub (see platform/qemu-virt-arm/include/platform/gic.h
++ * for the same pattern). Only MAX_INT is actually needed here, and
++ * platform/bcm28xx.h already defines it correctly per variant.
++ */
++#pragma once
++
++#include <platform/bcm28xx.h>
+diff --git a/platform/bcm28xx/platform.c b/platform/bcm28xx/platform.c
+index 67a395d4..4bc286e8 100644
+--- a/platform/bcm28xx/platform.c
++++ b/platform/bcm28xx/platform.c
+@@ -16,6 +16,7 @@
+ #include <kernel/vm.h>
+ #include <kernel/spinlock.h>
+ #include <dev/timer/arm_generic.h>
++#include <dev/interrupt/arm_gic.h>
+ #include <platform.h>
+ #include <platform/interrupts.h>
+ #include <platform/bcm28xx.h>
+@@ -93,6 +94,42 @@ struct mmu_initial_mapping mmu_initial_mappings[] = {
+ 
+ extern void arm64_reset(void);
+ 
++#elif BCM2711
++#include <arch/arm.h>
++#include <arch/arm/mmu.h>
++
++/* Same idea as BCM2836: 64MB device window covering main peripherals,
++ * ARM-local peripherals and the GIC-400 in one mapping (see
++ * platform/bcm28xx.h for the phys/virt constants), plus SDRAM and a
++ * temporary low identity map for the boot code in start.S. */
++struct mmu_initial_mapping mmu_initial_mappings[] = {
++    {
++        .phys = SDRAM_BASE,
++        .virt = KERNEL_BASE,
++        .size = MEMSIZE,
++        .flags = 0,
++        .name = "memory"
++    },
++    {
++        .phys = BCM2711_LOW_PERIPH_PHYS,
++        .virt = BCM2711_LOW_PERIPH_VIRT,
++        .size = BCM2711_LOW_PERIPH_SIZE,
++        .flags = MMU_INITIAL_MAPPING_FLAG_DEVICE,
++        .name = "bcm2711 low peripherals + gic"
++    },
++    {
++        .phys = SDRAM_BASE,
++        .virt = SDRAM_BASE,
++        .size = 16*1024*1024,
++        .flags = MMU_INITIAL_MAPPING_TEMPORARY
++    },
++    { 0 }
++};
++
++extern void arm_reset(void);
++
++#define DEBUG_UART 0
++
+ #else
+ #error Unknown BCM28XX Variant
+ #endif
+@@ -109,10 +146,43 @@ static pmm_arena_t arena = {
+ void platform_init_mmu_mappings(void) {
+ }
+ 
++#if BCM2711
++static void bcm2711_gic_init(uint level) {
++    /* GIC-400 (GICv2-compatible), confirmed via bcm2711.dtsi:
++     * distributor at phys 0xFF841000, cpu interface at 0xFF842000
++     * (GICBASE 0xFF840000 + 0x1000/+0x2000). Using the runtime
++     * arm_gic_init_map() API (same one qemu-virt-arm uses, just with
++     * hardcoded physical addresses instead of FDT-derived ones for
++     * this first cut) rather than the legacy GICBASE-macro
++     * arm_gic_init() path, which needs those macros visible when
++     * dev/interrupt/arm_gic/arm_gic.c itself is compiled -- awkward
++     * to arrange without editing that shared, non-platform-owned
++     * file. arm_gic_init_map() takes physical addresses and maps them
++     * itself. */
++    static const struct arm_gic_init_info bcm2711_gic_info = {
++        .gic_revision = 2,
++        .gicd_paddr = 0xFF841000,
++        /* dev/interrupt/arm_gic requires at least GICD_MIN_SIZE
++         * (0x10000) as a bounds-checking margin, even though GICv2's
++         * real distributor register block is 4KB -- this is metadata
++         * for the module's own sanity check, not an extra mapping. */
++        .gicd_size = 0x10000,
++        .gicc_paddr = 0xFF842000,
++        .gicc_size = 0x1000,
++    };
++    arm_gic_init_map(&bcm2711_gic_info);
++}
++LK_INIT_HOOK(bcm2711_gic_init, bcm2711_gic_init, LK_INIT_LEVEL_VM);
++#endif
++
+ void platform_early_init(void) {
+     uart_init_early();
+ 
++#if BCM2711
++    /* deferred to bcm2711_gic_init(), see above */
++#else
+     intc_init();
++#endif
+ 
+ #if BCM2837
+     arm_generic_timer_init(INTERRUPT_ARM_LOCAL_CNTPNSIRQ, 0);
+@@ -161,6 +231,8 @@ void platform_early_init(void) {
+ 
+ #elif BCM2836
+     arm_generic_timer_init(INTERRUPT_ARM_LOCAL_CNTPNSIRQ, 1000000);
++#elif BCM2711
++    arm_generic_timer_init(INTERRUPT_ARM_LOCAL_CNTPNSIRQ, 0);
+ #else
+ #error Unknown BCM28XX Variant
+ #endif
+diff --git a/platform/bcm28xx/rules.mk b/platform/bcm28xx/rules.mk
+index 8f291036..472d211d 100644
+--- a/platform/bcm28xx/rules.mk
++++ b/platform/bcm28xx/rules.mk
+@@ -66,6 +66,47 @@ MODULE_DEPS += \
+ 	    app/tests \
+ 	    lib/fdt
+ 
++else ifeq ($(TARGET),rpi4)
++ARCH := arm
++ARM_CPU := cortex-a15
++# This board's firmware enters LK in Hyp mode (confirmed via the
++# chainloader's own boot banner), so start.S's HYP->SVC drop has to
++# actually run. That drop is gated on ARM_WITH_HYP, and
++# arch/arm/rules.mk only sets it for ARM_CPU=cortex-a7 -- cortex-a15
++# does not set it. Without this, the #if ARM_WITH_HYP block compiles
++# out entirely, the CPU stays in Hyp mode for the rest of boot, and
++# .Lmmu_setup's SCTLR.M write silently does nothing for Hyp-mode
++# execution (that's HSCTLR.M, never touched), so the jump to the
++# virtual continuation address after MMU-enable executes as a raw
++# physical branch into empty memory. Confirmed by UART probes at each
++# boot stage: everything up to and including the last instruction
++# before .Lmmu_setup runs fine; nothing after it ever executes.
++GLOBAL_DEFINES += \
++	ARM_WITH_HYP=1
++KERNEL_BASE = 0x80000000
++KERNEL_LOAD_OFFSET := 0x00008000
++MEMSIZE ?= 0x10000000 # 256MB
++SMP_CPU_ID_BITS := 8
++
++# First cut: SMP off. Get one core to a working shell before turning on
++# the mailbox-3 secondary release this platform already has (same code
++# path as rpi2 -- see platform_early_init's non-BCM2837 branch).
++WITH_SMP := 0
++
++GLOBAL_DEFINES += \
++	BCM2711=1
++
++MODULE_SRCS += \
++	$(LOCAL_DIR)/uart.c
++
++# BCM2711 uses a real GIC-400 (GICv2), not this platform's legacy
++# proprietary interrupt controller -- drop intc.c, add the GIC module.
++# (Both rpi2 and rpi3 above still use intc.c; BCM2837's own branch of it
++# already exists in intc.c itself, unrelated to this change.)
++MODULE_SRCS := $(filter-out $(LOCAL_DIR)/intc.c,$(MODULE_SRCS))
++MODULE_DEPS += \
++	dev/interrupt/arm_gic
++
+ endif
+ 
+ include make/module.mk
