@@ -84,6 +84,18 @@ Things found along the way that the plan below didn't anticipate:
 - The original files are kept on the card as `kernel7l-linux-backup.img` and
   `config-linux-backup.txt`.
 
+**Serial chainloader working (same day).** `experiments/pi4-serialboot/` is
+now the `kernel7l.img` on the card. Images are sent over the console cable
+with `scripts/pi4_serial_boot.py`, so the SD card no longer moves. On first
+use it loaded `pi4-baremetal` (682 bytes, CRC OK, ~14 KiB/s) and the
+heartbeat came up. Its banner confirmed two things on real hardware:
+
+- **Entry mode is HYP** (`mode=HYP`), so the LK port does need the
+  HYP->SVC drop.
+- **The firmware's DTB is at `0x2eff3b00`** (`r2`), near the top of low RAM
+  and nowhere near the `0x8000` payload region. The loader's DTB-move path
+  wasn't needed. `r1=0xc42` is the device-tree machine type.
+
 **Next up: step 3 (LK `TARGET=rpi4` port).**
 
 ## Status before the 2026-09-26 update
