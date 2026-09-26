@@ -42,7 +42,10 @@ overlay/lk/*.patch     small, additive core-LK patches (e.g. the GIC tick hook)
 app/profiler/          the profiler LK module (grows through the staged plan)
 project/profiler.mk    LK project file (app/shell + app/profiler on qemu-virt-arm32)
 docs/DESIGN.md         full design: constraints, staged plan, SMP bookkeeping
-scripts/               host-side tooling (symbolizer, offline unwinder, flamegraph glue)
+docs/RPI4_BRINGUP.md   real-hardware track on Raspberry Pi 4B: status + LK port plan
+experiments/pi4-*/     standalone Pi 4B images (validation image, serial chainloader)
+scripts/               host-side tooling (symbolizer, offline unwinder, flamegraph glue,
+                       pi4_serial_boot.py for loading images onto the Pi over serial)
 ```
 
 LK is **not pinned** — deliberately tracks upstream `littlekernel/lk`'s
@@ -77,5 +80,11 @@ Stages 1–4 verified end-to-end on a fresh QEMU boot:
   secure-monitor boot stage to clear the relevant trap) -- caught by
   isolating a crash in an earlier, more ambitious version of this
   command before it shipped, not left in a panicking state.
+
+Real hardware (Raspberry Pi 4B, AArch32): a bare-metal image boots and
+prints over PL011, and a serial chainloader now loads images over the
+console cable, so the SD card no longer moves. Next is the LK
+`TARGET=rpi4` port. **To pick the work up, start with "Start here" in
+[docs/RPI4_BRINGUP.md](docs/RPI4_BRINGUP.md).**
 
 See [docs/DESIGN.md](docs/DESIGN.md) for full details.

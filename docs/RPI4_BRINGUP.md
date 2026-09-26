@@ -96,7 +96,160 @@ heartbeat came up. Its banner confirmed two things on real hardware:
   and nowhere near the `0x8000` payload region. The loader's DTB-move path
   wasn't needed. `r1=0xc42` is the device-tree machine type.
 
-**Next up: step 3 (LK `TARGET=rpi4` port).**
+**Next up: step 3 (LK `TARGET=rpi4` port). The detailed plan is in the
+next section.**
+
+## Start here: state at end of 2026-09-26 and the LK port plan
+
+This section is the handoff for picking the work up on another machine.
+Everything below the next heading is history.
+
+### What exists and works (all verified on the real Pi 4B)
+
+| Piece | Where | State |
+|---|---|---|
+| SD card | in the Pi | holds `experiments/pi4-serialboot/kernel7l.img` plus `config.txt` with `arm_64bit=0`, `enable_uart=1`, `dtoverlay=disable-bt`. The original Linux kernel and config are on the card as `-linux-backup` copies. Only needs touching again to change the bootloader or `config.txt`. |
+| Serial chainloader | `experiments/pi4-serialboot/` | Boots from the card and prints `SBOOT?` once a second. Loads images to `0x8000` over the console cable with a CRC-32 check. |
+| Host sender | `scripts/pi4_serial_boot.py` | `python scripts/pi4_serial_boot.py <image> --port COMx --log <file>`, then power-cycle the Pi. Needs pyserial. Close PuTTY first. |
+| Test payload | `experiments/pi4-baremetal/kernel7l.img` | Known-good image for checking the whole path: banner plus heartbeat. |
+| Confirmed hardware facts | | Entered in **HYP**. `r0=0`, `r1=0xc42`, **DTB at `r2=0x2eff3b00`**. PL011 at `0xFE201000` works at 115200 on GPIO14/15 (ALT0). Generic timer counts (CNTFRQ is set by the firmware). |
+
+### Setting up the next machine
+
+1. `git clone https://github.com/shadowfax80/lk-perf.git` (or `git pull`).
+2. **The serial side runs on whichever PC the Pi's USB-serial cable is
+   plugged into.** That PC needs Python with `pyserial`. On Windows 11 the
+   PL2303TA adapter also needs Prolific driver **3.8.28.0**, because newer
+   ones refuse the chip (see the 2026-09-26 update above). Wiring: adapter
+   RX to GPIO14 (pin 8), adapter TX to GPIO15 (pin 10), GND to pin 6.
+   115200 8N1.
+3. **The build runs on Linux: a RunPod CPU pod, WSL or any Linux box.** The
+   repo's `setup.sh` expects apt: it installs `gcc-arm-none-eabi` and
+   `qemu-system-arm`, clones upstream LK into `build/lk`, and applies
+   `overlay/lk/*.patch`. On RunPod, register the machine's SSH public key
+   under Settings, start the cheapest **CPU** pod on an Ubuntu template, and
+   use the "SSH over exposed TCP" command so `scp` works. Stop the pod when
+   you're done; the repo holds all the state.
+4. Sanity check before any port work: on the build box, `./setup.sh`, then
+   `cd build/lk && make profiler -j$(nproc)`, and boot it under QEMU. This
+   confirms upstream LK tip plus the overlay still build, so later failures
+   are really about the port.
+
+### The round trip once the port builds
+
+```
+# build box
+cd build/lk && make rpi4-test -j$(nproc)            # -> build-rpi4-test/lk.bin
+# serial PC
+scp -P <port> root@<pod-ip>:lk-perf/build/lk/build-rpi4-test/lk.bin .
+python scripts/pi4_serial_boot.py lk.bin --port COM7 --log lk-rpi4.log
+# then power-cycle the Pi
+```
+
+`lk.bin` is the raw image LK builds next to `lk.elf`, linked to run at
+`KERNEL_LOAD_OFFSET`, which must stay `0x8000` for the chainloader. Keep
+`lk.elf` on the build box for `addr2line` and `objdump` when something
+crashes. At the measured ~14 KiB/s, a few-hundred-KB image takes 20-30s.
+
+### Step 3 plan: LK `TARGET=rpi4` (AArch32)
+
+Upstream LK checked 2026-09-26: `platform/bcm28xx` supports `rpi2` (BCM2836,
+AArch32) and `rpi3` (BCM2837, arm64) only. What's already there and
+directly usable:
+
+- **HYP to SVC is already handled.** `arch/arm/arm/start.S` checks for mode
+  `0x1a` and calls `arm32_hyp_to_svc` when `ARM_WITH_HYP=1`, which
+  `ARM_CPU := cortex-a15` sets. Use `cortex-a15`, the same as the QEMU
+  project, so the profiler patches see the same arch code. A72 runs
+  ARMv7-A code fine in AArch32.
+- **Secondary-core release already matches Pi 4.** The rpi2 path writes the
+  entry address to `ARM_LOCAL_BASE + 0x8c + 0x10*i`, which is ARM-local
+  mailbox 3, exactly what the Pi 4 armstub spins on. Only `ARM_LOCAL_BASE`
+  moves, to `0xFF800000` physical on BCM2711.
+- **The PL011 driver (`uart.c`) is reusable.** `uart_init_early()` only sets
+  `CR`; it doesn't program baud, pins or clock. When LK is chain-loaded,
+  the chainloader has already left PL011 at 115200 on GPIO14/15, so this
+  works as-is. For a direct SD-card boot later, add the GPIO ALT0 mux and
+  the 48MHz mailbox clock plus `IBRD=26`/`FBRD=3` from
+  `experiments/pi4-serialboot/main.c`.
+- `dev/timer/arm_generic`: pass freq `0` so it reads CNTFRQ (54MHz), as
+  the rpi3 path does. rpi2 hardcodes 1MHz, which would be wrong here.
+
+What has to change:
+
+1. **Peripheral base and map.** BCM2711 low-peripheral mode puts the main
+   peripherals at `0xFE000000`, ARM-local at `0xFF800000` and the GIC-400 at
+   `0xFF840000`. Map `0xFC000000`-`0xFFFFFFFF` (64MB) as device memory in
+   `mmu_initial_mappings`, e.g. at virt `0xE0000000`. Add a `BCM2711`
+   branch in `bcm28xx.h`/`platform.c` instead of editing the `BCM2836`
+   one.
+2. **Interrupt controller: GIC-400, not `intc.c`.** On Pi 4 the firmware
+   enables the GIC (`enable_gic` defaults on), so the legacy BCM2836
+   controller that `intc.c` drives isn't where interrupts arrive. For
+   `TARGET=rpi4`, drop `intc.c` and add `dev/interrupt/arm_gic` with
+   `GIC_VERSION=2`, `GICBASE(0)` = virt of `0xFF840000`,
+   `GICD_OFFSET=0x1000`, `GICC_OFFSET=0x2000`. Model the defines on
+   `platform/qemu-virt-arm`. Interrupt IDs:
+   - non-secure physical timer (CNTPNSIRQ) = PPI 14 = **ID 30**
+   - PL011 UART0 = SPI 121 = **ID 153**
+
+   Both come from the BCM2711 device tree, so check them against
+   `bcm2711.dtsi` when writing the code. Using `arm_gic`/`gic_v2.c` is also
+   what the profiler's patch `0001` hooks, so the overlay ports with no
+   GIC rework.
+3. **Memory.** Start with `MEMBASE 0`, `MEMSIZE 0x10000000` (256MB),
+   `KERNEL_BASE 0x80000000`, `KERNEL_LOAD_OFFSET 0x8000`, the same as rpi2.
+   The DTB at `0x2eff3b00` is outside that, so nothing to reserve yet.
+   Later: read the real size from the DTB passed in `r2`. LK's arm start
+   code saves r0-r3 as boot args; confirm the symbol name (`lk_boot_args`)
+   in `start.S`. Don't use the rpi3 code's "DTB at `KERNEL_BASE`"
+   assumption, which isn't true on Pi 4.
+4. **New files.** `target/rpi4/rules.mk` (`PLATFORM := bcm28xx`), a
+   `TARGET=rpi4` block in `platform/bcm28xx/rules.mk`, and
+   `project/rpi4-test.mk` (copy of `rpi2-test.mk` with `TARGET := rpi4`).
+   Keep all of it as a new patch, **`overlay/lk/0004-bcm28xx-add-rpi4.patch`**,
+   so `setup.sh` applies it like 0001-0003 and upstream stays un-forked.
+5. **SMP off for the first boot.** Build with `WITH_SMP=0` or
+   `SMP_MAX_CPUS=1`, get a single core to the shell, and only then turn on
+   the mailbox release.
+
+Milestones, each checked through the chainloader log:
+
+- **M1 banner:** LK's `welcome to lk` banner and init log arrive after
+  `CRC OK, jumping to 0x00008000`. If the log stops right after that
+  line, LK died before the console came up (MMU or early init). The
+  cheapest probe: in `start.S`, before the MMU is enabled, store a
+  character to the PL011 data register at `0xFE201000`; the chainloader has
+  the UART ready. Move the probe forward to bisect.
+- **M2 interrupts:** a shell prompt, typing works (UART RX interrupt via
+  GIC ID 153; lines typed into `pi4_serial_boot.py` are forwarded), and
+  timer-driven sleep/`threads` behave (GIC ID 30).
+- **M3 SMP:** all 4 cores up via mailbox 3, confirmed in LK's boot log or
+  shell.
+- **M4 memory:** real memory size from the DTB.
+- **M5 profiler on hardware:** `project/profiler-rpi4.mk` (the rpi4 target
+  plus `app/profiler`, same `-fno-omit-frame-pointer` flags), with patches
+  0001-0003 checked on this build. **Note:** `scripts/pc_histogram.py`
+  pulls the sample ring buffers out through QEMU's QMP `pmemsave`, which
+  real hardware doesn't have. On the Pi the buffers have to come out over
+  the serial console, e.g. a shell command that hex-dumps them, parsed by
+  a host script. Plan that as part of M5.
+
+After M5 the original plan continues: step 5 (EXIDX unwinding) and step 6
+(real PMU events via `PMCEID0`/`PMCEID1`). They're listed under "Next
+steps, in order" below.
+
+### Things that would make iteration faster (optional)
+
+- A `reboot` shell command in LK: write the BCM2711 PM watchdog, `PM_RSTC`
+  and `PM_WDOG` at peripheral base `+0x100000`. Pi then comes back to
+  `SBOOT?` without a physical power-cycle, and the host script could
+  trigger it itself.
+- A faster baud rate in the chainloader and script. The UART clock is
+  already 48MHz, so 921600 is `IBRD=3`/`FBRD=16`. This needs a
+  bootloader update on the SD card.
+- JTAG (`enable_jtag_gpio=1`, GPIO22-27) with an FT2232H adapter and
+  OpenOCD, for when M1 dies before any output.
 
 ## Status before the 2026-09-26 update
 
