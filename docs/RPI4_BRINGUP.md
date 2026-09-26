@@ -405,53 +405,50 @@ Disassembly-verified (not just "it compiled"): MPIDR read -> mask ->
 park non-zero cores -> stack setup -> branch to `main`, exactly as
 designed.
 
+## Status (2026-09-26)
+
+Steps 1-4 below are done: `TARGET=rpi4` boots on real Pi 4B hardware
+over the serial chainloader, all the way to an interactive shell
+(`entering main console loop`, `help` command list echoed back over
+UART RX). Three real bugs were found and fixed getting there --
+`ARM_CPU=cortex-a15` doesn't set `ARM_WITH_HYP` (only `cortex-a7`
+does, so the Hyp->SVC drop was silently compiling out), a GICD
+mapping-size panic (`GICD_MIN_SIZE` vs the real 4KB register block),
+and `arm_gic_init_map()` being called too early -- before the VM
+subsystem it depends on (`vmm_alloc_physical`) is initialized, which
+was silently corrupting kernel BSS. See `overlay/lk/0004-bcm28xx-add-rpi4.patch`
+for the fixes and commit `7bcd92a` for the full writeup.
+
 ## Next steps, in order
 
-1. **Get real SD card write access on some machine.** Either resolve
-   the office PC's write block, or start a fresh Claude Code session
-   on a machine that has the card physically attached and genuine
-   write access (home PC, wife's PC, etc.) -- `git pull` this repo
-   there to get everything above.
-2. **First hardware milestone**: back up the existing `kernel7l.img` to
-   `kernel7l-linux-backup.img`, add `arm_64bit=0` + `enable_uart=1` to
-   `config.txt`, copy `experiments/pi4-baremetal/kernel7l.img` onto the
-   boot partition, boot with PuTTY open on the correct COM port at
-   115200 8N1 *before* powering on. Confirm the boot banner and
-   heartbeat counter actually arrive. This is the one thing that must
-   work before anything else is worth attempting.
-3. **Port LK to Pi 4B.** Confirmed via direct inspection of LK's
-   upstream source: there is **no existing `rpi4`/BCM2711 target** --
-   only `rpi2` (BCM2836, AArch32, Cortex-A7, real structural precedent)
-   and `rpi3` (BCM2837, AArch64). New work: a `bcm28xx` `TARGET=rpi4`
-   block with BCM2711's peripheral base (`0xFE000000`, confirmed --
-   different from earlier Pi generations). Reuse LK's existing
-   `dev/interrupt/arm_gic`/`gic_v2.c` driver instead of `bcm28xx`'s
-   legacy `intc.c`, since GIC-400 is genuinely GICv2-compatible.
-4. **Port lk-perf's overlay patches to this new target.** `0001`
-   (GIC tick hook) and `0002`/`0003` (per-CPU FP capture in
-   `exceptions.S`) target the same GICv2 driver the new Pi 4 port would
-   use -- expect real but bounded rework, nowhere near what the FVP's
-   GICv3 mismatch would have needed.
-5. **Build EXIDX unwinding**, replacing the FP-chain walker
+1. **M3 -- SMP.** Turn `WITH_SMP` back on for `rpi4` and release cores
+   1-3 via the ARM-local mailbox-3 write (`platform_early_init`'s
+   non-BCM2837 branch already has this code path; it just needs
+   re-enabling and verifying on real hardware -- Stage 4 of the
+   profiler work only ever verified SMP on QEMU, never this board).
+2. **M4 -- real memory size.** Parse the actual DTB the firmware hands
+   off instead of the hardcoded 256MB `MEMSIZE`.
+3. **M5 -- profiler on hardware.** Port `project/profiler-rpi4.mk` +
+   the existing profiler patches (`0001`-`0003`) onto this target.
+   `scripts/pc_histogram.py`'s current sample extraction is QMP-based
+   (QEMU-only) and has no real-hardware equivalent -- it needs to
+   become a serial dump instead.
+4. **EXIDX unwinding**, replacing the FP-chain walker
    (`walk_fp_chain` in `scripts/pc_histogram.py`). No hardware
-   dependency at all -- could genuinely be done and tested on the
-   existing QEMU setup before ever touching the Pi, if useful to
-   de-risk separately from the hardware bring-up above.
-6. **Only once 1-5 work**: attempt real PMU event sampling -- read
-   `PMCEID0`/`PMCEID1` to see what's actually implemented on this A72,
-   try counting a real event (e.g. `L1D_CACHE_REFILL`) across a known
-   workload, confirm it responds. This is the actual open question
-   this whole detour exists to answer.
+   dependency -- can be built and tested on the existing QEMU setup
+   independently of the steps above.
+5. **Real PMU event validation.** Read `PMCEID0`/`PMCEID1` on hardware
+   to see what's actually implemented on this SoC's cores, then try
+   counting a real event (e.g. `L1D_CACHE_REFILL`) across a known
+   workload and confirm it responds. This is the actual open question
+   the whole hardware bring-up exists to answer -- unverifiable on
+   QEMU.
 
 ## Open risks not yet resolved
 
-- SD card write access itself (see "Blocked" above) -- the immediate
-  blocker, nothing past step 1 can happen without it.
 - Whether BCM2711's exact PMU implementation (event set, counter count)
-  differs meaningfully from what a real target would have -- check
-  `PMCEID0`/`PMCEID1` once hardware access exists, don't assume.
+  differs meaningfully from what's assumed -- check `PMCEID0`/`PMCEID1`
+  once step 5 is reached, don't assume.
 - LK's SMP bring-up has never been attempted on Pi 4B specifically --
-  Stage 4 only verified SMP on QEMU. `WITH_SMP := 1` already exists in
-  `bcm28xx/rules.mk` at the platform level, but per-core bring-up
-  (secondary core release via PSCI or direct spin-table, whichever Pi 4
-  actually uses) is unverified for this specific board.
+  `WITH_SMP` is currently off for `rpi4` (deliberate first-cut choice
+  to get one core working before adding secondary-core complexity).
