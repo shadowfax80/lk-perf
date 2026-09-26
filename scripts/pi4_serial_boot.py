@@ -12,11 +12,14 @@ lines typed here are sent to the Pi with a CR, which is enough for
 LK's shell later on. Ctrl+C to quit.
 
 A serial port has one owner at a time: close PuTTY on the same port
-first.
+first. --port defaults to "auto": the one USB-serial adapter plugged in
+(the COM number or /dev path differs per machine). If the Pi doesn't
+answer, run scripts/pi4_doctor.py, which checks every prerequisite in
+order.
 
 Usage:
     python scripts/pi4_serial_boot.py experiments/pi4-baremetal/kernel7l.img \
-        --port COM7 --log pi4.log
+        --log pi4.log [--port COM8]
 """
 from __future__ import annotations
 
@@ -29,8 +32,33 @@ import zlib
 
 try:
     import serial
+    from serial.tools import list_ports
 except ImportError:
     sys.exit("error: pyserial is required (python -m pip install pyserial)")
+
+# USB vendor IDs of common USB-to-TTL serial chips: Prolific PL2303 (the
+# adapter this project uses), WCH CH340, Silicon Labs CP210x, FTDI.
+USB_SERIAL_VIDS = {0x067B: "Prolific", 0x1A86: "WCH", 0x10C4: "Silicon Labs", 0x0403: "FTDI"}
+
+
+def usb_serial_ports() -> list:
+    return [p for p in list_ports.comports() if p.vid in USB_SERIAL_VIDS]
+
+
+def resolve_port(port: str) -> str:
+    """Pass an explicit port through; for "auto", pick the single USB-serial
+    adapter or explain why that isn't possible."""
+    if port != "auto":
+        return port
+    found = usb_serial_ports()
+    if len(found) == 1:
+        return found[0].device
+    if not found:
+        sys.exit("error: no USB-serial adapter found. Is it plugged in? On Windows 11 a "
+                 "PL2303TA can be present but driver-blocked with no COM port -- run "
+                 "scripts/pi4_doctor.py")
+    listing = ", ".join(f"{p.device} ({p.description})" for p in found)
+    sys.exit(f"error: several USB-serial adapters ({listing}); pick one with --port")
 
 
 class Console:
@@ -126,7 +154,8 @@ def terminal(port: serial.Serial, console: Console) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("image", help="raw binary to load at 0x8000 (e.g. kernel7l.img, lk.bin)")
-    ap.add_argument("--port", default="COM7")
+    ap.add_argument("--port", default="auto",
+                    help='serial port, e.g. COM8 or /dev/ttyUSB0 (default: "auto")')
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--log", help="append everything received to this file")
     ap.add_argument("--wait", type=float, default=None,
@@ -141,10 +170,11 @@ def main() -> None:
         sys.exit(f"error: {args.image} is empty")
 
     console = Console(args.log)
+    port_name = resolve_port(args.port)
     try:
-        port = serial.Serial(args.port, args.baud, timeout=0.1)
+        port = serial.Serial(port_name, args.baud, timeout=0.1)
     except serial.SerialException as e:
-        sys.exit(f"error: can't open {args.port} ({e}). Is PuTTY still holding it?")
+        sys.exit(f"error: can't open {port_name} ({e}). Is PuTTY still holding it?")
 
     with port:
         port.reset_input_buffer()

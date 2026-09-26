@@ -110,11 +110,41 @@ Everything below the next heading is history.
 |---|---|---|
 | SD card | in the Pi | holds `experiments/pi4-serialboot/kernel7l.img` plus `config.txt` with `arm_64bit=0`, `enable_uart=1`, `dtoverlay=disable-bt`. The original Linux kernel and config are on the card as `-linux-backup` copies. Only needs touching again to change the bootloader or `config.txt`. |
 | Serial chainloader | `experiments/pi4-serialboot/` | Boots from the card and prints `SBOOT?` once a second. Loads images to `0x8000` over the console cable with a CRC-32 check. |
-| Host sender | `scripts/pi4_serial_boot.py` | `python scripts/pi4_serial_boot.py <image> --port COMx --log <file>`, then power-cycle the Pi. Needs pyserial. Close PuTTY first. |
+| Host sender | `scripts/pi4_serial_boot.py` | `python scripts/pi4_serial_boot.py <image> --log <file>` (port auto-detected), then power-cycle the Pi. Needs pyserial. Close PuTTY first. Check a new machine with `scripts/pi4_doctor.py`. |
 | Test payload | `experiments/pi4-baremetal/kernel7l.img` | Known-good image for checking the whole path: banner plus heartbeat. |
 | Confirmed hardware facts | | Entered in **HYP**. `r0=0`, `r1=0xc42`, **DTB at `r2=0x2eff3b00`**. PL011 at `0xFE201000` works at 115200 on GPIO14/15 (ALT0). Generic timer counts (CNTFRQ is set by the firmware). |
 
 ### Setting up the next machine
+
+**Run the checker first.** It goes through every prerequisite below in
+order, stops at the first problem, and prints the fix:
+
+```
+python -m pip install pyserial
+python scripts/pi4_doctor.py --no-pi                  # PC side only, no Pi needed
+python scripts/pi4_doctor.py --boot-test              # then power-cycle the Pi when it says so
+```
+
+`--boot-test` sends the test image through the chainloader and waits for
+its heartbeat. If that passes, the machine is ready: the port, driver,
+wiring, SD card and chainloader all work. The port is detected
+automatically; pass `--port COMx` or `--port /dev/ttyUSB0` if more than
+one USB-serial adapter is plugged in. `pi4_serial_boot.py` detects the
+port the same way.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `pyserial is required` | pyserial missing | `python -m pip install pyserial` |
+| no adapter, or `can't open COM7` | adapter not plugged in, or it has a different COM number on this PC (it was COM7, later COM8, even on the same PC) | plug it in; let `--port` auto-detect or pass the right one |
+| adapter "PL2303TA DO NOT SUPPORT WINDOWS 11 OR LATER", no COM port | Windows 11 driver block | driver 3.8.28.0 steps below (3.8.43.0 still blocks it) |
+| `Access is denied` / busy | PuTTY or another terminal holds the port | close it |
+| Linux `Permission denied` on `/dev/ttyUSB0` | not in `dialout` | `sudo usermod -aG dialout $USER`, log in again |
+| waits forever at `waiting for the chainloader` | Pi not power-cycled, or still running an earlier image | power-cycle *after* starting the script |
+| still nothing after a power-cycle | wiring or SD card | crossed RX/TX (below), common GND, card holds `pi4-serialboot/kernel7l.img` plus the three `config.txt` lines |
+| text arrives but no `SBOOT?` | card holds some other kernel | put `experiments/pi4-serialboot/kernel7l.img` on it |
+| garbage characters | wrong adapter type or bad ground | 3.3V TTL adapter (not RS-232), check GND |
+
+The details behind each row:
 
 1. `git clone https://github.com/shadowfax80/lk-perf.git` (or `git pull`).
 2. **The serial side runs on whichever PC the Pi's USB-serial cable is
@@ -161,7 +191,7 @@ Everything below the next heading is history.
 cd build/lk && make rpi4-test -j$(nproc)            # -> build-rpi4-test/lk.bin
 # serial PC
 scp -P <port> root@<pod-ip>:lk-perf/build/lk/build-rpi4-test/lk.bin .
-python scripts/pi4_serial_boot.py lk.bin --port COM7 --log lk-rpi4.log
+python scripts/pi4_serial_boot.py lk.bin --log lk-rpi4.log      # port auto-detected
 # then power-cycle the Pi
 ```
 

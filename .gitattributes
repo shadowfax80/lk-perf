@@ -1,0 +1,2 @@
+# Raw ARM binaries: never line-ending-convert them
+*.img binary

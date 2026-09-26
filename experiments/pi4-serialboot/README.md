@@ -36,7 +36,7 @@ Use the same `config.txt` lines as `pi4-baremetal` (`arm_64bit=0`,
 Close PuTTY first, since only one program can hold the COM port. Then:
 
 ```
-python scripts/pi4_serial_boot.py experiments/pi4-baremetal/kernel7l.img --port COM7 --log pi4.log
+python scripts/pi4_serial_boot.py experiments/pi4-baremetal/kernel7l.img --log pi4.log
 ```
 
 Power the Pi on, or power-cycle it if a payload is already running. The
