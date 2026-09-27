@@ -32,6 +32,92 @@ serial-dump sample format haven't been audited for the same bit yet --
 do that as part of M5, since a captured LR read straight off a Thumb
 call site will carry it too.
 
+Two more real bugs in `scripts/dwarf_unwind.py` were found and fixed
+while reasoning through what Thumb code actually needs from the
+unwinder, both covered by a hand-written-assembly regression case in
+`scripts/test_dwarf_unwind.py` (`testdata/thumb_edge.S`):
+
+- Only SP and LR were carried from one resolved frame into the next;
+  every other register's rule (r4-r11, in particular r7, the usual
+  Thumb frame pointer) was discarded. Thumb code frequently defines
+  the CFA via r7 rather than SP+offset, and that rule can be a frame
+  or more removed from wherever the register was last live, so
+  dropping it broke any unwind two or more levels deep through
+  r7-framed code. Fixed by resolving and carrying forward every
+  register's rule each step, not just LR's.
+- A resolved return address (from LR) was looked up as-is to find the
+  next frame's FDE/row, rather than at `address - 1`. LR points to the
+  instruction *after* a call; when that call is the last instruction
+  of its function -- the normal shape of a call to a noreturn function
+  like `panic()` or an assert handler, which gets no epilogue -- the
+  return address lands exactly on the next function's first byte, and
+  looking it up as-is finds that unrelated function's FDE (or none at
+  all) instead of the row that was actually active at the call site,
+  either silently misattributing the frame or stopping the unwind one
+  level short. Fixed by looking up `pc - 1` for every frame after the
+  first (the initial, actually-executing PC still needs no adjustment).
+
+## What "close to Linux `perf`" actually needs, revisited for the target platform
+
+The M1-M4 hardware work above is board bring-up, not profiler
+capability -- none of the timer-sampling/PC-LR-FP-capture/FP-chain-unwind
+work from `docs/DESIGN.md`'s Stages 1-4 has run on this hardware yet,
+only on QEMU. M5 is where the profiler itself starts running here.
+Revised scope, closest analogue to `perf` noted per item:
+
+1. **M5, redesigned (`perf record`, timer mode).** Each sample must
+   capture more than PC/LR/FP: also SPSR (Thumb-vs-ARM mode and the
+   interrupted mode), the *interrupted* mode's own banked SP/LR (not
+   the IRQ mode's), r7/r11, thread ID, CPU number, timestamp. Offline
+   DWARF unwinding needs the stack contents as they were at sample
+   time, which a live target can't preserve until the host reads it
+   (QEMU's old approach paused the VM; real hardware can't). Prefer
+   unwinding **on the target**: compile `.debug_frame` into a compact
+   address-range -> CFA/register-rule table on the host, load it onto
+   the Pi, and unwind inside the sample handler so only the resulting
+   PC chain needs to leave the device -- `dwarf_unwind.py` becomes the
+   table generator (and the reference to check the on-target unwinder
+   against), the way the Linux kernel's own ORC unwinder works.
+2. **Unwinder correctness for real `-mthumb` code.** The two fixes
+   above, done. Still to do: a real `-mthumb`-compiled regression case
+   (not just hand-written .S), and, if the target platform is built with
+   armclang/armcc rather than GCC, confirm that toolchain's `.debug_frame`
+   output matches the same assumptions -- CFI encoding details can
+   differ between compilers.
+3. **`profiler stat` (`perf stat`, counting mode).** Cheapest real PMU
+   capability and arguably the most useful one for optimization work:
+   IPC, cache misses, branch mispredicts for a region, before/after a
+   change. Supersedes the old "PMU event validation" step -- make it a
+   real command, not a one-off check. Also: confirm on this hardware
+   whether BCM2711's PMU interrupt is a per-core SPI or a shared PPI,
+   the M4-style DTB `arm-pmu` node parsing needs to know which.
+4. **`profiler report`/`annotate` (symbols + source lines +
+   instruction-level hotspots).** Nearest-symbol lookup exists; add
+   `.debug_line` for source-line attribution, and use the ELF's
+   `$t`/`$a` mapping symbols to disassemble each region in the correct
+   instruction set. `perf script`-compatible output would let existing
+   viewers (FlameGraph, Firefox Profiler, hotspot) consume it directly.
+5. **PMU-event sampling**, alongside (not instead of) timer sampling,
+   plus an explicit, documented position on the interrupts-masked blind
+   spot: timer-IRQ sampling can't fire while interrupts are masked, so
+   critical sections and ISRs get no samples and their time is
+   misattributed to whatever runs right after unmasking. Linux covers
+   this with FIQ/pseudo-NMI; LK on the Pi runs non-secure and can't
+   configure the GIC for FIQ delivery the way the target platform's real boot chain
+   probably can -- worth deciding explicitly rather than leaving it as
+   an unstated bias in the numbers.
+6. **How samples leave the device.** UART (~11 KB/s at 115200 baud) is
+   fine for a buffered dump after a run, not for streaming; the target platform's
+   real path is more likely a Trace32/JTAG memory dump than serial, so
+   the sample-buffer layout should be a documented, self-describing
+   format a host tool can read from a raw memory image, with UART as
+   just one way to deliver that image on the Pi.
+7. **Not planned, noted as a deliberate scope decision**: per-task/
+   per-thread breakdown beyond what the sample record's thread-ID field
+   already gives for free, and PMU event multiplexing/frequency-based
+   sampling (`perf -F`) -- revisit only if the target platform's actual use case
+   needs them.
+
 **Not A55-representative** — A72 is a different, higher-performance
 core than the eventual real target. This validates the *mechanism*
 (does interrupt-driven PMU sampling work at all on real silicon, does
@@ -507,89 +593,43 @@ See `overlay/lk/0004-bcm28xx-add-rpi4.patch` for the fix.
 
 ## Next steps, in order
 
-1. **M5 -- profiler on hardware.** Port `project/profiler-rpi4.mk` +
-   the existing profiler patches (`0001`-`0003`) onto this target. The
-   old `scripts/pc_histogram.py` (QEMU/QMP-based sample extraction) has
-   been **removed** along with all QEMU references in this project --
-   its replacement needs to be written from scratch as a serial dump:
-   an LK shell command that dumps the sample ring buffers over UART,
-   parsed by a new host script. This lands the existing **timer-tick
-   sampling** mode (GIC timer IRQ -> `profiler_on_tick` -> PC/LR/FP/(new)
-   SP ring buffers) working on real hardware. Note the sample buffers
-   need a new SP capture alongside PC/LR/FP for step 2 below -- DWARF
-   CFI's CFA computation in this project's stack layouts is anchored on
-   SP, not FP.
-2. **DWARF-CFI unwinding.** The standalone unwinder itself is **done**:
-   `scripts/dwarf_unwind.py` (`DwarfCFIUnwinder`, using `pyelftools`'
-   `.debug_frame` decoding) plus `scripts/test_dwarf_unwind.py`, a
-   self-contained regression test that compiles a real ARM32 binary
-   with no frame pointers at all, hand-traces the ground-truth call
-   chain from its own disassembly, and confirms the unwinder recovers
-   it exactly. What's left is wiring it into the live pipeline once M5
-   exists: a new `scripts/pc_histogram.py` that reads the serial-dumped
-   PC/SP/LR samples and calls `DwarfCFIUnwinder.unwind()` per sample,
-   producing the same FlameGraph-compatible folded-stack format the old
-   FP-chain walker did.
+Superseded by "What 'close to Linux `perf`' actually needs, revisited
+for the target platform" above -- that section is the current, authoritative
+ordering (M5 redesigned with a fuller sample record and on-target
+unwinding; unwinder correctness; `profiler stat`; `report`/`annotate`;
+PMU-event sampling with the interrupts-masked blind spot called out
+explicitly). Kept here only for detail not repeated above:
 
-   Chosen over ARM's own EXIDX (`.ARM.exidx`/`.ARM.extab`) deliberately:
-   this project's scope is a PoC for the the target platform's actual
-   perf use case, and the target platform's shipped firmware carries no EXIDX
-   (dropped from the production build to save flash/RAM, since C-only
-   code with no exceptions doesn't need it functionally) but does carry
-   DWARF CFI (`.debug_frame`) in its debug-symbol ELF -- the same
-   mechanism Trace32 already uses there to unwind crash dumps. Matching
-   that mechanism here means the validation transfers directly, rather
-   than validating a format the target platform doesn't use. Practically:
-   - No ARM unwind-tables needed (`-funwind-tables` on ARM defaults to
-     EHABI/EXIDX) -- just `-g` for debug info, which makes GCC emit
-     `.debug_frame` CFI independent of whether EXIDX is enabled at all.
-   - The offline host-side unwinder (`scripts/dwarf_unwind.py`, Python)
-     uses `pyelftools`' existing `.debug_frame`/CFI decoding directly,
-     rather than hand-rolling a decoder the way EXIDX's ARM-specific
-     compact opcodes would have required.
-   - This is also a closer match to real Linux `perf` itself, which
-     supports DWARF-based call-graph unwinding (`--call-graph dwarf`,
-     via `libunwind`) as one of its own core modes -- arguably more
-     representative of mainline `perf`'s actual DWARF path than the
-     ARM-specific EXIDX format would have been.
-   Developed and tested directly on the Pi 4B home-lab hardware, same
-   as everything else here -- QEMU is not used for this project going
-   forward.
-3. **PMU event validation.** Read `PMCEID0`/`PMCEID1` on hardware to
-   see what's actually implemented on this SoC's cores, then try
-   counting a real event (e.g. `L1D_CACHE_REFILL`) across a known
-   workload and confirm it responds. Prerequisite for step 4, not the
-   end goal by itself -- unverifiable on QEMU.
-4. **PMU-event-driven sampling**, implemented alongside (not instead
-   of) timer-tick sampling, so both are genuine, working, selectable
-   modes -- this is the real "sample on `cache-misses`, not just wall
-   clock" capability, and it's the main thing separating this project
-   from a plain statistical profiler. Concretely:
-   - Identify this core's PMU interrupt. It's a PPI (per-core, like the
-     local timer already wired up in M1-M3), and its GIC ID is
-     discoverable from the DTB's `arm-pmu` node (already seen in this
-     board's real device tree during M4's diagnostics) via the same
-     `lib/fdt` parsing M4 added -- not something to hardcode from a
-     datasheet guess.
-   - Program one PMU event counter to overflow after N occurrences of
-     the chosen event: preset it to `0xFFFFFFFF - N + 1` so it wraps
-     (and raises its interrupt) exactly N events later, mirroring
-     `perf record -e <event> -c <N>`.
-   - Reuse patches 0001-0003's existing capture mechanism (the
-     `profiler_on_tick`-style weak hook that stashes PC/LR/FP from the
-     interrupted frame) for the PMU IRQ vector as well as the timer
-     vector -- same ring buffers, same per-CPU indexing, same offline
-     unwinding and flamegraph pipeline. The sampling *source* changes;
-     the rest of the pipeline shouldn't have to.
-   - Add a way to select sampling mode (timer period, or PMU event +
-     count) at build or boot time, so both remain real, working options
-     rather than one replacing the other.
-   - Multi-event multiplexing (several PMU events sampled at once, the
-     way real `perf` can) is explicitly out of scope for this step --
-     one event at a time, correctly wired end to end, first.
+- DWARF CFI was chosen over ARM's own EXIDX (`.ARM.exidx`/`.ARM.extab`)
+  deliberately: the target platform's shipped firmware carries no EXIDX (dropped
+  from the production build to save flash/RAM) but does carry DWARF
+  CFI in its debug-symbol ELF, the same mechanism Trace32 already uses
+  there to unwind crash dumps -- and it's also the closer match to
+  real `perf`'s own `--call-graph dwarf` (via `libunwind`). No ARM
+  unwind-tables needed (`-funwind-tables` on ARM defaults to
+  EHABI/EXIDX) -- just `-g`, which makes GCC emit `.debug_frame`
+  independent of whether EXIDX is enabled at all.
+- PMU-event sampling groundwork: program a counter to overflow after N
+  occurrences of the chosen event by presetting it to
+  `0xFFFFFFFF - N + 1`, mirroring `perf record -e <event> -c <N>`.
+  Reuse patches 0001-0003's existing capture hook (the
+  `profiler_on_tick`-style weak hook stashing register state from the
+  interrupted frame) for the PMU IRQ vector too -- same ring buffers,
+  same per-CPU indexing. Add a build/boot-time mode selector so timer
+  and PMU sampling both remain real, working, selectable options.
+  Multi-event multiplexing is explicitly out of scope for the first
+  working version.
+- Whether the PMU interrupt is a PPI (per-core, like the timer) or a
+  per-core SPI needs checking in the DTB's `arm-pmu` node via the same
+  `lib/fdt` parsing M4 added -- don't assume either way from a
+  datasheet.
 
 ## Open risks not yet resolved
 
 - Whether BCM2711's exact PMU implementation (event set, counter count)
   differs meaningfully from what's assumed -- check `PMCEID0`/`PMCEID1`
-  in step 3, don't assume.
+  as part of `profiler stat`, don't assume.
+- Whether the target platform's real core is even Cortex-A-family (vs. Cortex-R,
+  ARMv7-R) -- changes PMU version and MMU assumptions, and would make
+  the Pi 4B's A72 a further step removed from the real target than
+  currently assumed.

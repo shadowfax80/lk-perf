@@ -26,6 +26,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from elftools.elf.elffile import ELFFile
+
 sys.path.insert(0, str(Path(__file__).parent))
 from dwarf_unwind import DwarfCFIUnwinder, symbolize, SP_REG, LR_REG, strip_isa_bit
 
@@ -84,6 +86,33 @@ def build(tmp: Path) -> Path:
     return tmp / "nested.elf"
 
 
+def build_thumb_edge(tmp: Path) -> Path:
+    """Hand-written Thumb .S with explicit .cfi_* directives (see
+    testdata/thumb_edge.S) -- built separately from nested.c because it
+    needs precise control over two things a C compiler won't reliably
+    produce on demand: an r7-based (not SP-based) CFA rule, and a
+    function whose very last instruction is a call, so the return
+    address lands exactly on the next function's first byte with no
+    gap -- the real shape of a call to a noreturn function like
+    panic()/assert-fail, which gets no epilogue.
+    """
+    (tmp / "thumb_edge.S").write_text((TESTDATA / "thumb_edge.S").read_text())
+    (tmp / "link.ld").write_text(LINKER_SCRIPT)
+
+    def run(*args):
+        subprocess.run(args, check=True, cwd=tmp)
+
+    run(
+        "arm-none-eabi-as", "-g", "-mcpu=cortex-a15", "-mthumb",
+        "thumb_edge.S", "-o", "thumb_edge.o",
+    )
+    run(
+        "arm-none-eabi-ld", "-T", "link.ld", "thumb_edge.o",
+        "-o", "thumb_edge.elf",
+    )
+    return tmp / "thumb_edge.elf"
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         elf_path = build(Path(tmpdir))
@@ -105,8 +134,21 @@ def main():
         #                (a true leaf) -- sampled mid-loop at pc=0x8038
         pc, sp, lr = 0x8038, 0xC138, 0x8078
         mock_memory = {
-            0xC14C: 0x80AC,  # mid_func's own saved lr (-> outer_func)
-            0xC15C: 0x8008,  # outer_func's own saved lr (-> _start)
+            # mid_func's and outer_func's frames both spill r4/r5/r6
+            # alongside lr (`strd r4,[sp,#-16]!; str r6,[sp,#8]`); the
+            # unwinder now resolves every register's rule, not just
+            # lr's, so all four spill slots need a value even though
+            # only the lr ones are asserted on below -- r4/r5/r6 here
+            # are placeholders, never read back by anything this test
+            # checks.
+            0xC140: 0xAAAA0004,  # mid_func's saved r4
+            0xC144: 0xAAAA0005,  # mid_func's saved r5
+            0xC148: 0xAAAA0006,  # mid_func's saved r6
+            0xC14C: 0x80AC,      # mid_func's own saved lr (-> outer_func)
+            0xC150: 0xAAAA0104,  # outer_func's saved r4
+            0xC154: 0xAAAA0105,  # outer_func's saved r5
+            0xC158: 0xAAAA0106,  # outer_func's saved r6
+            0xC15C: 0x8008,      # outer_func's own saved lr (-> _start)
         }
 
         def read_memory(addr, size):
@@ -161,6 +203,66 @@ def main():
         )
         print("PASS: ISA-bit (Thumb interworking) addresses unwind "
               "identically once masked")
+
+        # Two more real bugs, both exercised by the same scenario:
+        # (1) after unwinding one level, every register's rule must be
+        #     resolved and carried forward, not just SP/LR -- an outer
+        #     frame's CFA can depend on any of them (r7 here, the usual
+        #     Thumb frame pointer), and that rule can be a frame or more
+        #     removed from wherever it was last live.
+        # (2) a return address must be looked up as pc-1, not pc, when
+        #     finding which row/FDE covers it -- otherwise a call that
+        #     is the last instruction of its function (the shape of a
+        #     call to a noreturn function, which gets no epilogue) has
+        #     its return address land exactly on the next function's
+        #     first byte, and looking that address up as-is finds the
+        #     wrong (or no) FDE instead of the row active at the call.
+        edge_elf = build_thumb_edge(Path(tmpdir))
+        with open(edge_elf, "rb") as f:
+            edge_symtab = ELFFile(f).get_section_by_name(".symtab")
+            addrs = {
+                sym.name: strip_isa_bit(sym["st_value"])
+                for sym in edge_symtab.iter_symbols()
+                if sym.name in ("victim", "caller_func", "panic_stub")
+            }
+        victim_pc = addrs["victim"]
+        panic_stub_addr = addrs["panic_stub"]
+
+        # victim's own CFI never mentions r7 (empty body): r7 is only
+        # ever meaningful because it's carried forward, unresolved,
+        # from the initial registers all the way to caller_func's row.
+        fp_value = 0xC110
+        stop_addr = 0x9000  # covered by no FDE -- the unwind must stop here
+        edge_memory = {
+            fp_value: 0xBBBB0007,      # caller_func's saved r7 (unasserted)
+            fp_value + 4: stop_addr,   # caller_func's saved lr -> its
+                                       # own caller (no CFI there either)
+        }
+
+        def read_memory_edge(addr, size):
+            assert size == 4, size
+            if addr not in edge_memory:
+                raise KeyError(f"unexpected memory read at 0x{addr:x}")
+            return edge_memory[addr]
+
+        with DwarfCFIUnwinder(str(edge_elf)) as unwinder:
+            edge_chain = unwinder.unwind(
+                victim_pc,
+                {SP_REG: 0xC100, LR_REG: panic_stub_addr, 7: fp_value},
+                read_memory_edge,
+            )
+
+        edge_expected = [victim_pc, panic_stub_addr, stop_addr]
+        assert edge_chain == edge_expected, (
+            f"r7-carry / return-address-minus-one fix regressed: got "
+            f"{[hex(p) for p in edge_chain]}, expected "
+            f"{[hex(p) for p in edge_expected]} -- without either fix "
+            f"this either raises (r7 dropped) or stops after 2 frames "
+            f"(return address looked up without the -1 adjustment)"
+        )
+        print("PASS: r7 survives being carried across a frame, and a "
+              "call-as-last-instruction return address unwinds past "
+              "its own function's boundary correctly")
 
 
 if __name__ == "__main__":

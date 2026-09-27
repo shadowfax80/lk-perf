@@ -143,25 +143,58 @@ class DwarfCFIUnwinder:
 
         `registers` must at least have SP_REG (13); LR_REG (14) is
         needed unless the first frame's FDE has no rule for it (a true
-        leaf). `read_memory(addr, size)` reads `size` bytes of target
-        memory at `addr` and returns them as an unsigned little-endian
-        int -- backed by a live serial dump on real hardware, or a raw
-        stack snapshot in a test/offline case.
+        leaf). Include any other live registers the caller has (r4-r11
+        in particular) -- Thumb code commonly defines the CFA via r7
+        rather than SP+offset, and that rule can be several frames
+        removed from the sample, so a register only needed two or more
+        levels up must still be threaded through from the very start.
+
+        `read_memory(addr, size)` reads `size` bytes of target memory at
+        `addr` and returns them as an unsigned little-endian int --
+        backed by a live serial dump on real hardware, or a raw stack
+        snapshot in a test/offline case.
         """
         cur_pc = strip_isa_bit(pc)
         chain = [cur_pc]
         regs = dict(registers)
+        # Only the initial, actually-executing PC is looked up as-is.
+        # Every PC after that came from an LR value, which points to
+        # the instruction *after* a call -- looking that address up
+        # directly finds the wrong FDE whenever the call was the last
+        # instruction of its function (the common shape for a call to
+        # a noreturn function like panic()/assert-fail, which gets no
+        # epilogue), landing exactly on the next function's boundary
+        # instead. Look up pc-1 instead for every such frame, while
+        # still reporting/symbolizing the real (unadjusted) address.
+        is_return_address = False
 
         for _ in range(max_frames):
-            fde = self._find_fde(cur_pc)
+            lookup_pc = cur_pc - 1 if is_return_address else cur_pc
+            fde = self._find_fde(lookup_pc)
             if fde is None:
                 break
-            row = self._row_for_pc(fde, cur_pc)
+            row = self._row_for_pc(fde, lookup_pc)
             if row is None:
                 break
 
             cfa = self._resolve_cfa(row, regs)
-            new_lr = self._resolve_register(row, LR_REG, cfa, regs, read_memory)
+
+            # Resolve every general-purpose register's rule for this
+            # row, not just LR -- an outer frame's CFA rule may depend
+            # on any of them (e.g. r7), and a register this frame never
+            # touches must still carry its live value forward rather
+            # than being dropped. SP itself is excluded: DWARF defines
+            # the CFA *as* the caller's SP, unconditionally, regardless
+            # of any rule the row may separately state for r13.
+            new_regs = {SP_REG: cfa}
+            for regnum in range(15):
+                if regnum == SP_REG:
+                    continue
+                value = self._resolve_register(row, regnum, cfa, regs, read_memory)
+                if value is not None:
+                    new_regs[regnum] = value
+
+            new_lr = new_regs.get(LR_REG)
             if new_lr is None or new_lr == 0:
                 break
 
@@ -174,11 +207,9 @@ class DwarfCFIUnwinder:
             # form is ever meaningful.
             new_pc = strip_isa_bit(new_lr)
 
-            # After unwinding one level: SP becomes the CFA (the DWARF
-            # definition of CFA *is* "caller's SP at the call site"),
-            # and the return address becomes the new PC.
-            regs = {SP_REG: cfa, LR_REG: new_lr}
+            regs = new_regs
             cur_pc = new_pc
+            is_return_address = True
 
             if cur_pc in chain:
                 break  # cycle guard
