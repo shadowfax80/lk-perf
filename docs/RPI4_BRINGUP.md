@@ -106,12 +106,39 @@ Revised scope, closest analogue to `perf` noted per item:
    configure the GIC for FIQ delivery the way the target platform's real boot chain
    probably can -- worth deciding explicitly rather than leaving it as
    an unstated bias in the numbers.
-6. **How samples leave the device.** UART (~11 KB/s at 115200 baud) is
-   fine for a buffered dump after a run, not for streaming; the target platform's
-   real path is more likely a Trace32/JTAG memory dump than serial, so
-   the sample-buffer layout should be a documented, self-describing
-   format a host tool can read from a raw memory image, with UART as
-   just one way to deliver that image on the Pi.
+6. **How samples leave the device.** UART at 115200 baud is ~11 KiB/s --
+   fine for a small image, a real bottleneck for the sample dumps this
+   plans for (M5's richer per-sample record puts a full 4-core buffer
+   around 590 KB, ~52s to dump at that rate). the target platform's real path is
+   more likely a Trace32/JTAG memory dump than serial, so the
+   sample-buffer layout should still be a documented, self-describing
+   format a host tool can read from a raw memory image -- UART is just
+   one way to deliver that image on the Pi, and it's worth being fast.
+
+   **Baud-rate calibration tooling is built, not yet run on hardware.**
+   The chainloader (`experiments/pi4-serialboot`) already programs the
+   UART clock to 48MHz specifically so a higher baud rate could be
+   added later without another clock change. `experiments/pi4-baudcal`
+   is a one-shot test payload, loaded the same way (no SD-card
+   reflash), that tries a table of candidate rates --
+   230400/460800/921600/1000000/1500000/2000000/3000000, computed as
+   exact or near-exact divisors of that 48MHz clock -- confirming sync
+   via a PING/PONG handshake at each new rate and running a byte-exact
+   echo stress test (multiple sizes up to 64 KB, multiple repeats) once
+   synced. If a candidate doesn't sync, the target silently reverts
+   itself to 115200 on a ~1s timeout, so the host script
+   (`scripts/pi4_baud_calibrate.py`) can step through the whole table
+   in one sitting with no power-cycle between attempts. Only the
+   transient test payload's own rate changes during this -- the
+   persistent chainloader's initial 115200 handshake is untouched and
+   stays the universal fallback regardless of what calibration finds.
+   Once a stable rate is confirmed on the real board, it should become
+   the new default in `pi4_serial_boot.py --baud`, and the same
+   `uart_set_baud()`-style IBRD/FBRD reprogramming should be applied to
+   the real LK console driver (`platform/bcm28xx`'s PL011 init), not
+   just the loader/test payloads -- otherwise the interactive shell and
+   any future `profiler dump` command stay stuck at 115200 even after
+   calibration finds a faster rate works.
 7. **Not planned, noted as a deliberate scope decision**: per-task/
    per-thread breakdown beyond what the sample record's thread-ID field
    already gives for free, and PMU event multiplexing/frequency-based
