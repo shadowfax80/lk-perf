@@ -17,8 +17,17 @@ first. --port defaults to "auto": the one USB-serial adapter plugged in
 answer, run scripts/pi4_doctor.py, which checks every prerequisite in
 order.
 
+The chainloader's own handshake and image transfer always run at
+--baud (115200) -- that's fixed in the resident SD-card image, not
+changed here (see docs/RPI4_BRINGUP.md). Once the payload jumps and
+runs, this script follows it to --post-jump-baud (default: 3000000),
+matching the UART speed TARGET=rpi4 LK images reprogram themselves to
+as their first boot action (calibrated 2026-09-27, ~19x faster than
+115200). Pass --post-jump-baud 115200 for a payload that doesn't do
+this itself, e.g. an old pi4-baremetal image.
+
 Usage:
-    python scripts/pi4_serial_boot.py experiments/pi4-baremetal/kernel7l.img \
+    python scripts/pi4_serial_boot.py build/lk/build-rpi4-test/lk.bin \
         --log pi4.log [--port COM8]
 """
 from __future__ import annotations
@@ -159,7 +168,17 @@ def main() -> None:
     ap.add_argument("image", help="raw binary to load at 0x8000 (e.g. kernel7l.img, lk.bin)")
     ap.add_argument("--port", default="auto",
                     help='serial port, e.g. COM8 or /dev/ttyUSB0 (default: "auto")')
-    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--baud", type=int, default=115200,
+                    help="initial link speed, matching the resident SD-card "
+                         "chainloader's fixed handshake rate (default: 115200; "
+                         "don't change unless the chainloader itself was reflashed)")
+    ap.add_argument("--post-jump-baud", type=int, default=3000000,
+                    help="baud to switch to right after the payload jumps and "
+                         "runs (default: 3000000, matching TARGET=rpi4 LK images "
+                         "built after the 2026-09-27 UART calibration -- see "
+                         "docs/RPI4_BRINGUP.md). Pass the same value as --baud "
+                         "(115200) for a payload that doesn't reprogram its own "
+                         "UART, e.g. an old pi4-baremetal image.")
     ap.add_argument("--log", help="append everything received to this file")
     ap.add_argument("--wait", type=float, default=None,
                     help="seconds to wait for the SBOOT? prompt (default: forever)")
@@ -182,6 +201,9 @@ def main() -> None:
     with port:
         port.reset_input_buffer()
         send_image(port, console, image, args.wait)
+        if args.post_jump_baud != args.baud:
+            port.baudrate = args.post_jump_baud
+            port.reset_input_buffer()
         if not args.no_term:
             terminal(port, console)
 

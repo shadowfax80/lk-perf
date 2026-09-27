@@ -1,2 +1,8 @@
 # Raw ARM binaries: never line-ending-convert them
 *.img binary
+
+# git apply is byte-exact about line endings; a Windows checkout with
+# core.autocrlf=true silently rewrites these to CRLF otherwise, which
+# breaks `git apply` on Linux (confirmed: exactly this corrupted
+# 0006-bcm2711-uart-baud.patch before this rule existed).
+*.patch text eol=lf

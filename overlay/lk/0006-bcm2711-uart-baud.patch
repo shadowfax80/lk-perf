@@ -1,0 +1,52 @@
+diff --git a/platform/bcm28xx/platform.c b/platform/bcm28xx/platform.c
+index 0000000..0000000 100644
+@@ -187,9 +187,49 @@
+     arm_gic_init_map(&bcm2711_gic_info);
+ }
+ LK_INIT_HOOK(bcm2711_gic_init, bcm2711_gic_init, LK_INIT_LEVEL_VM);
++
++/* LK's own uart.c never programs the baud-rate divisor at all --
++ * uart_init_port() is a no-op -- it inherits whatever the previous
++ * bootloader left the UART set to. That's the pi4-serialboot
++ * chainloader, fixed at 115200 (deliberately left untouched: changing
++ * it would need an SD-card reflash to take effect, tracked as a TODO
++ * in docs/RPI4_BRINGUP.md rather than done here). Bump it ourselves,
++ * as the very first thing LK does, so everything from this point on --
++ * the boot banner, the interactive shell, and any future profiler-dump
++ * command -- runs at the calibrated 3,000,000 baud instead of the
++ * loader's slower rate. The loader's own initial handshake and image
++ * transfer already finished before this code runs, so they're
++ * unaffected either way.
++ *
++ * 48MHz UART clock (set by the chainloader's own mailbox call, still
++ * in effect here) / (16 * 3000000) = 1.0 exactly -- IBRD=1, FBRD=0, no
++ * rounding error, and the fastest rate the PL011 can reach at all with
++ * IBRD>=1 from this clock. Confirmed on real hardware, 2026-09-27
++ * (scripts/pi4_baud_calibrate.py): 1,000,000 / 1,500,000 / 2,000,000
++ * baud never sync on this adapter, but this exact rate does, reliably,
++ * at ~212.8 KiB/s sustained -- see docs/RPI4_BRINGUP.md for the full
++ * candidate table and the two independent confirmation runs. */
++#define UART0_TFR   (*(volatile uint32_t *)(UART0_BASE + 0x18))
++#define UART0_IBRD  (*(volatile uint32_t *)(UART0_BASE + 0x24))
++#define UART0_FBRD  (*(volatile uint32_t *)(UART0_BASE + 0x28))
++#define UART0_LCRH  (*(volatile uint32_t *)(UART0_BASE + 0x2c))
++#define UART0_CR    (*(volatile uint32_t *)(UART0_BASE + 0x30))
++#define UART0_FR_BUSY (1u << 3)
++
++static void bcm2711_uart_speed_init(void) {
++    while (UART0_TFR & UART0_FR_BUSY) {}
++    UART0_CR = 0;
++    UART0_IBRD = 1;
++    UART0_FBRD = 0;
++    UART0_LCRH = (1 << 4) | (3 << 5);  // FIFO enable, 8N1 -- latches IBRD/FBRD
++    UART0_CR = (1 << 0) | (1 << 8) | (1 << 9);  // uarten, txe, rxe
++}
+ #endif
+ 
+ void platform_early_init(void) {
++#if BCM2711
++    bcm2711_uart_speed_init();
++#endif
+     uart_init_early();
+ 
+ #if BCM2711

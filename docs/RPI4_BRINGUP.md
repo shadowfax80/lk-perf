@@ -150,16 +150,45 @@ Revised scope, closest analogue to `perf` noted per item:
 
    Only the transient test payload's own rate changed during
    calibration -- the persistent chainloader's initial 115200 handshake
-   was never touched and stays the universal fallback. **Still to do**,
-   now that a rate is confirmed: make 3,000,000 the new default in
-   `pi4_serial_boot.py --baud`; extend the chainloader protocol to
-   negotiate up to 3,000,000 for the bulk payload transfer after the
-   115200 header handshake (keeping the handshake itself at 115200, the
-   safe fallback); and apply the same `uart_set_baud()`-style IBRD/FBRD
-   reprogramming to the real LK console driver (`platform/bcm28xx`'s
-   PL011 init) -- otherwise the interactive shell and any future
-   `profiler dump` command stay stuck at 115200 even with this
-   calibrated.
+   was never touched and stays the universal fallback.
+
+   **Integration done (2026-09-28), except the one piece that needs an
+   SD-card reflash, deliberately left as a TODO:**
+   - `platform/bcm28xx/platform.c`'s BCM2711 branch now reprograms the
+     UART to 3,000,000 baud (`bcm2711_uart_speed_init()`, IBRD=1/FBRD=0)
+     as the very first thing `platform_early_init()` does, before
+     `uart_init_early()` -- LK's own `uart.c` never programs the baud
+     divisor itself (`uart_init_port()` is a no-op; it inherits
+     whatever the previous bootloader left the UART at), so without
+     this LK would stay at 115200 forever regardless of calibration.
+     Added as `overlay/lk/0006-bcm2711-uart-baud.patch`. Verified with a
+     real `make rpi4-test` build (RunPod CPU pod, avoids Windows
+     MAX_PATH issues with LK's own long paths) -- confirmed via
+     disassembly of the built `lk.elf` that the exact intended register
+     sequence (busy-wait, `CR=0`, `IBRD=1`, `FBRD=0`, `LCRH=0x70`,
+     `CR=0x301`) is inlined at the very start of `platform_early_init`,
+     immediately before the call into `uart_init_early`.
+   - `pi4_serial_boot.py` now takes `--post-jump-baud` (default
+     `3000000`): after the chainloader's own 115200 handshake and
+     image transfer finish and the payload jumps, the host follows to
+     this rate to match. `--baud` (the initial link speed) is
+     unchanged at 115200, since that's the resident SD-card
+     chainloader's fixed rate. Pass `--post-jump-baud 115200` for a
+     payload that doesn't reprogram its own UART (e.g. an old
+     pi4-baremetal image); `pi4_baud_calibrate.py` is unaffected, since
+     it manages its own baud switching directly rather than going
+     through this default.
+   - **TODO, not done, needs an SD-card reflash**: the persistent
+     chainloader (`experiments/pi4-serialboot`) itself still only ever
+     talks at 115200 -- its own header handshake *and* the bulk image
+     transfer that follows it both stay at the slow rate, since
+     negotiating a faster rate for either would mean changing the
+     firmware that's resident on the SD card. Left alone on purpose
+     per explicit instruction. Whenever an SD-card reflash is
+     acceptable, extend that protocol to negotiate up to 3,000,000 baud
+     for at least the bulk transfer (keeping the initial header
+     handshake at 115200 as the safe fallback, the same pattern
+     `pi4-baudcal` already validated).
 7. **Not planned, noted as a deliberate scope decision**: per-task/
    per-thread breakdown beyond what the sample record's thread-ID field
    already gives for free, and PMU event multiplexing/frequency-based

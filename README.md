@@ -38,8 +38,13 @@ python3 scripts/pi4_serial_boot.py build/lk/build-rpi4-test/lk.bin --port COM5
 
 That builds and sends the current `TARGET=rpi4` image over the serial
 chainloader to a real Pi 4B (see `docs/RPI4_BRINGUP.md` for the physical
-setup and current milestone status). To check the DWARF-CFI unwinder
-works independently of any hardware:
+setup and current milestone status). The chainloader's own handshake
+and transfer run at 115200 (fixed, resident on the SD card), but once
+LK boots the console runs at the calibrated 3,000,000 baud, and
+`pi4_serial_boot.py` follows automatically -- pass `--post-jump-baud
+115200` when loading an older payload that doesn't reprogram its own
+UART. To check the DWARF-CFI unwinder works independently of any
+hardware:
 
 ```bash
 python3 scripts/test_dwarf_unwind.py
