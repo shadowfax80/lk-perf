@@ -482,23 +482,48 @@ See `overlay/lk/0004-bcm28xx-add-rpi4.patch` for the fix.
    the existing profiler patches (`0001`-`0003`) onto this target.
    `scripts/pc_histogram.py`'s current sample extraction is QMP-based
    (QEMU-only) and has no real-hardware equivalent -- it needs to
-   become a serial dump instead.
+   become a serial dump instead. This lands the existing **timer-tick
+   sampling** mode (GIC timer IRQ -> `profiler_on_tick` -> PC/LR/FP
+   ring buffers) working on real hardware.
 2. **EXIDX unwinding**, replacing the FP-chain walker
    (`walk_fp_chain` in `scripts/pc_histogram.py`). Developed and
    tested directly on the Pi 4B home-lab hardware, same as everything
    else here -- QEMU is not used for this project going forward.
-3. **Real PMU event validation.** Read `PMCEID0`/`PMCEID1` on hardware
-   to see what's actually implemented on this SoC's cores, then try
+3. **PMU event validation.** Read `PMCEID0`/`PMCEID1` on hardware to
+   see what's actually implemented on this SoC's cores, then try
    counting a real event (e.g. `L1D_CACHE_REFILL`) across a known
-   workload and confirm it responds. This is the actual open question
-   the whole hardware bring-up exists to answer -- unverifiable on
-   QEMU.
+   workload and confirm it responds. Prerequisite for step 4, not the
+   end goal by itself -- unverifiable on QEMU.
+4. **PMU-event-driven sampling**, implemented alongside (not instead
+   of) timer-tick sampling, so both are genuine, working, selectable
+   modes -- this is the real "sample on `cache-misses`, not just wall
+   clock" capability, and it's the main thing separating this project
+   from a plain statistical profiler. Concretely:
+   - Identify this core's PMU interrupt. It's a PPI (per-core, like the
+     local timer already wired up in M1-M3), and its GIC ID is
+     discoverable from the DTB's `arm-pmu` node (already seen in this
+     board's real device tree during M4's diagnostics) via the same
+     `lib/fdt` parsing M4 added -- not something to hardcode from a
+     datasheet guess.
+   - Program one PMU event counter to overflow after N occurrences of
+     the chosen event: preset it to `0xFFFFFFFF - N + 1` so it wraps
+     (and raises its interrupt) exactly N events later, mirroring
+     `perf record -e <event> -c <N>`.
+   - Reuse patches 0001-0003's existing capture mechanism (the
+     `profiler_on_tick`-style weak hook that stashes PC/LR/FP from the
+     interrupted frame) for the PMU IRQ vector as well as the timer
+     vector -- same ring buffers, same per-CPU indexing, same offline
+     unwinding and flamegraph pipeline. The sampling *source* changes;
+     the rest of the pipeline shouldn't have to.
+   - Add a way to select sampling mode (timer period, or PMU event +
+     count) at build or boot time, so both remain real, working options
+     rather than one replacing the other.
+   - Multi-event multiplexing (several PMU events sampled at once, the
+     way real `perf` can) is explicitly out of scope for this step --
+     one event at a time, correctly wired end to end, first.
 
 ## Open risks not yet resolved
 
 - Whether BCM2711's exact PMU implementation (event set, counter count)
   differs meaningfully from what's assumed -- check `PMCEID0`/`PMCEID1`
-  once step 5 is reached, don't assume.
-- LK's SMP bring-up has never been attempted on Pi 4B specifically --
-  `WITH_SMP` is currently off for `rpi4` (deliberate first-cut choice
-  to get one core working before adding secondary-core complexity).
+  in step 3, don't assume.
