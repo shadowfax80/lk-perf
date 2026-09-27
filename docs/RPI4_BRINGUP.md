@@ -444,20 +444,50 @@ ARM: secondary cpu 132 started`). Fixed by moving the lock to
 public functions (`console_print_lock`/`console_print_unlock` in
 `lib/io.h`). See `overlay/lk/0005-fix-smp-console-output-race.patch`.
 
+## M4 (real memory size) done (2026-09-27)
+
+Reads the real installed RAM from the DTB the firmware hands off
+(`lk_boot_args[2]`, the physical DTB address at kernel entry -- the
+standard ARM Linux boot convention this firmware follows, same r2 the
+chainloader already treats as a DTB pointer), instead of the hardcoded
+256MB `MEMSIZE` guess.
+
+This board turned out to be an **8GB unit** with a genuinely
+non-contiguous memory map (confirmed via the real `memory@0` node's
+`reg` property, `address-cells=2 size-cells=1`, 4 entries): `[0,
+~948MB)` (already excluding the GPU carve-out), then `[1GB, ~4GB)`,
+then two 2GB banks above the 4GB boundary. Supporting all 8GB properly
+needs LPAE (large physical address extension) and multiple PMM arenas
+-- real, but out of scope for "read the real size instead of
+guessing". M4 uses only the first, low, `addr==0` entry: confirmed via
+`pmm arenas` showing `size 0x3b400000` (994,050,048 bytes, ~948MB) --
+already a ~4x improvement over the old 256MB guess, fully addressable
+in 32-bit space with no LPAE needed.
+
+Two real gotchas hit along the way, worth remembering for any future
+DTB parsing on this platform:
+- The real node name is `memory@0`, not `memory` -- BCM2837's existing
+  FDT-parsing code (which this was modeled on) does an exact `strcmp`
+  that would never match this board's actual DTB either.
+- `reg` property layout depends on the DTB's actual `#address-cells`/
+  `#size-cells` (2/1 here, giving 12-byte entries), not a fixed 16-byte
+  assumption -- read them from `fdt_address_cells()`/`fdt_size_cells()`
+  rather than hardcoding.
+
+See `overlay/lk/0004-bcm28xx-add-rpi4.patch` for the fix.
+
 ## Next steps, in order
 
-1. **M4 -- real memory size.** Parse the actual DTB the firmware hands
-   off instead of the hardcoded 256MB `MEMSIZE`.
-2. **M5 -- profiler on hardware.** Port `project/profiler-rpi4.mk` +
+1. **M5 -- profiler on hardware.** Port `project/profiler-rpi4.mk` +
    the existing profiler patches (`0001`-`0003`) onto this target.
    `scripts/pc_histogram.py`'s current sample extraction is QMP-based
    (QEMU-only) and has no real-hardware equivalent -- it needs to
    become a serial dump instead.
-3. **EXIDX unwinding**, replacing the FP-chain walker
+2. **EXIDX unwinding**, replacing the FP-chain walker
    (`walk_fp_chain` in `scripts/pc_histogram.py`). Developed and
    tested directly on the Pi 4B home-lab hardware, same as everything
    else here -- QEMU is not used for this project going forward.
-4. **Real PMU event validation.** Read `PMCEID0`/`PMCEID1` on hardware
+3. **Real PMU event validation.** Read `PMCEID0`/`PMCEID1` on hardware
    to see what's actually implemented on this SoC's cores, then try
    counting a real event (e.g. `L1D_CACHE_REFILL`) across a known
    workload and confirm it responds. This is the actual open question

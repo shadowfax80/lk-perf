@@ -100,7 +100,7 @@ index 00000000..01bf62a3
 +
 +#include <platform/bcm28xx.h>
 diff --git a/platform/bcm28xx/platform.c b/platform/bcm28xx/platform.c
-index 67a395d4..4bc286e8 100644
+index 67a395d4..4acc8ee6 100644
 --- a/platform/bcm28xx/platform.c
 +++ b/platform/bcm28xx/platform.c
 @@ -16,6 +16,7 @@
@@ -111,23 +111,37 @@ index 67a395d4..4bc286e8 100644
  #include <platform.h>
  #include <platform/interrupts.h>
  #include <platform/bcm28xx.h>
-@@ -93,6 +94,42 @@ struct mmu_initial_mapping mmu_initial_mappings[] = {
+@@ -93,6 +94,56 @@ struct mmu_initial_mapping mmu_initial_mappings[] = {
  
  extern void arm64_reset(void);
  
 +#elif BCM2711
 +#include <arch/arm.h>
 +#include <arch/arm/mmu.h>
++#include <libfdt.h>
++#include <lk/main.h>
++
++#define MEMORY_APERTURE_SIZE (1024 * 1024 * 1024)
 +
 +/* Same idea as BCM2836: 64MB device window covering main peripherals,
 + * ARM-local peripherals and the GIC-400 in one mapping (see
 + * platform/bcm28xx.h for the phys/virt constants), plus SDRAM and a
-+ * temporary low identity map for the boot code in start.S. */
++ * temporary low identity map for the boot code in start.S.
++ *
++ * The "memory" entry maps a full MEMORY_APERTURE_SIZE (1GB, same as
++ * BCM2837's own choice below) rather than just MEMSIZE -- this is
++ * boot-time scaffolding, not the real memory size. It has to be big
++ * enough to reach wherever the firmware's DTB actually sits (confirmed
++ * via this board's own chainloader banner: r2 lands well above the
++ * 256MB MEMSIZE guess this platform used before M4, e.g. 0x2eff3b00),
++ * since platform_early_init needs to dereference it below to find the
++ * REAL installed RAM size. MEMSIZE remains as the fallback arena.size
++ * if DTB parsing fails for any reason. */
 +struct mmu_initial_mapping mmu_initial_mappings[] = {
 +    {
 +        .phys = SDRAM_BASE,
 +        .virt = KERNEL_BASE,
-+        .size = MEMSIZE,
++        .size = MEMORY_APERTURE_SIZE,
 +        .flags = 0,
 +        .name = "memory"
 +    },
@@ -154,7 +168,7 @@ index 67a395d4..4bc286e8 100644
  #else
  #error Unknown BCM28XX Variant
  #endif
-@@ -109,10 +146,43 @@ static pmm_arena_t arena = {
+@@ -109,10 +160,43 @@ static pmm_arena_t arena = {
  void platform_init_mmu_mappings(void) {
  }
  
@@ -198,20 +212,95 @@ index 67a395d4..4bc286e8 100644
  
  #if BCM2837
      arm_generic_timer_init(INTERRUPT_ARM_LOCAL_CNTPNSIRQ, 0);
-@@ -161,6 +231,8 @@ void platform_early_init(void) {
+@@ -161,6 +245,83 @@ void platform_early_init(void) {
  
  #elif BCM2836
      arm_generic_timer_init(INTERRUPT_ARM_LOCAL_CNTPNSIRQ, 1000000);
 +#elif BCM2711
 +    arm_generic_timer_init(INTERRUPT_ARM_LOCAL_CNTPNSIRQ, 0);
++
++    /* M4: read the real installed RAM size from the DTB the firmware
++     * handed off, instead of the MEMSIZE guess. lk_boot_args[2] is the
++     * physical DTB address (r2 at kernel entry, the standard ARM Linux
++     * boot convention this firmware follows -- confirmed via this
++     * board's own chainloader, which treats r2 the same way). Convert
++     * to virtual via the same linear offset the "memory" mmu_initial_mappings
++     * entry above uses (phys 0 -> virt KERNEL_BASE), which is why that
++     * entry had to grow to MEMORY_APERTURE_SIZE: the DTB can land
++     * anywhere in the first 1GB, well past the old 256MB mapping. */
++    const void *fdt = (const void *)(uintptr_t)(lk_boot_args[2] + KERNEL_BASE);
++    int err = fdt_check_header(fdt);
++    if (err >= 0) {
++        int addr_cells = fdt_address_cells(fdt, 0);
++        int size_cells = fdt_size_cells(fdt, 0);
++        int entry_cells = addr_cells + size_cells;
++
++        int depth = 0;
++        int offset = 0;
++        for (;;) {
++            offset = fdt_next_node(fdt, offset, &depth);
++            if (offset < 0)
++                break;
++
++            const char *name = fdt_get_name(fdt, offset, NULL);
++            if (!name)
++                continue;
++
++            /* Real name is "memory@0", not "memory" -- confirmed on
++             * this board's actual DTB (a plain strcmp match, which is
++             * what BCM2837's own version of this code below still
++             * does, never fires here). */
++            if (strncmp(name, "memory", 6) != 0)
++                continue;
++
++            int lenp;
++            const void *prop_ptr = fdt_getprop(fdt, offset, "reg", &lenp);
++            if (!prop_ptr || entry_cells <= 0 || lenp < entry_cells * 4)
++                continue;
++
++            /* This board's "memory" node describes 4 non-contiguous
++             * regions on an 8GB unit (confirmed: [0, ~948MB), then
++             * [1GB, ~4GB), then two 2GB banks above the 4GB boundary --
++             * BCM2711's known split memory map). Using anything past
++             * the first, low, addr==0 entry as one flat arena would be
++             * wrong: those higher regions live above 4GB physical,
++             * need LPAE to even map on AArch32, and aren't contiguous
++             * with region 0 -- well out of scope for "read the real
++             * size instead of guessing". Only entry 0 is used here. */
++            const uint32_t *cells = (const uint32_t *)prop_ptr;
++            uint64_t addr = 0;
++            for (int c = 0; c < addr_cells; c++) {
++                addr = (addr << 32) | fdt32_to_cpu(cells[c]);
++            }
++            if (addr != 0)
++                continue;
++
++            uint64_t len = 0;
++            for (int c = 0; c < size_cells; c++) {
++                len = (len << 32) | fdt32_to_cpu(cells[addr_cells + c]);
++            }
++
++            if (len > 1024*1024*1024U) {
++                len = 1024*1024*1024; /* only use the first 1GB on ARM32 */
++                printf("trimming memory to 1GB\n");
++            }
++
++            printf("Found memory in fdt: %llu bytes at addr 0\n",
++                   (unsigned long long)len);
++            arena.size = len;
++            break;
++        }
++    } else {
++        printf("no valid DTB at %p (fdt_check_header: %d), keeping MEMSIZE guess\n", fdt, err);
++    }
  #else
  #error Unknown BCM28XX Variant
  #endif
 diff --git a/platform/bcm28xx/rules.mk b/platform/bcm28xx/rules.mk
-index 8f291036..b53a08e6 100644
+index 8f291036..49d77684 100644
 --- a/platform/bcm28xx/rules.mk
 +++ b/platform/bcm28xx/rules.mk
-@@ -66,6 +66,49 @@ MODULE_DEPS += \
+@@ -66,6 +66,50 @@ MODULE_DEPS += \
  	    app/tests \
  	    lib/fdt
  
@@ -256,7 +345,8 @@ index 8f291036..b53a08e6 100644
 +# already exists in intc.c itself, unrelated to this change.)
 +MODULE_SRCS := $(filter-out $(LOCAL_DIR)/intc.c,$(MODULE_SRCS))
 +MODULE_DEPS += \
-+	dev/interrupt/arm_gic
++	dev/interrupt/arm_gic \
++	lib/fdt
 +
  endif
  
