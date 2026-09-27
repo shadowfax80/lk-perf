@@ -5,4 +5,14 @@
 experiments/pi4-*/*.o
 experiments/pi4-*/*.elf
 
+# Ad-hoc hardware-debugging outputs (test images, bisection artifacts,
+# serial logs) tend to get dumped straight into the repo root during
+# real Pi bring-up sessions -- never intentional check-ins, and there's
+# no reason to track them once the finding they were for is documented.
+/*.bin
+/*.elf
+/*.img
+/*.log
+/nm.txt
+
 __pycache__/

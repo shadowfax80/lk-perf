@@ -65,19 +65,53 @@ work from `docs/DESIGN.md`'s Stages 1-4 has run on this hardware yet,
 only on QEMU. M5 is where the profiler itself starts running here.
 Revised scope, closest analogue to `perf` noted per item:
 
-1. **M5, redesigned (`perf record`, timer mode).** Each sample must
-   capture more than PC/LR/FP: also SPSR (Thumb-vs-ARM mode and the
-   interrupted mode), the *interrupted* mode's own banked SP/LR (not
-   the IRQ mode's), r7/r11, thread ID, CPU number, timestamp. Offline
-   DWARF unwinding needs the stack contents as they were at sample
-   time, which a live target can't preserve until the host reads it
-   (QEMU's old approach paused the VM; real hardware can't). Prefer
-   unwinding **on the target**: compile `.debug_frame` into a compact
+1. **M5, redesigned (`perf record`, timer mode). In progress -- two
+   prerequisites done, the actual sample-capture code not written
+   yet.**
+
+   Each sample must capture more than PC/LR/FP: also SPSR (Thumb-vs-ARM
+   mode and the interrupted mode), the *interrupted* thread's own real
+   SP, r7/r11, thread ID, CPU number, timestamp. Offline DWARF
+   unwinding needs the stack contents as they were at sample time,
+   which a live target can't preserve until the host reads it (QEMU's
+   old approach paused the VM; real hardware can't). Prefer unwinding
+   **on the target**: compile `.debug_frame` into a compact
    address-range -> CFA/register-rule table on the host, load it onto
    the Pi, and unwind inside the sample handler so only the resulting
    PC chain needs to leave the device -- `dwarf_unwind.py` becomes the
    table generator (and the reference to check the on-target unwinder
    against), the way the Linux kernel's own ORC unwinder works.
+
+   **Done (2026-09-28):**
+   - No-FPU/NEON build fidelity (`overlay/lk/0007-rpi4-no-fpu-neon.patch`,
+     `project/rpi4-test.mk` drops `app/tests`) -- see the FPU/NEON note
+     further down. Prerequisite for any new capture code, since it's
+     easy to accidentally pull in a float path (e.g. via a library
+     dependency) that the target platform's Cortex-A55 could never run.
+   - **The interrupted SP derivation.** LK's standard IRQ entry
+     (`arch/arm/arm/exceptions.S`'s `save` macro) captures `frame->usp`/
+     `frame->ulr` via `stmia sp,{r13,r14}^` -- but that instruction only
+     captures the **USR-mode banked** SP/LR. Checked `arch/arm/arm/thread.c`:
+     this project's LK threads never switch to USR/SYS mode at all
+     (`arch_context_switch`/`arm_context_switch` do a raw cooperative
+     stack-pointer swap, no CPSR mode field anywhere) -- everything runs
+     in SVC mode the whole time, so `usp`/`ulr` are dead, irrelevant
+     registers here, not usable for unwinding. The real interrupted SP
+     needs **no new assembly**: it's `(uint32_t)(frame + 1)`, i.e. one
+     past the end of the `struct arm_iframe` that `save` already pushes
+     -- traced the exact push/align sequence in `exceptions.S` by hand
+     (`srsdb`+`push{r0-r3,r12,lr}`+the usp/ulr slot all land at a fixed
+     offset before the variable `stack_align` padding; `save`'s own
+     final `r0 = pre-align sp` plus the struct's own size gets you
+     there without needing to reason about that padding at all -- `r0`
+     *is* the iframe pointer). Not yet wired into `profiler.c` --
+     that's part of the "not done" list below.
+
+   **Not done yet:** the actual `profiler.c` sample-record change (add
+   SPSR/interrupted-SP/thread-ID/CPU fields to the per-CPU ring
+   buffers), the LK shell command to dump those buffers over UART, and
+   the host-side parser to replace the deleted `pc_histogram.py`. Pick
+   up here next.
 2. **Unwinder correctness for real `-mthumb` code.** The two fixes
    above, done. Still to do: a real `-mthumb`-compiled regression case
    (not just hand-written .S), and, if the target platform is built with
