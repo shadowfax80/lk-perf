@@ -1,0 +1,29 @@
+diff --git a/platform/bcm28xx/rules.mk b/platform/bcm28xx/rules.mk
+index 0000000..0000000 100644
+@@ -69,6 +69,13 @@
+ else ifeq ($(TARGET),rpi4)
+ ARCH := arm
+ ARM_CPU := cortex-a15
++
++# the target platform (the real PoC target) is a multi-core Cortex-A55 with no
++# FPU and no NEON -- match that here rather than validating a
++# mechanism that assumes hardware the real target doesn't have.
++# cortex-a15 defaults ARM_WITH_VFP/NEON on; this is upstream LK's own
++# supported override for disabling both.
++ARM_WITHOUT_VFP_NEON := true
+ # This board's firmware enters LK in Hyp mode (confirmed via the
+ # chainloader's own boot banner), so start.S's HYP->SVC drop has to
+ # actually run. That drop is gated on ARM_WITH_HYP, and
+diff --git a/arch/arm/arm/arch.c b/arch/arm/arm/arch.c
+index 0000000..0000000 100644
+@@ -371,8 +371,10 @@
+     /* put the booting cpu back into close to a default state */
+     arch_quiesce();
+ 
++#if ARM_WITH_VFP
+     // linux wont re-enable the FPU during boot, so it must be enabled when chainloading
+     arm_fpu_set_enable(true);
++#endif
+ 
+     LTRACEF("branching to physical address of loader\n");
+ 
