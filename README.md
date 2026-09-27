@@ -1,18 +1,30 @@
 # lk-perf
 
 Bare-metal statistical sampling profiler for [LK](https://github.com/littlekernel/lk),
-AArch32, targeting an eventual real Cortex-A55 SMP system (ARMv8.2-A) with
-QEMU as the first, cheap-to-iterate-on target.
+AArch32 SMP -- a standalone tool for finding real hotspots/bottlenecks in
+LK workloads, developed and validated on real Raspberry Pi 4B hardware
+(Cortex-A72, BCM2711; QEMU was used only for early staged development,
+not for this project's hardware-validation work). See
+[docs/RPI4_BRINGUP.md](docs/RPI4_BRINGUP.md) for current status.
+
+**Scope: a PoC for the the target platform's actual perf use case.**
+Stack unwinding uses DWARF CFI (`.debug_frame`), not ARM's own EXIDX --
+the target platform's shipped firmware carries no EXIDX (dropped from the production
+build to save flash/RAM) but does carry DWARF CFI in its debug-symbol
+ELF, the same mechanism Trace32 already uses there to unwind crash
+dumps. Matching that here means the validation transfers directly to
+the real target, rather than validating a format the target platform doesn't use.
 
 No hardware profiling assist available or assumed: no ETM, no SPE, no
 BRBE (SPE/BRBE are AArch64-only architecturally, categorically unavailable
 in AArch32 state regardless of silicon). Design and staged plan:
 [docs/DESIGN.md](docs/DESIGN.md).
 
-Sibling project to [bolt-aarch32](https://github.com/shadowfax80/bolt-aarch32)
-(the AArch32 BOLT backend this profiler is meant to help validate) and
-[lk-modloader](https://github.com/shadowfax80/lk-modloader) — same overlay
-pattern (pinned LK commit + `setup.sh` + `app/<name>/`), reused directly.
+Uses the same overlay pattern (pinned LK commit + `setup.sh` +
+`app/<name>/`) as [bolt-aarch32](https://github.com/shadowfax80/bolt-aarch32)
+and [lk-modloader](https://github.com/shadowfax80/lk-modloader), reused
+directly -- unrelated sibling projects, not something this profiler
+validates or depends on.
 
 ## Quick start
 

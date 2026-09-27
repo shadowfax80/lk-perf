@@ -6,14 +6,23 @@ device tree, and PMU register access itself faults without a
 secure-monitor boot stage). Real Cortex-A55/production hardware wasn't
 available, so a Raspberry Pi 4B (Cortex-A72, BCM2711) was chosen as the
 cheapest real-hardware path to validate two specific things QEMU
-categorically cannot: EXIDX unwinding robustness, and whether real PMU
+categorically cannot: DWARF-CFI unwinding robustness, and whether real PMU
 event counters (cache misses, branch mispredicts) actually respond to
 workload behavior.
+
+**Scope: this project is a PoC for the the target platform's actual perf
+use case**, not a general-purpose ARM32 profiler. the target platform's own shipped
+firmware has no EXIDX (ARM EHABI unwind tables aren't generated for its
+production build) but does carry DWARF CFI (`.debug_frame`) in its debug
+symbol files -- the same mechanism Trace32 already uses there to unwind
+crash dumps. lk-perf's unwinder uses DWARF CFI for the same reason, so
+the mechanism validated here transfers directly, rather than validating
+a format (EXIDX) the target platform doesn't actually use.
 
 **Not A55-representative** — A72 is a different, higher-performance
 core than the eventual real target. This validates the *mechanism*
 (does interrupt-driven PMU sampling work at all on real silicon, does
-EXIDX give more complete unwinds than the FP-chain walker), not
+DWARF CFI give more complete unwinds than the FP-chain walker), not
 A55-accurate numbers.
 
 ## Why Pi 4B over the Arm Cortex-A55 FVP route
@@ -313,9 +322,9 @@ Milestones, each checked through the chainloader log:
   the serial console, e.g. a shell command that hex-dumps them, parsed by
   a host script. Plan that as part of M5.
 
-After M5 the original plan continues: step 5 (EXIDX unwinding) and step 6
-(real PMU events via `PMCEID0`/`PMCEID1`). They're listed under "Next
-steps, in order" below.
+After M5 the original plan continues: step 5 (DWARF-CFI unwinding) and
+step 6 (real PMU events via `PMCEID0`/`PMCEID1`). They're listed under
+"Next steps, in order" below.
 
 ### Things that would make iteration faster (optional)
 
@@ -485,10 +494,32 @@ See `overlay/lk/0004-bcm28xx-add-rpi4.patch` for the fix.
    become a serial dump instead. This lands the existing **timer-tick
    sampling** mode (GIC timer IRQ -> `profiler_on_tick` -> PC/LR/FP
    ring buffers) working on real hardware.
-2. **EXIDX unwinding**, replacing the FP-chain walker
-   (`walk_fp_chain` in `scripts/pc_histogram.py`). Developed and
-   tested directly on the Pi 4B home-lab hardware, same as everything
-   else here -- QEMU is not used for this project going forward.
+2. **DWARF-CFI unwinding**, replacing the FP-chain walker
+   (`walk_fp_chain` in `scripts/pc_histogram.py`). Chosen over ARM's
+   own EXIDX (`.ARM.exidx`/`.ARM.extab`) deliberately: this project's
+   scope is a PoC for the the target platform's actual perf use case,
+   and the target platform's shipped firmware carries no EXIDX (dropped from the
+   production build to save flash/RAM, since C-only code with no
+   exceptions doesn't need it functionally) but does carry DWARF CFI
+   (`.debug_frame`) in its debug-symbol ELF -- the same mechanism
+   Trace32 already uses there to unwind crash dumps. Matching that
+   mechanism here means the validation transfers directly, rather than
+   validating a format the target platform doesn't use. Practically:
+   - No ARM unwind-tables needed (`-funwind-tables` on ARM defaults to
+     EHABI/EXIDX) -- just `-g` for debug info, which makes GCC emit
+     `.debug_frame` CFI independent of whether EXIDX is enabled at all.
+   - The offline host-side unwinder (`scripts/pc_histogram.py`, already
+     Python) can use `pyelftools`' existing `.debug_frame`/CFI decoding
+     directly, rather than hand-rolling a decoder the way EXIDX's
+     ARM-specific compact opcodes would have required.
+   - This is also a closer match to real Linux `perf` itself, which
+     supports DWARF-based call-graph unwinding (`--call-graph dwarf`,
+     via `libunwind`) as one of its own core modes -- arguably more
+     representative of mainline `perf`'s actual DWARF path than the
+     ARM-specific EXIDX format would have been.
+   Developed and tested directly on the Pi 4B home-lab hardware, same
+   as everything else here -- QEMU is not used for this project going
+   forward.
 3. **PMU event validation.** Read `PMCEID0`/`PMCEID1` on hardware to
    see what's actually implemented on this SoC's cores, then try
    counting a real event (e.g. `L1D_CACHE_REFILL`) across a known
