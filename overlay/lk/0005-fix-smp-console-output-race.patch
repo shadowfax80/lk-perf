@@ -1,0 +1,75 @@
+diff --git a/lib/io/console.c b/lib/io/console.c
+index f6fdb4cf..86a0a40a 100644
+--- a/lib/io/console.c
++++ b/lib/io/console.c
+@@ -25,6 +25,21 @@
+ static spin_lock_t print_spin_lock = 0;
+ static struct list_node print_callbacks = LIST_INITIAL_VALUE(print_callbacks);
+ 
++/* Held by a caller (see vfprintf()) across an entire formatted-print
++ * call, not just one out_count() chunk. On SMP, a single printf/dprintf
++ * call reaches out_count() multiple times (once per literal segment,
++ * once per converted argument, ...); locking only inside out_count()
++ * lets two cores' calls interleave mid-string, producing garbled
++ * console output. Confirmed on real rpi4 hardware the first time SMP
++ * was enabled for that target. */
++arch_interrupt_saved_state_t console_print_lock(void) {
++    return spin_lock_irqsave(&print_spin_lock);
++}
++
++void console_print_unlock(arch_interrupt_saved_state_t state) {
++    spin_unlock_irqrestore(&print_spin_lock, state);
++}
++
+ #if CONSOLE_HAS_INPUT_BUFFER
+ #ifndef CONSOLE_BUF_LEN
+ #define CONSOLE_BUF_LEN 256
+diff --git a/lib/io/include/lib/io.h b/lib/io/include/lib/io.h
+index d9f63689..370d2334 100644
+--- a/lib/io/include/lib/io.h
++++ b/lib/io/include/lib/io.h
+@@ -9,6 +9,7 @@
+ 
+ #include <lk/compiler.h>
+ #include <lk/list.h>
++#include <arch/interrupts.h>
+ #include <sys/types.h>
+ 
+ /* LK specific calls to register to get input/output of the main console */
+@@ -26,6 +27,12 @@ struct __print_callback {
+ void register_print_callback(print_callback_t *cb);
+ void unregister_print_callback(print_callback_t *cb);
+ 
++/* Hold across an entire formatted-print call (see printf.c.inc's
++ * vfprintf) to keep concurrent callers' output from interleaving on
++ * SMP. */
++arch_interrupt_saved_state_t console_print_lock(void);
++void console_print_unlock(arch_interrupt_saved_state_t state);
++
+ /* the underlying handle to talk to io devices */
+ struct io_handle;
+ typedef struct io_handle_hooks {
+diff --git a/lib/libc/printf.c.inc b/lib/libc/printf.c.inc
+index 14fbd49b..c3b9af2d 100644
+--- a/lib/libc/printf.c.inc
++++ b/lib/libc/printf.c.inc
+@@ -13,6 +13,7 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <sys/types.h>
++#include <lib/io.h>
+ 
+ #include "printf_local.h"
+ 
+@@ -101,7 +102,10 @@ int FUNC(vsnprintf)(char *str, size_t len, const char *fmt, va_list ap) {
+ }
+ 
+ int FUNC(vfprintf)(FILE *fp, const char *fmt, va_list ap) {
+-    return FUNC(_printf_engine)(&_fprintf_output_func, (void *)fp, fmt, ap);
++    arch_interrupt_saved_state_t state = console_print_lock();
++    int ret = FUNC(_printf_engine)(&_fprintf_output_func, (void *)fp, fmt, ap);
++    console_print_unlock(state);
++    return ret;
+ }
+ 
+ int FUNC(fprintf)(FILE *fp, const char *fmt, ...) {

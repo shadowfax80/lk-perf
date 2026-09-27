@@ -419,25 +419,45 @@ subsystem it depends on (`vmm_alloc_physical`) is initialized, which
 was silently corrupting kernel BSS. See `overlay/lk/0004-bcm28xx-add-rpi4.patch`
 for the fixes and commit `7bcd92a` for the full writeup.
 
+## M3 (SMP) done (2026-09-27)
+
+`WITH_SMP := 1` for `rpi4`; all 4 cores confirmed alive and scheduling
+on real hardware (`threads` command shows idle threads for cores 0-3
+all in `run`/`rdy` state, and the shell thread itself has been observed
+running on cores other than 0, proving genuine scheduler activity, not
+just idling). Secondary-core release uses the same generic BCM28xx
+mailbox-3 mechanism `rpi2` already had in `platform_early_init` --
+unverified on real hardware before now, Stage 4 of the profiler work
+only ever verified SMP on QEMU.
+
+Found and fixed a real, pre-existing bug in shared LK code along the
+way: `lib/io/console.c`'s `out_count()` only held `print_spin_lock`
+around the registered-logger callback list, not around the
+`platform_dputc()` loop that actually writes the UART -- and a single
+`printf`/`dprintf` call reaches `out_count()` multiple times (once per
+literal segment, once per formatted argument, ...). On SMP this let
+concurrent cores' output interleave mid-string, producing garbled
+console text (confirmed: `ARM: secondary cpu 3 started` from 3
+different cores appeared as `ARM: secondary cpu ARM: secondary cpu
+ARM: secondary cpu 132 started`). Fixed by moving the lock to
+`vfprintf()`, held across the entire formatted-print call via two new
+public functions (`console_print_lock`/`console_print_unlock` in
+`lib/io.h`). See `overlay/lk/0005-fix-smp-console-output-race.patch`.
+
 ## Next steps, in order
 
-1. **M3 -- SMP.** Turn `WITH_SMP` back on for `rpi4` and release cores
-   1-3 via the ARM-local mailbox-3 write (`platform_early_init`'s
-   non-BCM2837 branch already has this code path; it just needs
-   re-enabling and verifying on real hardware -- Stage 4 of the
-   profiler work only ever verified SMP on QEMU, never this board).
-2. **M4 -- real memory size.** Parse the actual DTB the firmware hands
+1. **M4 -- real memory size.** Parse the actual DTB the firmware hands
    off instead of the hardcoded 256MB `MEMSIZE`.
-3. **M5 -- profiler on hardware.** Port `project/profiler-rpi4.mk` +
+2. **M5 -- profiler on hardware.** Port `project/profiler-rpi4.mk` +
    the existing profiler patches (`0001`-`0003`) onto this target.
    `scripts/pc_histogram.py`'s current sample extraction is QMP-based
    (QEMU-only) and has no real-hardware equivalent -- it needs to
    become a serial dump instead.
-4. **EXIDX unwinding**, replacing the FP-chain walker
+3. **EXIDX unwinding**, replacing the FP-chain walker
    (`walk_fp_chain` in `scripts/pc_histogram.py`). Developed and
    tested directly on the Pi 4B home-lab hardware, same as everything
    else here -- QEMU is not used for this project going forward.
-5. **Real PMU event validation.** Read `PMCEID0`/`PMCEID1` on hardware
+4. **Real PMU event validation.** Read `PMCEID0`/`PMCEID1` on hardware
    to see what's actually implemented on this SoC's cores, then try
    counting a real event (e.g. `L1D_CACHE_REFILL`) across a known
    workload and confirm it responds. This is the actual open question
