@@ -4,6 +4,7 @@ TARGET := rpi4
 
 MODULES += \
 	app/shell \
+	app/love \
 	app/stringtests \
 	app/tests \
 	lib/cksum \

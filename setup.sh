@@ -71,6 +71,7 @@ apply_overlay() {
     mkdir -p "$LK_DIR/target/rpi4"
     cp "$ROOT/project/rpi4-test.mk" "$LK_DIR/project/rpi4-test.mk"
     cp "$ROOT/target/rpi4/rules.mk" "$LK_DIR/target/rpi4/rules.mk"
+    rsync -a "$ROOT/app/love/" "$LK_DIR/app/love/"
 
     apply_lk_patches
 }
