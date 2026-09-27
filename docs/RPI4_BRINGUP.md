@@ -196,10 +196,20 @@ Revised scope, closest analogue to `perf` noted per item:
    needs them.
 
 **Not A55-representative** — A72 is a different, higher-performance
-core than the eventual real target. This validates the *mechanism*
-(does interrupt-driven PMU sampling work at all on real silicon, does
-DWARF CFI give more complete unwinds than the FP-chain walker), not
-A55-accurate numbers.
+core than the eventual real target (the target platform: multi-core Cortex-A55).
+This validates the *mechanism* (does interrupt-driven PMU sampling work
+at all on real silicon, does DWARF CFI give more complete unwinds than
+the FP-chain walker), not A55-accurate numbers.
+
+**FPU/NEON disabled entirely (2026-09-28), matching the target platform exactly**:
+the target platform has no FPU and no SIMD/NEON unit at all, unlike the A72's own
+hardware. `overlay/lk/0007-rpi4-no-fpu-neon.patch` turns both off via
+`ARM_WITHOUT_VFP_NEON := true` and gates one inconsistent, unreachable
+`arm_fpu_set_enable(true)` call in shared LK code; `project/rpi4-test.mk`
+drops `app/tests` (it pulled in `lib/libm`, which compiles several
+routines with real hardware VFP instructions independent of that
+kernel-level setting). Verified via a full disassembly of the linked
+`lk.elf`: zero VFP/NEON instructions of any kind remain in the binary.
 
 ## Why Pi 4B over the Arm Cortex-A55 FVP route
 
