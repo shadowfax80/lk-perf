@@ -27,7 +27,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from dwarf_unwind import DwarfCFIUnwinder, symbolize, SP_REG, LR_REG
+from dwarf_unwind import DwarfCFIUnwinder, symbolize, SP_REG, LR_REG, strip_isa_bit
 
 TESTDATA = Path(__file__).parent / "testdata"
 
@@ -128,6 +128,39 @@ def main():
         )
         print("\nPASS: matches hand-traced ground truth "
               "(leaf_func -> mid_func -> outer_func -> _start)")
+
+        # the target platform's workload is ARM/Thumb interworking code: BL/BLX sets
+        # LR with the ISA bit (bit 0) when the call target is Thumb, and
+        # Thumb function symbols carry the same bit in the ELF. This
+        # binary is built -marm, so none of its real addresses have that
+        # bit -- simulate it by OR-ing every register/memory address in
+        # the exact same scenario with 1, exactly as a real capture off
+        # Thumb code would, and confirm the unwinder still recovers the
+        # identical (masked) chain rather than stopping short or missing
+        # the FDE at each hop.
+        thumb_pc, thumb_sp, thumb_lr = pc | 1, sp, lr | 1
+        thumb_memory = {addr: val | 1 for addr, val in mock_memory.items()}
+
+        def read_memory_thumb(addr, size):
+            assert size == 4, size
+            if addr not in thumb_memory:
+                raise KeyError(f"unexpected memory read at 0x{addr:x}")
+            return thumb_memory[addr]
+
+        with DwarfCFIUnwinder(str(elf_path)) as unwinder:
+            thumb_chain = unwinder.unwind(
+                thumb_pc, {SP_REG: thumb_sp, LR_REG: thumb_lr}, read_memory_thumb
+            )
+        assert thumb_chain == expected, (
+            f"ISA-bit masking broke unwinding: got "
+            f"{[hex(p) for p in thumb_chain]}, expected "
+            f"{[hex(p) for p in expected]}"
+        )
+        assert all(strip_isa_bit(p) == p for p in thumb_chain), (
+            "unwind() leaked the ISA bit into a chain PC"
+        )
+        print("PASS: ISA-bit (Thumb interworking) addresses unwind "
+              "identically once masked")
 
 
 if __name__ == "__main__":

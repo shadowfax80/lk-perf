@@ -19,6 +19,19 @@ crash dumps. lk-perf's unwinder uses DWARF CFI for the same reason, so
 the mechanism validated here transfers directly, rather than validating
 a format (EXIDX) the target platform doesn't actually use.
 
+**Workload is ARM/Thumb interworking code (`-mthumb`), not pure ARM.**
+`scripts/dwarf_unwind.py` masks the ARM interworking ISA bit (bit 0,
+set by BL/BLX on a Thumb call target, and set on Thumb function symbols
+in the ELF) before ever using an address as an FDE/PC lookup key --
+see `strip_isa_bit()` and the regression case in
+`scripts/test_dwarf_unwind.py`. DWARF CFI decoding itself doesn't care
+about instruction set (GCC emits correct `.debug_frame` rules either
+way); only address bookkeeping needed the fix. Still open: the LK-side
+profiler's own capture hook (patches `0001`-`0003`) and the eventual
+serial-dump sample format haven't been audited for the same bit yet --
+do that as part of M5, since a captured LR read straight off a Thumb
+call site will carry it too.
+
 **Not A55-representative** — A72 is a different, higher-performance
 core than the eventual real target. This validates the *mechanism*
 (does interrupt-driven PMU sampling work at all on real silicon, does
