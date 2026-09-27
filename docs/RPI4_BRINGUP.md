@@ -115,30 +115,51 @@ Revised scope, closest analogue to `perf` noted per item:
    format a host tool can read from a raw memory image -- UART is just
    one way to deliver that image on the Pi, and it's worth being fast.
 
-   **Baud-rate calibration tooling is built, not yet run on hardware.**
-   The chainloader (`experiments/pi4-serialboot`) already programs the
-   UART clock to 48MHz specifically so a higher baud rate could be
-   added later without another clock change. `experiments/pi4-baudcal`
-   is a one-shot test payload, loaded the same way (no SD-card
-   reflash), that tries a table of candidate rates --
-   230400/460800/921600/1000000/1500000/2000000/3000000, computed as
-   exact or near-exact divisors of that 48MHz clock -- confirming sync
-   via a PING/PONG handshake at each new rate and running a byte-exact
-   echo stress test (multiple sizes up to 64 KB, multiple repeats) once
-   synced. If a candidate doesn't sync, the target silently reverts
-   itself to 115200 on a ~1s timeout, so the host script
-   (`scripts/pi4_baud_calibrate.py`) can step through the whole table
-   in one sitting with no power-cycle between attempts. Only the
-   transient test payload's own rate changes during this -- the
-   persistent chainloader's initial 115200 handshake is untouched and
-   stays the universal fallback regardless of what calibration finds.
-   Once a stable rate is confirmed on the real board, it should become
-   the new default in `pi4_serial_boot.py --baud`, and the same
-   `uart_set_baud()`-style IBRD/FBRD reprogramming should be applied to
-   the real LK console driver (`platform/bcm28xx`'s PL011 init), not
-   just the loader/test payloads -- otherwise the interactive shell and
-   any future `profiler dump` command stay stuck at 115200 even after
-   calibration finds a faster rate works.
+   **Baud-rate calibrated on real hardware (2026-09-27): 3,000,000
+   baud, ~212.8 KiB/s sustained (~19.3x over 115200's ~11 KiB/s).**
+   `experiments/pi4-baudcal` (a one-shot test payload, loaded the same
+   way as any other payload -- no SD-card reflash) tried a table of
+   candidate rates -- 230400/460800/921600/1000000/1500000/2000000/
+   3000000, computed as exact or near-exact divisors of the
+   chainloader's 48MHz UART clock -- confirming sync via a PING/PONG
+   handshake at each new rate, then a byte-exact echo stress test
+   (multiple sizes up to 64 KB, multiple repeats). Result, run twice
+   independently plus a 10x64KB confirmation pass at the winning rate:
+
+   | rate | result |
+   |---|---|
+   | 115200 | stable, 11.0 KiB/s (baseline) |
+   | 230400 | stable, 21.8 KiB/s |
+   | 460800 | stable, 42.4 KiB/s |
+   | 921600 | stable, 80.5 KiB/s |
+   | 1000000 | **never syncs** (reproducible, not a fluke) |
+   | 1500000 | **never syncs** (reproducible) |
+   | 2000000 | **never syncs** (reproducible) |
+   | 3000000 | stable, 212.2-212.8 KiB/s, 10/10 on a follow-up stress run |
+
+   The 1M/1.5M/2M gap right below the working 3M rate is real and
+   repeatable across independent runs -- most likely this host's
+   USB-serial adapter (Prolific PL2303, per `pi4_serial_boot.py`'s
+   `USB_SERIAL_VIDS`) or its Windows driver only cleanly supports a
+   specific discrete set of non-standard baud rates, not an arbitrary
+   continuum, and 3,000,000 happens to be one of the ones it supports
+   while 1M/1.5M/2M aren't. Not investigated further since 3,000,000 is
+   already the fastest rate the PL011 can reach at all from this 48MHz
+   clock with `IBRD >= 1` (the hardware ceiling, not just this
+   adapter's ceiling).
+
+   Only the transient test payload's own rate changed during
+   calibration -- the persistent chainloader's initial 115200 handshake
+   was never touched and stays the universal fallback. **Still to do**,
+   now that a rate is confirmed: make 3,000,000 the new default in
+   `pi4_serial_boot.py --baud`; extend the chainloader protocol to
+   negotiate up to 3,000,000 for the bulk payload transfer after the
+   115200 header handshake (keeping the handshake itself at 115200, the
+   safe fallback); and apply the same `uart_set_baud()`-style IBRD/FBRD
+   reprogramming to the real LK console driver (`platform/bcm28xx`'s
+   PL011 init) -- otherwise the interactive shell and any future
+   `profiler dump` command stay stuck at 115200 even with this
+   calibrated.
 7. **Not planned, noted as a deliberate scope decision**: per-task/
    per-thread breakdown beyond what the sample record's thread-ID field
    already gives for free, and PMU event multiplexing/frequency-based
