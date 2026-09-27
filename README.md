@@ -29,22 +29,27 @@ validates or depends on.
 ## Quick start
 
 ```bash
-./setup.sh                          # installs gcc-arm-none-eabi + qemu-system-arm, clones LK (latest, no pin), applies overlay
+./setup.sh                          # installs gcc-arm-none-eabi + pyelftools, clones LK (latest, no pin), applies overlay
 cd build/lk
-make profiler -j$(nproc)
+make rpi4-test -j$(nproc)
 cd ../..
-python3 scripts/pc_histogram.py --elf build/lk/build-profiler/lk.elf
+python3 scripts/pi4_serial_boot.py build/lk/build-rpi4-test/lk.bin --port COM5
 ```
 
-`pc_histogram.py` boots QEMU, drives `profiler clear`/`start`/`bench`
-(`--nest` for a 3-level call chain, `--smp-workload` for one worker
-thread per core) over the console, pauses the VM mid-workload via QMP
-once enough samples exist, pulls the per-CPU PC/LR/FP/timestamp ring
-buffers out, and prints a symbolized self-time histogram plus (Stage 3)
-offline FP-chain-unwound call stacks in FlameGraph-compatible folded
-format -- one merged file and one per core (Stage 4). At the LK shell
-directly:
+That builds and sends the current `TARGET=rpi4` image over the serial
+chainloader to a real Pi 4B (see `docs/RPI4_BRINGUP.md` for the physical
+setup and current milestone status). To check the DWARF-CFI unwinder
+works independently of any hardware:
+
+```bash
+python3 scripts/test_dwarf_unwind.py
+```
+
+At the LK shell, once booted:
 `profiler <start|stop|status|clear|bench [iters]|nest [iters]|smp [iters]|pmu|fpcheck>`.
+Live sample extraction over serial (replacing the old QEMU/QMP-based
+`pc_histogram.py`, removed along with all QEMU references) is M5 in
+`docs/RPI4_BRINGUP.md` -- not yet implemented.
 
 ## Layout
 
@@ -52,12 +57,13 @@ directly:
 setup.sh              toolchain install + LK clone (latest, no pin) + overlay apply
 overlay/lk/*.patch     small, additive core-LK patches (e.g. the GIC tick hook)
 app/profiler/          the profiler LK module (grows through the staged plan)
-project/profiler.mk    LK project file (app/shell + app/profiler on qemu-virt-arm32)
+project/rpi4-test.mk   LK project file (app/shell + app/profiler + app/love on TARGET=rpi4)
 docs/DESIGN.md         full design: constraints, staged plan, SMP bookkeeping
 docs/RPI4_BRINGUP.md   real-hardware track on Raspberry Pi 4B: status + LK port plan
 experiments/pi4-*/     standalone Pi 4B images (validation image, serial chainloader)
-scripts/               host-side tooling (symbolizer, offline unwinder, flamegraph glue,
-                       pi4_serial_boot.py for loading images onto the Pi over serial)
+scripts/               host-side tooling: dwarf_unwind.py (DWARF-CFI offline unwinder,
+                       see test_dwarf_unwind.py), pi4_serial_boot.py/pi4_doctor.py for
+                       the Pi over serial
 ```
 
 LK is **not pinned** — deliberately tracks upstream `littlekernel/lk`'s

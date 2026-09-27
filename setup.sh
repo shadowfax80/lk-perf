@@ -18,7 +18,19 @@ ensure_toolchain() {
     fi
     echo "Installing gcc-arm-none-eabi via apt ..."
     apt-get update -qq
-    apt-get install -y -qq gcc-arm-none-eabi qemu-system-arm
+    apt-get install -y -qq gcc-arm-none-eabi
+}
+
+# Needed by scripts/dwarf_unwind.py (DWARF CFI-based stack unwinding --
+# chosen over ARM's own EXIDX, see docs/RPI4_BRINGUP.md and README.md
+# for why) and scripts/test_dwarf_unwind.py's regression test.
+ensure_pyelftools() {
+    if python3 -c "import elftools" >/dev/null 2>&1; then
+        echo "pyelftools already present"
+        return 0
+    fi
+    echo "Installing pyelftools ..."
+    python3 -m pip install --quiet pyelftools
 }
 
 clone_lk() {
@@ -64,7 +76,6 @@ apply_overlay() {
     echo "Applying profiler overlay ..."
     mkdir -p "$LK_DIR/app" "$LK_DIR/project"
     rsync -a "$ROOT/app/profiler/" "$LK_DIR/app/profiler/"
-    cp "$ROOT/project/profiler.mk" "$LK_DIR/project/profiler.mk"
     [ -d "$LK_DIR/app/profiler" ] && find "$LK_DIR/app/profiler" -name "*.sh" -exec chmod +x {} \; || true
 
     echo "Applying rpi4 target overlay ..."
@@ -91,19 +102,22 @@ ensure_flamegraph() {
         https://raw.githubusercontent.com/brendangregg/FlameGraph/master/flamegraph.pl
 }
 
-echo "==> [1/4] Ensuring arm-none-eabi toolchain + qemu-system-arm ..."
+echo "==> [1/5] Ensuring arm-none-eabi toolchain ..."
 ensure_toolchain
-echo "==> [2/4] Cloning/updating upstream LK (latest, no pin) ..."
+echo "==> [2/5] Ensuring pyelftools (DWARF-CFI unwinding) ..."
+ensure_pyelftools
+echo "==> [3/5] Cloning/updating upstream LK (latest, no pin) ..."
 clone_lk
-echo "==> [3/4] Applying profiler overlay ..."
+echo "==> [4/5] Applying profiler overlay ..."
 apply_overlay
-echo "==> [4/4] Ensuring flamegraph.pl ..."
+echo "==> [5/5] Ensuring flamegraph.pl ..."
 ensure_flamegraph
 
 echo ""
 echo "Toolchain:     $(command -v arm-none-eabi-gcc)"
 echo "LK tree ready: $LK_DIR"
-echo "Build:  cd $LK_DIR && make profiler -j\$(nproc)"
-echo "Boot:   qemu-system-arm -machine virt -cpu cortex-a15 -smp 1 -m 512 -nographic -kernel $LK_DIR/build-profiler/lk.elf"
-echo "Profile+unwind: python3 scripts/pc_histogram.py --elf \$LK_DIR/build-profiler/lk.elf"
-echo "Render flame graph: perl scripts/flamegraph.pl \$LK_DIR/build-profiler/lk.folded > flame.svg"
+echo "This project targets real Raspberry Pi 4B hardware only (TARGET=rpi4)."
+echo "Build:  cd $LK_DIR && make rpi4-test -j\$(nproc)"
+echo "Send over serial: python3 scripts/pi4_serial_boot.py \$LK_DIR/build-rpi4-test/lk.bin --port COM5"
+echo "Unwind test: python3 scripts/test_dwarf_unwind.py"
+echo "Render flame graph: perl scripts/flamegraph.pl <folded-file> > flame.svg"

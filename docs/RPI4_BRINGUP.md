@@ -132,7 +132,8 @@ the "Start here" section of docs/RPI4_BRINGUP.md first.
 2. Set up the Linux build box: I'll create a RunPod CPU pod. Give me
    this PC's SSH public key to add, wait for my "SSH over exposed TCP"
    command, then clone the repo there, run ./setup.sh and confirm the
-   QEMU `make profiler` baseline builds and boots.
+   `rpi4-test` baseline builds cleanly (`cd build/lk && make rpi4-test
+   -j$(nproc)`).
 3. Start the LK TARGET=rpi4 port per the doc's step 3 plan, as
    overlay/lk/0004-bcm28xx-add-rpi4.patch, single-core first, aiming
    for M1 then M2. Verify the GIC IDs and the boot-args symbol against
@@ -211,16 +212,20 @@ The details behind each row:
    RX to GPIO14 (pin 8), adapter TX to GPIO15 (pin 10), GND to pin 6.
    115200 8N1.
 3. **The build runs on Linux: a RunPod CPU pod, WSL or any Linux box.** The
-   repo's `setup.sh` expects apt: it installs `gcc-arm-none-eabi` and
-   `qemu-system-arm`, clones upstream LK into `build/lk`, and applies
-   `overlay/lk/*.patch`. On RunPod, register the machine's SSH public key
-   under Settings, start the cheapest **CPU** pod on an Ubuntu template, and
-   use the "SSH over exposed TCP" command so `scp` works. Stop the pod when
-   you're done; the repo holds all the state.
+   repo's `setup.sh` expects apt: it installs `gcc-arm-none-eabi`,
+   `pyelftools` (for `scripts/dwarf_unwind.py`), clones upstream LK into
+   `build/lk`, and applies `overlay/lk/*.patch`. On RunPod, use the REST
+   API (`POST https://rest.runpod.io/v1/pods` with `computeType: "CPU"`,
+   `cpuFlavorIds: ["cpu3g"]` -- **not** the GraphQL `podFindAndDeployOnDemand`
+   mutation, which doesn't support CPU-only pods cleanly and will
+   silently deploy an expensive GPU pod instead if `computeType` is
+   omitted) to start the cheapest CPU pod, then SSH in directly.
 4. Sanity check before any port work: on the build box, `./setup.sh`, then
-   `cd build/lk && make profiler -j$(nproc)`, and boot it under QEMU. This
-   confirms upstream LK tip plus the overlay still build, so later failures
-   are really about the port.
+   `cd build/lk && make rpi4-test -j$(nproc)`. This confirms upstream LK
+   tip plus the overlay still build, so later failures are really about
+   the port. There's no QEMU boot step any more -- real verification
+   happens by sending the image to the actual Pi over serial
+   (`scripts/pi4_serial_boot.py`).
 
 ### The round trip once the port builds
 
@@ -315,12 +320,14 @@ Milestones, each checked through the chainloader log:
   shell.
 - **M4 memory:** real memory size from the DTB.
 - **M5 profiler on hardware:** `project/profiler-rpi4.mk` (the rpi4 target
-  plus `app/profiler`, same `-fno-omit-frame-pointer` flags), with patches
-  0001-0003 checked on this build. **Note:** `scripts/pc_histogram.py`
-  pulls the sample ring buffers out through QEMU's QMP `pmemsave`, which
-  real hardware doesn't have. On the Pi the buffers have to come out over
-  the serial console, e.g. a shell command that hex-dumps them, parsed by
-  a host script. Plan that as part of M5.
+  plus `app/profiler`; `-g` for DWARF CFI, not `-fno-omit-frame-pointer`
+  -- see the DWARF-CFI-unwinding step below), with patches 0001-0003
+  checked on this build. **Note:** the old `scripts/pc_histogram.py`
+  (removed along with all QEMU references -- it pulled sample ring
+  buffers out through QEMU's QMP `pmemsave`, which real hardware doesn't
+  have) needs a real, from-scratch replacement: on the Pi the buffers
+  have to come out over the serial console, e.g. a shell command that
+  hex-dumps them, parsed by a host script. Plan that as part of M5.
 
 After M5 the original plan continues: step 5 (DWARF-CFI unwinding) and
 step 6 (real PMU events via `PMCEID0`/`PMCEID1`). They're listed under
@@ -488,30 +495,45 @@ See `overlay/lk/0004-bcm28xx-add-rpi4.patch` for the fix.
 ## Next steps, in order
 
 1. **M5 -- profiler on hardware.** Port `project/profiler-rpi4.mk` +
-   the existing profiler patches (`0001`-`0003`) onto this target.
-   `scripts/pc_histogram.py`'s current sample extraction is QMP-based
-   (QEMU-only) and has no real-hardware equivalent -- it needs to
-   become a serial dump instead. This lands the existing **timer-tick
-   sampling** mode (GIC timer IRQ -> `profiler_on_tick` -> PC/LR/FP
-   ring buffers) working on real hardware.
-2. **DWARF-CFI unwinding**, replacing the FP-chain walker
-   (`walk_fp_chain` in `scripts/pc_histogram.py`). Chosen over ARM's
-   own EXIDX (`.ARM.exidx`/`.ARM.extab`) deliberately: this project's
-   scope is a PoC for the the target platform's actual perf use case,
-   and the target platform's shipped firmware carries no EXIDX (dropped from the
-   production build to save flash/RAM, since C-only code with no
-   exceptions doesn't need it functionally) but does carry DWARF CFI
-   (`.debug_frame`) in its debug-symbol ELF -- the same mechanism
-   Trace32 already uses there to unwind crash dumps. Matching that
-   mechanism here means the validation transfers directly, rather than
-   validating a format the target platform doesn't use. Practically:
+   the existing profiler patches (`0001`-`0003`) onto this target. The
+   old `scripts/pc_histogram.py` (QEMU/QMP-based sample extraction) has
+   been **removed** along with all QEMU references in this project --
+   its replacement needs to be written from scratch as a serial dump:
+   an LK shell command that dumps the sample ring buffers over UART,
+   parsed by a new host script. This lands the existing **timer-tick
+   sampling** mode (GIC timer IRQ -> `profiler_on_tick` -> PC/LR/FP/(new)
+   SP ring buffers) working on real hardware. Note the sample buffers
+   need a new SP capture alongside PC/LR/FP for step 2 below -- DWARF
+   CFI's CFA computation in this project's stack layouts is anchored on
+   SP, not FP.
+2. **DWARF-CFI unwinding.** The standalone unwinder itself is **done**:
+   `scripts/dwarf_unwind.py` (`DwarfCFIUnwinder`, using `pyelftools`'
+   `.debug_frame` decoding) plus `scripts/test_dwarf_unwind.py`, a
+   self-contained regression test that compiles a real ARM32 binary
+   with no frame pointers at all, hand-traces the ground-truth call
+   chain from its own disassembly, and confirms the unwinder recovers
+   it exactly. What's left is wiring it into the live pipeline once M5
+   exists: a new `scripts/pc_histogram.py` that reads the serial-dumped
+   PC/SP/LR samples and calls `DwarfCFIUnwinder.unwind()` per sample,
+   producing the same FlameGraph-compatible folded-stack format the old
+   FP-chain walker did.
+
+   Chosen over ARM's own EXIDX (`.ARM.exidx`/`.ARM.extab`) deliberately:
+   this project's scope is a PoC for the the target platform's actual
+   perf use case, and the target platform's shipped firmware carries no EXIDX
+   (dropped from the production build to save flash/RAM, since C-only
+   code with no exceptions doesn't need it functionally) but does carry
+   DWARF CFI (`.debug_frame`) in its debug-symbol ELF -- the same
+   mechanism Trace32 already uses there to unwind crash dumps. Matching
+   that mechanism here means the validation transfers directly, rather
+   than validating a format the target platform doesn't use. Practically:
    - No ARM unwind-tables needed (`-funwind-tables` on ARM defaults to
      EHABI/EXIDX) -- just `-g` for debug info, which makes GCC emit
      `.debug_frame` CFI independent of whether EXIDX is enabled at all.
-   - The offline host-side unwinder (`scripts/pc_histogram.py`, already
-     Python) can use `pyelftools`' existing `.debug_frame`/CFI decoding
-     directly, rather than hand-rolling a decoder the way EXIDX's
-     ARM-specific compact opcodes would have required.
+   - The offline host-side unwinder (`scripts/dwarf_unwind.py`, Python)
+     uses `pyelftools`' existing `.debug_frame`/CFI decoding directly,
+     rather than hand-rolling a decoder the way EXIDX's ARM-specific
+     compact opcodes would have required.
    - This is also a closer match to real Linux `perf` itself, which
      supports DWARF-based call-graph unwinding (`--call-graph dwarf`,
      via `libunwind`) as one of its own core modes -- arguably more
