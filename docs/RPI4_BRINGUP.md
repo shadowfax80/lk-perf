@@ -226,11 +226,35 @@ Revised scope, closest analogue to `perf` noted per item:
    only the PMU *interrupt* path (event-overflow sampling) remained
    unverified at the time this was written -- see item 5, also now done.
 4. **`profiler report`/`annotate` (symbols + source lines +
-   instruction-level hotspots).** Nearest-symbol lookup exists; add
-   `.debug_line` for source-line attribution, and use the ELF's
-   `$t`/`$a` mapping symbols to disassemble each region in the correct
-   instruction set. `perf script`-compatible output would let existing
-   viewers (FlameGraph, Firefox Profiler, hotspot) consume it directly.
+   instruction-level hotspots). Done (2026-09-28, commit `76e8e4f`),
+   entirely host-side -- no on-target change needed.**
+   - `dwarf_unwind.py` gained `find_function()` (nearest function with
+     its real size/ISA mode, for disassembling exactly its address
+     range) and `resolve_lines()` (PC -> `file:line` via `.debug_line`,
+     correctly handling `end_sequence` gaps between CUs). Verified
+     against `test_dwarf_unwind.py`'s own fixture before trusting
+     either: exact `nested.c:9/15/19` for the three known sample points.
+   - `pi4_pc_histogram.py --annotate N`: disassembles the N hottest
+     functions via `arm-none-eabi-objdump` over each one's real address
+     range -- objdump already handles ARM/Thumb-correct disassembly
+     from the ELF's own `$t`/`$a` mapping symbols, so nothing here
+     needs to track instruction sets itself -- prefixes every
+     instruction with its own sample count and interleaves source-line
+     markers, a `perf annotate`-style per-instruction view.
+   - Verified against real hardware capture (the PMU-event-sampling run
+     above): each hot function's single loop-body instruction (the
+     XOR-rotate accumulator / the add accumulator) got ~100% of that
+     function's samples, exactly as expected for a tight inner loop.
+   - Real pitfall hit and worth remembering: an early check against
+     this same capture used a **stale local `lk.elf`** (only `lk.bin`
+     had been re-fetched after the last rebuild) and got a
+     systematically wrong but internally-consistent line-number offset
+     -- looked plausible, wasn't. Always re-fetch `lk.elf` alongside
+     `lk.bin` after any rebuild, not just the binary needed to flash.
+   - Not done: a `perf script`-compatible text emitter. Lower priority
+     than source lines/annotate turned out to be -- FlameGraph
+     consumption already works via the existing folded-stack output;
+     revisit only if Firefox Profiler/hotspot import is actually needed.
 5. **PMU-event sampling. Done and confirmed working on real hardware
    (2026-09-28, commits `e9ed753`/`6aebf9c`).** `profiler pmustart
    <event> <count>` / `pmustop`: a real second sampling mode alongside
