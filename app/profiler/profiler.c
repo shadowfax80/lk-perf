@@ -98,11 +98,15 @@
 #include <lib/console.h>
 #include <lk/compiler.h>
 #include <lk/reg.h>
+#include <platform/interrupts.h>
 #include <platform/time.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#if BCM2711
+#include <platform/bcm28xx.h>
+#endif
 
 // IRQ 27 = non-secure physical timer PPI on qemu-virt-arm/cortex-a15 --
 // this is LK's own scheduler-tick IRQ (kernel/timer.c, dev/timer/
@@ -187,6 +191,60 @@ static inline void pmu_write_pmxevtyper(uint32_t v) {
 static inline uint32_t pmu_read_pmxevcntr(void) {
     uint32_t v; __asm__ volatile("mrc p15, 0, %0, c9, c13, 2" : "=r"(v)); return v;
 }
+static inline void pmu_write_pmxevcntr(uint32_t v) {
+    __asm__ volatile("mcr p15, 0, %0, c9, c13, 2" :: "r"(v));
+}
+static inline void pmu_write_pmintenset(uint32_t v) {
+    __asm__ volatile("mcr p15, 0, %0, c9, c14, 1" :: "r"(v));
+}
+static inline void pmu_write_pmintenclr(uint32_t v) {
+    __asm__ volatile("mcr p15, 0, %0, c9, c14, 2" :: "r"(v));
+}
+// Write-1-to-clear, per the ARM architecture: writing back the same
+// bits read from PMOVSR clears exactly those overflow flags.
+static inline void pmu_write_pmovsr(uint32_t v) {
+    __asm__ volatile("mcr p15, 0, %0, c9, c12, 3" :: "r"(v));
+}
+
+#if BCM2711
+// M5 `profiler pmustart`: BCM2711's PMU interrupt is NOT a PPI like
+// the timer (dev/timer/arm_generic) -- it's 4 separate per-core SPIs,
+// confirmed from the real Raspberry Pi kernel's own device tree source
+// (bcm2711.dtsi): `interrupts = <GIC_SPI 16 ...>, <GIC_SPI 17 ...>,
+// <GIC_SPI 18 ...>, <GIC_SPI 19 ...>; interrupt-affinity = <&cpu0>,
+// <&cpu1>, <&cpu2>, <&cpu3>;`. GIC_SPI n in DTS notation is real GIC
+// interrupt ID n+32, so these are IDs 48-51, one per core.
+//
+// dev/interrupt/arm_gic/gic_v2.c's own init (`arm_gic_init_hw`) routes
+// every SPI to cpu0 only by default (`GICD_ITARGETSR(i/4) = 0x01010101`
+// for all of them) -- without reprogramming this, all 4 PMU interrupts
+// would land on core 0 regardless of which core's counter actually
+// overflowed. IDs 48-51 all share one ITARGETSR register (4 IDs per
+// register, byte-per-ID target bitmask), so this is one write:
+// byte0(ID48)=0x01(cpu0), byte1(ID49)=0x02(cpu1), byte2(ID50)=0x04(cpu2),
+// byte3(ID51)=0x08(cpu3) => 0x08040201.
+//
+// Computed via this platform's own static "bcm2711 low peripherals +
+// gic" mmu_initial_mappings entry (platform/bcm28xx.h's
+// BCM_GIC_BASE_VIRT), not arm_gic's own internal (separately,
+// dynamically mapped) GICD virtual address -- both are valid device-
+// memory aliases of the exact same physical GICD_ITARGETSR register,
+// so which one this uses doesn't matter for correctness, and this
+// avoids needing arm_gic's private (non-public-header) internal state
+// at all.
+#define PROFILER_PMU_SPI_BASE 48  // GIC_SPI 16 == real GIC ID 48 (16+32)
+#define PROFILER_PMU_GICD_VIRT (BCM_GIC_BASE_VIRT + 0x1000)
+
+static void profiler_pmu_route_and_unmask(void) {
+    volatile uint32_t *itargetsr =
+        (volatile uint32_t *)(PROFILER_PMU_GICD_VIRT + 0x800 +
+                               (PROFILER_PMU_SPI_BASE / 4) * 4);
+    *itargetsr = 0x08040201;
+    for (int i = 0; i < 4; i++) {
+        unmask_interrupt(PROFILER_PMU_SPI_BASE + i);
+    }
+}
+#endif
 
 // Defined in arch/arm/arm/exceptions.S by
 // overlay/lk/0002-capture-interrupted-fp.patch +
@@ -223,6 +281,14 @@ uint64_t profiler_ts_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
 volatile uint32_t profiler_head[SMP_MAX_CPUS];
 volatile uint32_t profiler_total[SMP_MAX_CPUS];
 volatile uint32_t profiler_enabled;
+// M5 `profiler pmustart`/`pmustop`: independent of profiler_enabled --
+// both timer-tick and PMU-event sampling are genuine, separately
+// selectable modes (per docs/RPI4_BRINGUP.md), sharing the same ring
+// buffers. profiler_pmu_reload is the "0xFFFFFFFF - count + 1" preset
+// value, reapplied to PMXEVCNTR every time it overflows so sampling
+// continues at the same event-count interval.
+volatile uint32_t profiler_pmu_enabled;
+volatile uint32_t profiler_pmu_reload;
 
 // Called from dev/interrupt/arm_gic/gic_v2.c on every IRQ (weak default is
 // a no-op when this file isn't linked in). Keep this minimal and
@@ -232,7 +298,18 @@ volatile uint32_t profiler_enabled;
 // cross-core serialization) -- touches only this core's own array slots,
 // so no locking is needed despite running on N cores at once.
 void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
-    if (vector != PROFILER_TIMER_IRQ || !profiler_enabled) {
+    bool is_timer_tick = (vector == PROFILER_TIMER_IRQ) && profiler_enabled;
+#if BCM2711
+    // M5: the PMU's 4 per-core SPIs (see profiler_pmu_route_and_unmask's
+    // own comment) are routed one-to-one with cores, so a real overflow
+    // on this exact core always arrives as its own specific vector --
+    // no need to check *which* of the 4 fired, just that one did.
+    bool is_pmu_overflow = profiler_pmu_enabled &&
+        vector >= PROFILER_PMU_SPI_BASE && vector < PROFILER_PMU_SPI_BASE + 4;
+#else
+    bool is_pmu_overflow = false;
+#endif
+    if (!is_timer_tick && !is_pmu_overflow) {
         return;
     }
 
@@ -254,6 +331,13 @@ void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
     profiler_ts_buf[cpu][idx] = current_time_hires();
     profiler_head[cpu] = (idx + 1) % PROFILER_BUF_SIZE;
     profiler_total[cpu]++;
+
+#if BCM2711
+    if (is_pmu_overflow) {
+        pmu_write_pmovsr(1u << 0);           // write-1-to-clear counter0's overflow flag
+        pmu_write_pmxevcntr(profiler_pmu_reload);  // reprogram for the next window
+    }
+#endif
 }
 
 // Minimal, self-contained synthetic workload purely to give Stage 1
@@ -309,7 +393,7 @@ static int profiler_smp_worker(void *arg) {
 
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
-        printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|stat|pmu|fpcheck>\n");
+        printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|stat|pmustart|pmustop|pmu|fpcheck>\n");
         return -1;
     }
 
@@ -459,6 +543,70 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
                    (uint32_t)(refills_per_iter_tenthousandth % 10000));
         }
         printf("stat: done\n");
+    } else if (!strcmp(sub, "pmustart")) {
+#if BCM2711
+        // M5 PMU-event-driven sampling, real second sampling mode
+        // alongside timer-tick (`start`/`stop`), not instead of it --
+        // both are genuine, selectable options sharing the same ring
+        // buffers. Single-core only in this first version: PMU control
+        // registers are per-core (banked in hardware, unlike the
+        // shared distributor state profiler_pmu_route_and_unmask sets
+        // up once), so arming every core would need cross-core
+        // signaling (e.g. an SGI to each core) this doesn't do yet --
+        // it only arms whichever core runs this command. One event at
+        // a time, correctly wired end to end, first.
+        if (argc < 4) {
+            printf("usage: profiler pmustart <event_hex> <count>\n");
+            return -1;
+        }
+        uint32_t event = (uint32_t)argv[2].u;
+        uint32_t count = (uint32_t)argv[3].u;
+        if (count == 0) {
+            printf("pmustart: count must be > 0\n");
+            return -1;
+        }
+
+        uint32_t pmceid0 = pmu_read_pmceid0();
+        if (event < 32 && !(pmceid0 & (1u << event))) {
+            printf("pmustart: warning: event 0x%x not marked implemented in "
+                   "PMCEID0=0x%08x -- trying anyway\n", event, pmceid0);
+        }
+
+        printf("pmustart: routing PMU SPIs 48-51 to cpu0-3 and unmasking ...\n");
+        profiler_pmu_route_and_unmask();
+
+        printf("pmustart: configuring event counter 0 for event 0x%x, "
+               "reload every %u ...\n", event, count);
+        pmu_write_pmselr(0);
+        pmu_write_pmxevtyper(event);
+        profiler_pmu_reload = 0xFFFFFFFFu - count + 1u;
+        pmu_write_pmxevcntr(profiler_pmu_reload);
+
+        printf("pmustart: enabling counter0 + its overflow interrupt ...\n");
+        pmu_write_pmcntenset(1u << 0);
+        pmu_write_pmintenset(1u << 0);
+
+        printf("pmustart: enabling PMU (PMCR E=1) ...\n");
+        uint32_t pmcr = pmu_read_pmcr();
+        pmu_write_pmcr(pmcr | (1u << 0));
+
+        profiler_pmu_enabled = 1;
+        printf("profiler: PMU-event sampling started on cpu%u "
+               "(event 0x%x, every %u occurrences)\n",
+               arch_curr_cpu_num(), event, count);
+#else
+        printf("pmustart: needs real hardware (BCM2711) -- see the 'pmu' command\n");
+#endif
+    } else if (!strcmp(sub, "pmustop")) {
+#if BCM2711
+        profiler_pmu_enabled = 0;
+        pmu_write_pmintenclr(1u << 0);
+        uint32_t pmcr = pmu_read_pmcr();
+        pmu_write_pmcr(pmcr & ~(1u << 0));
+        printf("profiler: PMU-event sampling stopped\n");
+#else
+        printf("pmustop: needs real hardware (BCM2711)\n");
+#endif
     } else if (!strcmp(sub, "pmu")) {
         // Stage 5 (PMU-overflow-triggered sampling) is real-hardware-only
         // on this project -- confirmed two independent ways on the
