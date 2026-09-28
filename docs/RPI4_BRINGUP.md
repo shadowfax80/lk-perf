@@ -412,6 +412,66 @@ routines with real hardware VFP instructions independent of that
 kernel-level setting). Verified via a full disassembly of the linked
 `lk.elf`: zero VFP/NEON instructions of any kind remain in the binary.
 
+## M5 edge-case validation (2026-09-28)
+
+Every M5 result up to this point had exercised only "easy" cases:
+shallow chains, no recursion, no forced frame pointers, no real
+ARM-mode code. `profiler edgetest` adds four workloads deliberately
+built to stress specific things the pipeline had never actually been
+run against on real hardware -- see `app/profiler/profiler.c`'s own
+comments on `profiler_deep_1..8`, `profiler_recurse`,
+`profiler_fp_forced_{inner,outer}`, and `profiler_arm_mode_func` for
+exactly what each targets and how each was confirmed to compile as
+intended (real `bl` chains vs. tail calls, real r7-based frames, real
+ARM-mode encodings) before ever touching hardware.
+
+**Real bug found and fixed: the unwinder's cycle guard broke real
+recursion.** `profiler_recurse(20, ...)` -- genuine, non-tail
+recursion, confirmed via disassembly to compile to a real `bl
+profiler_recurse` (calls itself) -- revisits the exact same
+instruction address at every depth. The unwinder's original cycle
+guard (`if cur_pc in chain: break`) checked pc alone, and broke
+immediately: every single captured sample inside 20 levels of real
+recursion unwound to a chain of length 1. Fixed by keying the guard on
+`(pc, cfa)` instead (commit `48a98cd`) -- recursion's cfa is different
+at every real depth (each call has its own stack frame), while an
+actual CFI-driven infinite loop would repeat both. Added a regression
+case to `scripts/test_dwarf_unwind.py` reusing `nested.c`'s own already
+-verified CFI data (no new fixture needed), confirmed it fails against
+the pre-fix code, then confirmed the fix on real hardware: the same
+workload now reaches depth 15-18 (previously always 1) before running
+out of `PROFILER_STACK_CAPTURE_BYTES` (128) -- the capture window, not
+the algorithm, is the real limit on recursion depth now.
+
+**Everything else confirmed correct, no fixes needed:**
+- The 8-level genuine non-tail-call chain (`profiler_deep_8` ->
+  ... -> `profiler_deep_1` -> `cmd_profiler`) unwinds completely, no
+  truncation -- each of those frames only needs ~8-16 bytes, so 128
+  bytes covers meaningfully deep *non-recursive* real chains in this
+  codebase already (a useful negative result: the original guess that
+  8 levels would exceed the window was wrong, in the good direction).
+- `profiler_fp_forced_inner`/`_outer` (forced `-fno-omit-frame-pointer`,
+  confirmed via disassembly to really push/use r7 as CFA) unwound
+  correctly on real hardware for the first time -- every other sample
+  captured on this target before this had `fp=0` or garbage, since
+  `-O2` omits frame pointers by default. This is real proof the r7-CFA
+  path (previously only exercised by the hand-written
+  `testdata/thumb_edge.S` test) works on genuine compiled code too.
+- `profiler_arm_mode_func` (`__attribute__((target("arm")))`,
+  confirmed via disassembly to be real 32-bit ARM encodings inside
+  this otherwise all-Thumb build) unwound correctly and its symbol
+  correctly carries no `(thumb)` tag -- real BL/BX interworking, ISA
+  bit handled right, not just the offline synthetic test from before.
+- No frame pointer is required anywhere in the base mechanism: the
+  three cases above with `fp=0`/garbage all unwound correctly because
+  their real CFI data defines the CFA via SP, never referencing r7/r11
+  at all -- `fp` is only ever read when a specific function's own
+  `.debug_frame` row says to (confirmed by `_resolve_cfa()` reading
+  whichever register `cfa_rule.reg` names, never a hardcoded r7/r11
+  fallback). This is exactly the property DWARF CFI was chosen for
+  over the old FP-chain walker in the first place, now confirmed with
+  real edge cases instead of just the original design rationale.
+
 ## Why Pi 4B over the Arm Cortex-A55 FVP route
 
 The FVP was investigated first and set aside for concrete, confirmed
