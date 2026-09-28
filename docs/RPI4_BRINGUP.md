@@ -303,13 +303,9 @@ Revised scope, closest analogue to `perf` noted per item:
    do yet. One event at a time, correctly wired end to end, first --
    multi-event multiplexing remains out of scope per the original plan.
 
-   Still open, not addressed by this: an explicit, documented position
-   on the interrupts-masked blind spot -- timer-IRQ *and* PMU-IRQ
-   sampling both can't fire while interrupts are masked, so critical
-   sections and ISRs get no samples and their time is misattributed to
-   whatever runs right after unmasking. Linux covers this with
-   FIQ/pseudo-NMI; LK on the Pi runs non-secure and can't configure the
-   GIC for FIQ delivery the way the target platform's real boot chain probably can.
+   Still open, not addressed by this: the interrupts-masked blind spot
+   -- see "The interrupts-masked blind spot: a position" below for the
+   full analysis and recommendation (2026-09-28).
 6. **How samples leave the device.** UART at 115200 baud is ~11 KiB/s --
    fine for a small image, a real bottleneck for the sample dumps this
    plans for (M5's richer per-sample record puts a full 4-core buffer
@@ -474,6 +470,91 @@ the algorithm, is the real limit on recursion depth now.
   fallback). This is exactly the property DWARF CFI was chosen for
   over the old FP-chain walker in the first place, now confirmed with
   real edge cases instead of just the original design rationale.
+
+## The interrupts-masked blind spot: a position (2026-09-28)
+
+**The mechanism.** Both sampling modes here (`profiler start`/`stop`
+and `profiler pmustart`/`pmustop`) work by hooking a GIC interrupt --
+the timer PPI, or the PMU's per-core SPI. Standard ARM GIC behavior:
+while `CPSR.I` is set, neither can actually interrupt the core. The
+signal doesn't disappear -- it stays pending at the distributor and
+fires the moment interrupts are unmasked again -- but nothing gets
+sampled for the entire masked duration, and the *next* sample after
+unmasking lands on whatever happens to be running right then, which is
+often not representative of the masked code at all. This is not a bug
+in this project's implementation; it's how IRQ-driven sampling works
+on any architecture. `perf` on Linux hits the identical problem, which
+is exactly why it exists.
+
+**This already has a real, concrete example on this target, not just
+a hypothetical one.** `lib/io/console.c`'s print lock (the M3 SMP
+console-race fix, `overlay/lk/0005-fix-smp-console-output-race.patch`)
+holds `spin_lock_irqsave(&print_spin_lock)` across the *entire*
+`vfprintf()` call, not just the final UART write -- deliberately, to
+stop concurrent cores' output from interleaving mid-string. Every
+`printf`/`dprintf` call on this system runs with interrupts masked for
+its whole duration as a direct, necessary consequence. Any code that
+prints a lot -- which describes most of this project's own bring-up
+and debug work -- gets systematically under-sampled by exactly this
+mechanism. This is a known, accepted tradeoff (the SMP correctness
+problem it fixes was real and hard-won), not something to casually
+"fix" by shrinking the lock back down.
+
+**Why this can't be fixed here, and that's a fact about *this*
+environment, not about the mechanism in general.** Linux's real
+answer is FIQ (older ARM) or GICv3 priority-based pseudo-NMI (newer
+ARM64): route the PMU interrupt at a priority/exception path that
+bypasses the normal IRQ-disable mechanism entirely. Both require
+configuring interrupt *group* membership at the GIC distributor
+(`GICD_IGROUPRn` on this GICv2 hardware), which is Secure-state-only
+per the architecture. LK on this Pi boots straight into HYP, non-secure
+(confirmed during M1's own HYP->SVC bring-up work), with no secure-world
+code of its own at all -- there's no path here to reconfigure interrupt
+groups, not because it hasn't been implemented, but because the
+privilege to do so was never available on this boot chain in the first
+place. Attempting it isn't a "todo"; it's out of reach for this
+specific validation environment regardless of effort spent.
+
+**This is a fact about the Pi validation environment, not a
+demonstrated fact about the target platform.** A cellular baseband processor
+almost certainly has its own real secure-boot chain, for reasons
+unrelated to profiling (DRM, crypto, radio certification) -- unlike
+this from-scratch bare-metal Pi bring-up, which never had one. Whether
+the target platform's actual boot chain grants its own OS/RTOS the secure access
+FIQ or pseudo-NMI sampling would need is a genuinely open question,
+not something this project can answer from the Pi side. Don't read
+"lk-perf hit this limitation on the Pi" as "the target platform also has this
+limitation" -- that would need checking on the real target, separately.
+
+**The position:**
+1. Document the blind spot as a known, quantified bias in every report
+   from this profiler, not a blocker to using it. Every statistical
+   sampling profiler has *some* systematic bias; the useful move is
+   making this one visible, not pretending it doesn't exist.
+2. Don't attempt FIQ/pseudo-NMI on the Pi. It's not reachable from a
+   non-secure boot chain here, and even if it were, the result
+   wouldn't transfer to the target platform anyway -- the target platform's own GIC
+   configuration, secure boot chain, and RTOS are all different from
+   LK-on-Pi, so this would need its own, separate implementation on the
+   real target regardless of what happened here. Spending real effort
+   defeating a non-secure boot chain on validation hardware, for a
+   capability that has to be rebuilt from scratch on the actual target
+   anyway, is effort spent on the wrong side of the port.
+3. What *is* worth building here, being genuinely cheap and actually
+   informative: a running counter of total cycles spent with interrupts
+   masked (hook the same `spin_lock_irqsave`/IRQ-entry paths already
+   instrumented for other reasons), reported alongside every `profiler
+   stat`/`dump` -- turning "some unknown fraction of this run was
+   invisible to sampling" into a real number, the same way `perf`
+   itself reports lost/dropped samples rather than staying silent about
+   them. Not built yet; a reasonable next small addition, distinct from
+   trying to close the gap itself.
+4. When this work reaches the target platform's real target, the first question to
+   check there -- before assuming either way -- is whether its boot
+   chain grants secure/TrustZone access an RTOS profiler could use for
+   FIQ or priority-based sampling. If yes, that closes this gap for
+   real, on the target that actually matters, in a way the Pi never
+   could validate.
 
 ## Why Pi 4B over the Arm Cortex-A55 FVP route
 
@@ -987,7 +1068,11 @@ explicitly). Kept here only for detail not repeated above:
   happened. The Pi 4B's A72 remains a different, higher-performance
   core than the real target either way (see "Not A55-representative"
   above) -- that's a permanent, accepted mismatch, not an open risk.
-- The interrupts-masked blind spot (item 5 above) has no documented
-  position yet -- still genuinely open.
+- ~~The interrupts-masked blind spot has no documented position yet~~
+  -- **resolved**: see "The interrupts-masked blind spot: a position"
+  above. Documented and deliberately not fixed on this hardware, with
+  a small, real, cheap follow-up identified (a masked-cycles counter)
+  and the actual open question (the target platform's own secure-boot access)
+  correctly placed on the real target, not this one.
 - The persistent chainloader's own baud rate needs an SD-card reflash
   to improve, deliberately deferred -- see item 6 above.
