@@ -7,7 +7,7 @@ LK workloads, developed and validated on real Raspberry Pi 4B hardware
 not for this project's hardware-validation work). See
 [docs/RPI4_BRINGUP.md](docs/RPI4_BRINGUP.md) for current status.
 
-**Scope: a PoC for the the target platform's actual perf use case.**
+**Scope: a PoC for a real target platform's actual perf use case.**
 Stack unwinding uses DWARF CFI (`.debug_frame`), not ARM's own EXIDX --
 the target platform's shipped firmware carries no EXIDX (dropped from the production
 build to save flash/RAM) but does carry DWARF CFI in its debug-symbol

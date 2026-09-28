@@ -4,7 +4,7 @@
 
 A `perf`-style statistical sampling profiler for LK running in AArch32
 SMP, for finding real hotspots and bottlenecks in bare-metal AArch32
-workloads. Currently scoped as a PoC for the the target platform's own
+workloads. Currently scoped as a PoC for a real target platform's own
 perf use case (see `README.md` and `docs/RPI4_BRINGUP.md`) -- a
 standalone tool, not something built to validate or support any other
 project.
@@ -32,7 +32,7 @@ of which environment first proved it out.
   A32/T32 execution when present — treat it as absent on the target SoC.
 - **Stack unwinding uses DWARF CFI (`.debug_frame`), not ARM's own EXIDX
   (`.ARM.exidx`/`.ARM.extab`).** Chosen deliberately, not for lack of an
-  EXIDX implementation: the the target platform's shipped firmware
+  EXIDX implementation: the target platform's shipped firmware
   carries no EXIDX (dropped from the production build to save flash/RAM)
   but does carry DWARF CFI in its debug-symbol ELF, the same mechanism
   Trace32 already uses there to unwind crash dumps -- matching that here

@@ -171,7 +171,7 @@ def main():
         print("\nPASS: matches hand-traced ground truth "
               "(leaf_func -> mid_func -> outer_func -> _start)")
 
-        # the target platform's workload is ARM/Thumb interworking code: BL/BLX sets
+        # The target platform's workload is ARM/Thumb interworking code: BL/BLX sets
         # LR with the ISA bit (bit 0) when the call target is Thumb, and
         # Thumb function symbols carry the same bit in the ELF. This
         # binary is built -marm, so none of its real addresses have that

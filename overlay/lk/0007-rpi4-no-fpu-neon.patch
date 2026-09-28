@@ -5,7 +5,7 @@ index 0000000..0000000 100644
  ARCH := arm
  ARM_CPU := cortex-a15
 +
-+# the target platform (the real PoC target) is a multi-core Cortex-A55 with no
++# The target platform (the real PoC target) is a multi-core Cortex-A55 with no
 +# FPU and no NEON -- match that here rather than validating a
 +# mechanism that assumes hardware the real target doesn't have.
 +# cortex-a15 defaults ARM_WITH_VFP/NEON on; this is upstream LK's own

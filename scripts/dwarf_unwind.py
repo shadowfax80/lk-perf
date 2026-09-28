@@ -1,8 +1,8 @@
 """
 DWARF CFI (.debug_frame) based stack unwinder, using pyelftools.
 
-Chosen over ARM's own EXIDX deliberately: this project is a PoC for the
-the target platform's actual perf use case, and the target platform's shipped
+Chosen over ARM's own EXIDX deliberately: this project is a PoC for a
+real target platform's actual perf use case, and that target platform's shipped
 firmware carries no EXIDX (dropped from the production build) but does
 carry DWARF CFI in its debug-symbol ELF -- the same mechanism Trace32
 already uses there to unwind crash dumps.
@@ -12,7 +12,7 @@ read target memory, walks the .debug_frame call-frame tables to recover
 the caller's PC/SP one level at a time, exactly like a real unwinder
 does -- no frame pointer required.
 
-the target platform's workload is ARM/Thumb interworking code (built -mthumb, with
+The target platform's workload is ARM/Thumb interworking code (built -mthumb, with
 some ARM-mode functions still mixed in), so every address that came
 from a *register* rather than straight from the instruction stream may
 carry the ARM interworking "ISA bit" (bit 0 set = callee is Thumb) --

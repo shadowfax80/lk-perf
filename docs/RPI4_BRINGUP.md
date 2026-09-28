@@ -10,8 +10,8 @@ categorically cannot: DWARF-CFI unwinding robustness, and whether real PMU
 event counters (cache misses, branch mispredicts) actually respond to
 workload behavior.
 
-**Scope: this project is a PoC for the the target platform's actual perf
-use case**, not a general-purpose ARM32 profiler. the target platform's own shipped
+**Scope: this project is a PoC for a real target platform's actual perf
+use case**, not a general-purpose ARM32 profiler. That target platform's own shipped
 firmware has no EXIDX (ARM EHABI unwind tables aren't generated for its
 production build) but does carry DWARF CFI (`.debug_frame`) in its debug
 symbol files -- the same mechanism Trace32 already uses there to unwind
@@ -309,7 +309,7 @@ Revised scope, closest analogue to `perf` noted per item:
 6. **How samples leave the device.** UART at 115200 baud is ~11 KiB/s --
    fine for a small image, a real bottleneck for the sample dumps this
    plans for (M5's richer per-sample record puts a full 4-core buffer
-   around 590 KB, ~52s to dump at that rate). the target platform's real path is
+   around 590 KB, ~52s to dump at that rate). The target platform's real path is
    more likely a Trace32/JTAG memory dump than serial, so the
    sample-buffer layout should still be a documented, self-describing
    format a host tool can read from a raw memory image -- UART is just
@@ -402,7 +402,7 @@ at all on real silicon, does DWARF CFI give more complete unwinds than
 the FP-chain walker), not A55-accurate numbers.
 
 **FPU/NEON disabled entirely (2026-09-28), matching the target platform exactly**:
-the target platform has no FPU and no SIMD/NEON unit at all, unlike the A72's own
+The target platform has no FPU and no SIMD/NEON unit at all, unlike the A72's own
 hardware. `overlay/lk/0007-rpi4-no-fpu-neon.patch` turns both off via
 `ARM_WITHOUT_VFP_NEON := true` and gates one inconsistent, unreachable
 `arm_fpu_set_enable(true)` call in shared LK code; `project/rpi4-test.mk`
@@ -517,7 +517,7 @@ specific validation environment regardless of effort spent.
 
 **Confirmed (2026-09-28): the target platform runs in Secure mode, always AArch32
 SVC.** This directly answers the question above, not just narrows it.
-the target platform's RTOS has exactly the privilege this Pi bring-up never had --
+The target platform's RTOS has exactly the privilege this Pi bring-up never had --
 Secure-state access to reconfigure `GICD_IGROUPRn` and assign the PMU's
 overflow interrupt to Group 0/FIQ, which is precisely the mechanism
 that bypasses `CPSR.I` masking. **This gap is real and permanent on
@@ -552,7 +552,7 @@ transfers as validated, not just as a hopeful analogy.
    real number, the same way `perf` itself reports lost/dropped
    samples rather than staying silent about them. Not built yet; a
    reasonable next small addition, distinct from closing the gap itself.
-4. **Real action item for the eventual the target platform port, not just a
+4. **Real action item for the eventual target-platform port, not just a
    question to check anymore**: implement FIQ-routed (or priority-based)
    PMU sampling there, using this Pi's `profiler pmustart`/`pmustop` as
    the reference for the counter-programming/overflow-handling side
@@ -1068,7 +1068,7 @@ explicitly). Kept here only for detail not repeated above:
   `PMCEID0=0x7fff0f3f`/`PMCR=0x41023001` (6 event counters) on actual
   hardware, matching a real Cortex-A72's PMU.
 - ~~Whether the target platform's real core is even Cortex-A-family~~ -- **settled**:
-  the target platform is a multi-core Cortex-A55, no FPU/NEON (see
+  The target platform is a multi-core Cortex-A55, no FPU/NEON (see
   [[project_lk_perf_no_fpu_neon]]) -- this is why that fidelity work
   happened. The Pi 4B's A72 remains a different, higher-performance
   core than the real target either way (see "Not A55-representative"
