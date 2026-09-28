@@ -65,9 +65,8 @@ work from `docs/DESIGN.md`'s Stages 1-4 has run on this hardware yet,
 only on QEMU. M5 is where the profiler itself starts running here.
 Revised scope, closest analogue to `perf` noted per item:
 
-1. **M5, redesigned (`perf record`, timer mode). In progress -- two
-   prerequisites done, the actual sample-capture code not written
-   yet.**
+1. **M5, redesigned (`perf record`, timer mode). In progress -- built
+   and verified on a build pod, not yet run on the actual Pi.**
 
    Each sample must capture more than PC/LR/FP: also SPSR (Thumb-vs-ARM
    mode and the interrupted mode), the *interrupted* thread's own real
@@ -107,11 +106,42 @@ Revised scope, closest analogue to `perf` noted per item:
      *is* the iframe pointer). Not yet wired into `profiler.c` --
      that's part of the "not done" list below.
 
-   **Not done yet:** the actual `profiler.c` sample-record change (add
-   SPSR/interrupted-SP/thread-ID/CPU fields to the per-CPU ring
-   buffers), the LK shell command to dump those buffers over UART, and
-   the host-side parser to replace the deleted `pc_histogram.py`. Pick
-   up here next.
+   **Also done (2026-09-28):**
+   - **`app/profiler` was never actually linked into the rpi4 build.**
+     Every prior hardware milestone (M1-M4) booted without it --
+     `project/rpi4-test.mk` never listed it in `MODULES`. Fixed; the
+     `profiler` shell command has never existed on this target before
+     now.
+   - **`PROFILER_TIMER_IRQ` was hardcoded to 27** (qemu-virt-arm's
+     timer vector). BCM2711 uses GIC ID 30 for the same timer (see
+     `overlay/lk/0004-bcm28xx-add-rpi4.patch`'s own redefinition of
+     `INTERRUPT_ARM_LOCAL_CNTPNSIRQ`). Without this fix sampling would
+     have silently captured zero samples forever on real hardware --
+     found by checking the actual registered vector before the first
+     hardware test, not by a failed one.
+   - `profiler.c`'s sample record now includes SPSR, the interrupted
+     SP (the `frame + 1` derivation above, now actually wired in), and
+     the interrupted thread's `thread_t*` as a de-facto TID.
+   - New `profiler dump` shell command: tagged `SAMPLE ...` text lines,
+     oldest-to-newest per core.
+   - New `scripts/pi4_pc_histogram.py`: parses `dump` output, symbolizes
+     via `dwarf_unwind.py`, prints a per-function histogram, optionally
+     writes a FlameGraph-compatible folded file. Tested offline against
+     the `nested.c` fixture with a synthetic log.
+
+   All of the above verified via a real `setup.sh` + `make rpi4-test`
+   build on a RunPod CPU pod, including a full disassembly confirming
+   the vector check, the SP/SPSR captures, and the thread-pointer read
+   (via `TPIDRPRW`) all compile to exactly what was intended, and a
+   full VFP/NEON re-scan (still zero instructions).
+
+   **Not done yet:** nothing has run on the actual Pi -- this pass was
+   build-only. Next real step is an actual hardware test: `profiler
+   start`, a workload (`bench`/`nest`/`smp`), `stop`, `dump`, capture
+   the log, run it through `pi4_pc_histogram.py`. After that: full
+   multi-frame unwinding still needs a stack-memory capture this
+   doesn't add yet (registers only) -- see `profiler.c`'s header
+   comment.
 2. **Unwinder correctness for real `-mthumb` code.** The two fixes
    above, done. Still to do: a real `-mthumb`-compiled regression case
    (not just hand-written .S), and, if the target platform is built with
