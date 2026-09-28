@@ -26,11 +26,14 @@ in the ELF) before ever using an address as an FDE/PC lookup key --
 see `strip_isa_bit()` and the regression case in
 `scripts/test_dwarf_unwind.py`. DWARF CFI decoding itself doesn't care
 about instruction set (GCC emits correct `.debug_frame` rules either
-way); only address bookkeeping needed the fix. Still open: the LK-side
-profiler's own capture hook (patches `0001`-`0003`) and the eventual
-serial-dump sample format haven't been audited for the same bit yet --
-do that as part of M5, since a captured LR read straight off a Thumb
-call site will carry it too.
+way); only address bookkeeping needed the fix. **Resolved as part of
+M5**: the capture hook and dump format don't need their own ISA-bit
+handling -- the raw `lr`/`pc` fields are dumped unmasked, and
+`dwarf_unwind.py`'s `strip_isa_bit()` already strips the bit wherever
+it's used as a lookup key, which is the only place it matters. The
+`profiler_arm_mode_func` edge case (see the M5 edge-case validation
+section below) confirmed this end to end with a real captured sample
+from genuine ARM-mode code.
 
 Two more real bugs in `scripts/dwarf_unwind.py` were found and fixed
 while reasoning through what Thumb code actually needs from the
@@ -972,12 +975,19 @@ explicitly). Kept here only for detail not repeated above:
   `lib/fdt` parsing M4 added -- don't assume either way from a
   datasheet.
 
-## Open risks not yet resolved
+## Open risks
 
-- Whether BCM2711's exact PMU implementation (event set, counter count)
-  differs meaningfully from what's assumed -- check `PMCEID0`/`PMCEID1`
-  as part of `profiler stat`, don't assume.
-- Whether the target platform's real core is even Cortex-A-family (vs. Cortex-R,
-  ARMv7-R) -- changes PMU version and MMU assumptions, and would make
-  the Pi 4B's A72 a further step removed from the real target than
-  currently assumed.
+- ~~Whether BCM2711's exact PMU implementation differs from what's
+  assumed~~ -- **resolved**: `profiler stat` read real
+  `PMCEID0=0x7fff0f3f`/`PMCR=0x41023001` (6 event counters) on actual
+  hardware, matching a real Cortex-A72's PMU.
+- ~~Whether the target platform's real core is even Cortex-A-family~~ -- **settled**:
+  the target platform is a multi-core Cortex-A55, no FPU/NEON (see
+  [[project_lk_perf_no_fpu_neon]]) -- this is why that fidelity work
+  happened. The Pi 4B's A72 remains a different, higher-performance
+  core than the real target either way (see "Not A55-representative"
+  above) -- that's a permanent, accepted mismatch, not an open risk.
+- The interrupts-masked blind spot (item 5 above) has no documented
+  position yet -- still genuinely open.
+- The persistent chainloader's own baud rate needs an SD-card reflash
+  to improve, deliberately deferred -- see item 6 above.
