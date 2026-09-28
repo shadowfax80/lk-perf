@@ -12,10 +12,16 @@ TARGET := rpi4
 # project's real PoC target) has no FPU/NEON hardware at all -- keep
 # it that way here too rather than validating a math path that would
 # never be exercisable on the real target.
+# app/profiler was missing from this list entirely until M5 -- the
+# profiler module has never actually been linked into any rpi4 build
+# before now, despite M1-M4's hardware work; nothing here failed
+# loudly because nothing depended on the profiler shell command
+# existing, it just silently wasn't there.
 MODULES += \
 	app/shell \
 	app/love \
 	app/stringtests \
+	app/profiler \
 	lib/cksum \
 	lib/debugcommands \
 

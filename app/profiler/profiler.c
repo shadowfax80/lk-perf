@@ -57,6 +57,34 @@
  * boot log: "Generic timer register irq 27 on cpu 0" repeated per core),
  * so it adds no timer-programming code and cannot double-program
  * hardware timer registers already owned by kernel/timer.c.
+ *
+ * M5 (real Pi 4B hardware): three more fields per sample -- SPSR (full
+ * register, not just the Thumb bit already extracted below: the host
+ * needs it to know the interrupted mode, and to correctly mask the ARM
+ * interworking ISA bit the way scripts/dwarf_unwind.py's
+ * strip_isa_bit() already does for other addresses), the interrupted
+ * thread's own SP, and its thread_t* as a de-facto thread ID (LK has
+ * no small numeric TID, just a pointer and a name[32]).
+ *
+ * The interrupted SP needs no new assembly capture, unlike FP: LK's
+ * standard IRQ entry (arch/arm/arm/exceptions.S's `save` macro)
+ * captures `frame->usp`/`ulr` via `stmia sp,{r13,r14}^`, but that
+ * instruction only captures the USR-mode banked SP/LR -- this
+ * project's LK threads never switch to USR/SYS mode at all
+ * (arch/arm/arm/thread.c's arch_context_switch does a raw cooperative
+ * stack-pointer swap, no CPSR mode field anywhere), so usp/ulr are
+ * dead registers here, not the real interrupted SP. The real one is
+ * exactly `frame + 1`: one past the end of the `struct arm_iframe`
+ * that `save` already pushes, confirmed by hand-tracing the exact
+ * push/align sequence in exceptions.S (see docs/RPI4_BRINGUP.md).
+ *
+ * This is registers only, not stack memory -- offline DWARF-CFI
+ * unwinding needs the actual stack bytes at sample time to walk past
+ * the first frame (dwarf_unwind.py's read_memory callback), which
+ * isn't captured yet. Until that exists (or on-target unwinding
+ * replaces the need for it), `scripts/pi4_pc_histogram.py` only
+ * produces a single-frame (leaf-function) view, same as Stage 1 of
+ * the original QEMU-era design.
  */
 
 #include <arch/arch_ops.h>
@@ -79,7 +107,20 @@
 // (10ms / 100Hz at the time of writing) -- fine for proving the pipeline;
 // an independent, configurable-rate timer is a later refinement, not a
 // Stage 1 requirement.
+//
+// M5: BCM2711 (Pi 4B) uses a different vector for the exact same timer
+// -- GIC ID 30, not 27 -- per overlay/lk/0004-bcm28xx-add-rpi4.patch's
+// own redefinition of INTERRUPT_ARM_LOCAL_CNTPNSIRQ (which
+// platform_early_init() actually registers the tick against). Without
+// this, profiler_on_tick()'s vector check would never match on real
+// hardware and the profiler would silently capture zero samples --
+// found by checking the actual registered vector before the first
+// real hardware test, not by a failed test.
+#if BCM2711
+#define PROFILER_TIMER_IRQ 30
+#else
 #define PROFILER_TIMER_IRQ 27
+#endif
 
 #define PROFILER_BUF_SIZE 4096
 
@@ -106,6 +147,11 @@ extern uint32_t profiler_fp_r11[SMP_MAX_CPUS];
 uint32_t profiler_pc_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
 uint32_t profiler_lr_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
 uint32_t profiler_fp_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
+// M5: the interrupted thread's real SP (frame + 1, see the file-level
+// comment above) and full SPSR, plus its thread_t* as a de-facto TID.
+uint32_t profiler_sp_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
+uint32_t profiler_spsr_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
+uint32_t profiler_tid_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
 uint64_t profiler_ts_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
 volatile uint32_t profiler_head[SMP_MAX_CPUS];
 volatile uint32_t profiler_total[SMP_MAX_CPUS];
@@ -130,6 +176,12 @@ void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
     profiler_pc_buf[cpu][idx] = frame->pc;
     profiler_lr_buf[cpu][idx] = frame->lr;
     profiler_fp_buf[cpu][idx] = thumb ? profiler_fp_r7[cpu] : profiler_fp_r11[cpu];
+    // frame + 1: one past the end of the pushed struct arm_iframe --
+    // the interrupted thread's own real SP, not frame->usp (that's the
+    // USR-mode bank, dead here; see the file-level comment above).
+    profiler_sp_buf[cpu][idx] = (uint32_t)(frame + 1);
+    profiler_spsr_buf[cpu][idx] = frame->spsr;
+    profiler_tid_buf[cpu][idx] = (uint32_t)(uintptr_t)get_current_thread();
     profiler_ts_buf[cpu][idx] = current_time_hires();
     profiler_head[cpu] = (idx + 1) % PROFILER_BUF_SIZE;
     profiler_total[cpu]++;
@@ -188,7 +240,7 @@ static int profiler_smp_worker(void *arg) {
 
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
-        printf("usage: profiler <start|stop|status|clear|bench|nest|smp|pmu|fpcheck>\n");
+        printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|pmu|fpcheck>\n");
         return -1;
     }
 
@@ -210,8 +262,34 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         memset(profiler_pc_buf, 0, sizeof(profiler_pc_buf));
         memset(profiler_lr_buf, 0, sizeof(profiler_lr_buf));
         memset(profiler_fp_buf, 0, sizeof(profiler_fp_buf));
+        memset(profiler_sp_buf, 0, sizeof(profiler_sp_buf));
+        memset(profiler_spsr_buf, 0, sizeof(profiler_spsr_buf));
+        memset(profiler_tid_buf, 0, sizeof(profiler_tid_buf));
         memset(profiler_ts_buf, 0, sizeof(profiler_ts_buf));
         printf("profiler: buffer cleared\n");
+    } else if (!strcmp(sub, "dump")) {
+        // M5: text dump, one tagged line per sample, oldest-to-newest
+        // per core -- simple and robust over the console's existing
+        // printf path rather than a new binary protocol, and cheap
+        // enough at the calibrated 3,000,000 baud (see
+        // docs/RPI4_BRINGUP.md). scripts/pi4_pc_histogram.py parses
+        // the "SAMPLE " lines out of a captured log.
+        for (int c = 0; c < SMP_MAX_CPUS; c++) {
+            uint32_t count = profiler_total[c] < PROFILER_BUF_SIZE ?
+                             profiler_total[c] : PROFILER_BUF_SIZE;
+            uint32_t start = profiler_total[c] < PROFILER_BUF_SIZE ?
+                             0 : profiler_head[c];
+            for (uint32_t n = 0; n < count; n++) {
+                uint32_t idx = (start + n) % PROFILER_BUF_SIZE;
+                printf("SAMPLE cpu=%d pc=%08x lr=%08x fp=%08x sp=%08x "
+                       "spsr=%08x tid=%08x ts=%016llx\n",
+                       c, profiler_pc_buf[c][idx], profiler_lr_buf[c][idx],
+                       profiler_fp_buf[c][idx], profiler_sp_buf[c][idx],
+                       profiler_spsr_buf[c][idx], profiler_tid_buf[c][idx],
+                       (unsigned long long)profiler_ts_buf[c][idx]);
+            }
+        }
+        printf("SAMPLE done\n");
     } else if (!strcmp(sub, "bench")) {
         uint32_t iters = argc >= 3 ? (uint32_t)argv[2].u : 20000000;
         printf("profiler: running synthetic workload (%u iters/function) ...\n", iters);
