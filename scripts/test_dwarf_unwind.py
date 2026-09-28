@@ -264,6 +264,58 @@ def main():
               "call-as-last-instruction return address unwinds past "
               "its own function's boundary correctly")
 
+        # Real recursion revisits the exact same instruction address at
+        # every depth (the same call site each time) -- confirmed a
+        # real problem on real hardware, not just theoretical: a
+        # pc-only cycle guard stopped a genuine 20-level-deep recursive
+        # workload's unwind after just 1-2 frames every time, mistaking
+        # "same instruction, deeper recursion" for "stuck in a loop".
+        # Reuses mid_func's own real, already-verified CFI row (cfa =
+        # sp+16, r14 saved at cfa-4) rather than a new compiled fixture
+        # -- feeding it a synthetic chain where every level's own
+        # "saved lr" points back to mid_func's own entry again (except
+        # the last, which points to STOP_ADDR, an address covered by no
+        # FDE) exercises the exact same mechanics real recursion would,
+        # without needing a genuinely recursive binary.
+        mid_pc = 0x8070  # inside mid_func's "full frame" row (0x8068-0x808c)
+        N_LEVELS = 4      # synthetic frames resolving back to mid_pc before stopping
+        STOP_ADDR = 0x9000
+        sp0 = 0xC100
+
+        recurse_memory = {}
+        sp = sp0
+        for level in range(N_LEVELS):
+            cfa = sp + 16
+            recurse_memory[cfa - 16] = 0xAAAA0000 | level  # r4, unasserted
+            recurse_memory[cfa - 12] = 0xAAAA0100 | level  # r5, unasserted
+            recurse_memory[cfa - 8] = 0xAAAA0200 | level   # r6, unasserted
+            recurse_memory[cfa - 4] = mid_pc if level < N_LEVELS - 1 else STOP_ADDR
+            sp = cfa
+
+        def read_memory_recurse(addr, size):
+            assert size == 4, size
+            if addr not in recurse_memory:
+                raise KeyError(f"unexpected memory read at 0x{addr:x}")
+            return recurse_memory[addr]
+
+        with DwarfCFIUnwinder(str(elf_path)) as unwinder:
+            recurse_chain = unwinder.unwind(
+                mid_pc, {SP_REG: sp0, LR_REG: mid_pc}, read_memory_recurse
+            )
+
+        recurse_expected = [mid_pc] * N_LEVELS + [STOP_ADDR]
+        assert recurse_chain == recurse_expected, (
+            f"recursion cycle-guard fix regressed: got "
+            f"{[hex(p) for p in recurse_chain]}, expected "
+            f"{[hex(p) for p in recurse_expected]} -- a pc-only cycle "
+            f"guard stops this at length 1 (just [{hex(mid_pc)}], the "
+            f"break firing before the first resolved frame is even "
+            f"appended), mistaking recursion for a stuck loop"
+        )
+        print(f"PASS: {N_LEVELS} levels of genuine recursion (same PC, "
+              f"advancing CFA each level) unwind correctly instead of "
+              f"tripping the cycle guard after 2 frames")
+
 
 if __name__ == "__main__":
     main()

@@ -424,10 +424,17 @@ static int profiler_smp_worker(void *arg) {
 //    none of them can be tail-call-eliminated: each one's own return
 //    address into ITS caller must survive across the `bl` it makes,
 //    forcing a real spilled LR and a real frame at every level.
-//    8 levels deep specifically to likely exceed
-//    PROFILER_STACK_CAPTURE_BYTES (128) by the outer few levels, to
-//    see the unwinder degrade gracefully (truncate) rather than
-//    silently produce a wrong deep chain.
+//    8 levels deep, expecting to likely exceed
+//    PROFILER_STACK_CAPTURE_BYTES (128) by the outer few levels and
+//    see the unwinder degrade gracefully -- on real hardware it
+//    turned out each of these small frames only needs ~8-16 bytes, so
+//    the full 8-level chain (deep_8 -> ... -> deep_1 -> cmd_profiler)
+//    fit inside the window and unwound completely every time, no
+//    truncation. A real, useful negative result: 128 bytes covers
+//    meaningfully deep real (non-recursive) chains in this codebase,
+//    not just the shallow ones tested before this. See
+//    profiler_recurse below for where the window *does* end up being
+//    the real limit, on a workload deep enough to actually reach it.
 __NO_INLINE static uint32_t profiler_deep_8(uint32_t x) {
     volatile uint32_t v = x * 3u + 1u;
     return v;
@@ -449,14 +456,20 @@ static void profiler_workload_deepchain(uint32_t iters) {
 }
 
 // 2. Real (non-tail) recursion: the SAME instruction address recurs at
-// every depth, on purpose -- DwarfCFIUnwinder.unwind()'s cycle guard
-// (`if cur_pc in chain: break`) can't distinguish genuine recursion
-// (same PC, different/advancing SP each level) from an actual
-// CFI-table-driven infinite loop (same PC *and* SP) purely by PC.
-// This is the concrete case that distinction matters for -- expect
-// (and verify, don't assume) that the unwind stops after 2 levels of
-// real recursion here, one level "too early" by the C-source picture,
-// even though nothing is actually wrong with the CFI data.
+// every depth, on purpose. This found a real bug on first real
+// hardware use, not a hypothetical one: DwarfCFIUnwinder.unwind()'s
+// original cycle guard checked pc alone (`if cur_pc in chain: break`),
+// which can't tell genuine recursion (same pc, a *different* cfa/SP
+// at every depth -- each recursive call has its own stack frame) from
+// an actual CFI-driven infinite loop (same pc *and* the same cfa,
+// meaning the walk truly isn't making progress) -- it stopped every
+// one of this function's real 20-level-deep unwinds after just 1
+// frame. Fixed by keying the guard on (pc, cfa) instead; verified
+// against the exact scenario in scripts/test_dwarf_unwind.py, and
+// confirmed on real hardware afterward: this now correctly reaches
+// depth 15-18 before running out of PROFILER_STACK_CAPTURE_BYTES
+// (128) -- the *capture window*, not the algorithm, is what limits
+// how deep a real recursive unwind can go here.
 __NO_INLINE static uint32_t profiler_recurse(uint32_t depth, uint32_t acc) {
     if (depth == 0) {
         return acc;

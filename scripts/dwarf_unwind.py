@@ -157,6 +157,17 @@ class DwarfCFIUnwinder:
         cur_pc = strip_isa_bit(pc)
         chain = [cur_pc]
         regs = dict(registers)
+        # Cycle guard keys on (pc, cfa), not pc alone -- confirmed a
+        # real problem on real hardware, not just theoretical: genuine
+        # recursion revisits the exact same instruction address at
+        # every depth (the same `bl` call site each time), which a
+        # pc-only guard can't tell apart from an actual CFI-driven
+        # infinite loop. cfa (the resolved frame's own base, becoming
+        # the next frame's SP) is different at every real recursion
+        # depth -- each level occupies distinct stack memory -- so
+        # (pc, cfa) only repeats when the walk has truly stopped making
+        # progress, which is the only time stopping is actually right.
+        seen_frames = {(cur_pc, registers.get(SP_REG))}
         # Only the initial, actually-executing PC is looked up as-is.
         # Every PC after that came from an LR value, which points to
         # the instruction *after* a call -- looking that address up
@@ -211,8 +222,10 @@ class DwarfCFIUnwinder:
             cur_pc = new_pc
             is_return_address = True
 
-            if cur_pc in chain:
-                break  # cycle guard
+            frame_key = (cur_pc, cfa)
+            if frame_key in seen_frames:
+                break  # genuine cycle: same pc *and* same cfa -- no progress
+            seen_frames.add(frame_key)
             chain.append(cur_pc)
 
         return chain
