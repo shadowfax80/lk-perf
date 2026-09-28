@@ -78,13 +78,18 @@
  * that `save` already pushes, confirmed by hand-tracing the exact
  * push/align sequence in exceptions.S (see docs/RPI4_BRINGUP.md).
  *
- * This is registers only, not stack memory -- offline DWARF-CFI
- * unwinding needs the actual stack bytes at sample time to walk past
- * the first frame (dwarf_unwind.py's read_memory callback), which
- * isn't captured yet. Until that exists (or on-target unwinding
- * replaces the need for it), `scripts/pi4_pc_histogram.py` only
- * produces a single-frame (leaf-function) view, same as Stage 1 of
- * the original QEMU-era design.
+ * Each sample also captures PROFILER_STACK_CAPTURE_BYTES of raw stack
+ * memory starting at that same SP -- offline DWARF-CFI unwinding needs
+ * the actual stack bytes at sample time to walk past the first frame
+ * (dwarf_unwind.py's read_memory callback), and a live target can't
+ * preserve them until the host reads them later, so they're captured
+ * into the ring buffer right alongside the registers. 128 bytes is
+ * enough for several frames of this project's own small ARM32 call
+ * chains, not whole thread stacks -- see PROFILER_STACK_CAPTURE_BYTES's
+ * own comment for the sizing rationale. `scripts/pi4_pc_histogram.py`
+ * feeds this to DwarfCFIUnwinder for a real multi-frame view instead
+ * of the single-frame (leaf-function) one Stage 1 of the original
+ * QEMU-era design was limited to.
  */
 
 #include <arch/arch_ops.h>
@@ -124,6 +129,18 @@
 
 #define PROFILER_BUF_SIZE 4096
 
+// M5: bytes of stack memory captured per sample, starting at the
+// interrupted SP (see the file-level comment's `frame + 1` derivation).
+// DWARF-CFI unwinding needs to read a handful of words per frame (the
+// callee-saved registers a frame actually spilled) above the CFA --
+// 128 bytes covers several frames of typical small ARM32 call chains
+// (this project's own workload_outer->mid->inner is 3 levels deep with
+// small frames) without capturing whole thread stacks. Per-CPU,
+// per-sample: 4 * PROFILER_BUF_SIZE * 128 = 2MB total, comfortably
+// inside this board's real (DTB-derived, M4) memory, and a full-buffer
+// dump at the calibrated 3,000,000 baud stays well under a minute.
+#define PROFILER_STACK_CAPTURE_BYTES 128
+
 // SPSR T-bit (Thumb state) -- CPSR/SPSR bit 5, per the ARM architecture
 // reference manual. Picks which of profiler_fp_r7/profiler_fp_r11 was the
 // interrupted code's actual frame-pointer register.
@@ -152,6 +169,14 @@ uint32_t profiler_fp_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
 uint32_t profiler_sp_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
 uint32_t profiler_spsr_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
 uint32_t profiler_tid_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
+// M5: raw stack bytes starting at profiler_sp_buf[cpu][idx], for
+// offline DWARF-CFI unwinding's read_memory callback. No bounds check
+// against the thread's actual stack top -- thread stacks in this
+// project are always allocated well over PROFILER_STACK_CAPTURE_BYTES
+// (4096B minimum, see app/profiler.c's own thread_create calls), and a
+// sample landing within 128 bytes of a real overflow is already a
+// separate, worse problem than this capture.
+uint8_t profiler_stack_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE][PROFILER_STACK_CAPTURE_BYTES];
 uint64_t profiler_ts_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
 volatile uint32_t profiler_head[SMP_MAX_CPUS];
 volatile uint32_t profiler_total[SMP_MAX_CPUS];
@@ -182,6 +207,8 @@ void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
     profiler_sp_buf[cpu][idx] = (uint32_t)(frame + 1);
     profiler_spsr_buf[cpu][idx] = frame->spsr;
     profiler_tid_buf[cpu][idx] = (uint32_t)(uintptr_t)get_current_thread();
+    memcpy(profiler_stack_buf[cpu][idx], (const void *)(frame + 1),
+           PROFILER_STACK_CAPTURE_BYTES);
     profiler_ts_buf[cpu][idx] = current_time_hires();
     profiler_head[cpu] = (idx + 1) % PROFILER_BUF_SIZE;
     profiler_total[cpu]++;
@@ -265,6 +292,7 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         memset(profiler_sp_buf, 0, sizeof(profiler_sp_buf));
         memset(profiler_spsr_buf, 0, sizeof(profiler_spsr_buf));
         memset(profiler_tid_buf, 0, sizeof(profiler_tid_buf));
+        memset(profiler_stack_buf, 0, sizeof(profiler_stack_buf));
         memset(profiler_ts_buf, 0, sizeof(profiler_ts_buf));
         printf("profiler: buffer cleared\n");
     } else if (!strcmp(sub, "dump")) {
@@ -273,7 +301,11 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         // printf path rather than a new binary protocol, and cheap
         // enough at the calibrated 3,000,000 baud (see
         // docs/RPI4_BRINGUP.md). scripts/pi4_pc_histogram.py parses
-        // the "SAMPLE " lines out of a captured log.
+        // the "SAMPLE " lines out of a captured log; the trailing
+        // `stack=<hex>` field is PROFILER_STACK_CAPTURE_BYTES raw
+        // bytes starting at `sp`, which the host feeds to
+        // dwarf_unwind.py's read_memory callback for real multi-frame
+        // unwinding instead of the leaf-only view earlier M5 work had.
         for (int c = 0; c < SMP_MAX_CPUS; c++) {
             uint32_t count = profiler_total[c] < PROFILER_BUF_SIZE ?
                              profiler_total[c] : PROFILER_BUF_SIZE;
@@ -282,11 +314,15 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
             for (uint32_t n = 0; n < count; n++) {
                 uint32_t idx = (start + n) % PROFILER_BUF_SIZE;
                 printf("SAMPLE cpu=%d pc=%08x lr=%08x fp=%08x sp=%08x "
-                       "spsr=%08x tid=%08x ts=%016llx\n",
+                       "spsr=%08x tid=%08x ts=%016llx stack=",
                        c, profiler_pc_buf[c][idx], profiler_lr_buf[c][idx],
                        profiler_fp_buf[c][idx], profiler_sp_buf[c][idx],
                        profiler_spsr_buf[c][idx], profiler_tid_buf[c][idx],
                        (unsigned long long)profiler_ts_buf[c][idx]);
+                for (int b = 0; b < PROFILER_STACK_CAPTURE_BYTES; b++) {
+                    printf("%02x", profiler_stack_buf[c][idx][b]);
+                }
+                printf("\n");
             }
         }
         printf("SAMPLE done\n");
