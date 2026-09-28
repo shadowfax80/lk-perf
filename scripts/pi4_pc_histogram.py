@@ -203,7 +203,8 @@ def main() -> None:
             names = symbolize(args.elf, chain)
             # root-to-leaf for FlameGraph, chain itself is leaf-to-root
             folded_counts[";".join(reversed(names))] += 1
-        with open(args.folded, "w") as f:
+        # flamegraph.pl rejects every line ending in "\r\n"; text mode on Windows writes that
+        with open(args.folded, "w", newline="\n") as f:
             for stack, count in folded_counts.items():
                 f.write(f"{stack} {count}\n")
         print(f"\nwrote {args.folded} -- render with: "
