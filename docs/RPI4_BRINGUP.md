@@ -135,13 +135,34 @@ Revised scope, closest analogue to `perf` noted per item:
    (via `TPIDRPRW`) all compile to exactly what was intended, and a
    full VFP/NEON re-scan (still zero instructions).
 
-   **Not done yet:** nothing has run on the actual Pi -- this pass was
-   build-only. Next real step is an actual hardware test: `profiler
-   start`, a workload (`bench`/`nest`/`smp`), `stop`, `dump`, capture
-   the log, run it through `pi4_pc_histogram.py`. After that: full
-   multi-frame unwinding still needs a stack-memory capture this
-   doesn't add yet (registers only) -- see `profiler.c`'s header
-   comment.
+   **Run for real on the Pi 4B (2026-09-28) -- timer-tick sampling
+   confirmed working end to end, single-core and SMP:**
+   - New `scripts/pi4_run.py`: loads an image, then runs a scripted
+     command sequence over serial (waits for output to go idle between
+     commands rather than assuming any particular shell-prompt shape),
+     capturing everything -- the actual driver for this test and for
+     any future one.
+   - `profiler start` -> `profiler bench 5000000` -> `stop` -> `dump`:
+     13 real samples, all correctly landing in `profiler_workload_a`/
+     `profiler_workload_b` (7/6 split) once run through
+     `pi4_pc_histogram.py` -- the exact two functions `bench` runs.
+     Boot log confirms the IRQ fix: `Generic timer register irq 30 on
+     cpu 0`, `profiler: sampling started (irq 30, ...)`.
+   - `profiler smp 8000000`: 8 samples, exactly 2 per core across all 4
+     cores, each with a genuinely distinct SP and thread pointer (no
+     cross-core aliasing) -- symbolized 8/8 to
+     `profiler_workload_inner`, the one function all 4 worker threads
+     actually run. `fp=0` and `lr=0x9e3779b9` (a literal data constant
+     from that function's own loop body, not a return address) on
+     these samples -- expected, not a new bug: this is the same
+     GCC-reuses-lr/omits-fp-under-optimization limitation the original
+     QEMU-era Stage 2/3 work already documented, and exactly why DWARF
+     CFI (not the FP chain) is the real long-term unwinding mechanism.
+
+   **Not done yet:** full multi-frame unwinding still needs a
+   stack-memory capture this doesn't add (registers only) -- see
+   `profiler.c`'s header comment. `dwarf_unwind.py` is ready for it
+   once that capture exists.
 2. **Unwinder correctness for real `-mthumb` code.** The two fixes
    above, done. Still to do: a real `-mthumb`-compiled regression case
    (not just hand-written .S), and, if the target platform is built with
