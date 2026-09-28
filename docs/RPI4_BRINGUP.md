@@ -736,6 +736,85 @@ deferred as should-fix, not must:
   warning, the good one still unwinds fully to depth 3, and the script
   exits 0 either way.
 
+## Outstanding work, by priority (2026-09-28)
+
+Everything below was surfaced by the code review and is tracked but
+not yet done, ordered by actual priority -- not the order it was
+found in. This supersedes "Next steps, in order" further down (already
+superseded once, by the "close to Linux perf" section above); kept
+here as the current, single backlog rather than three overlapping
+lists. Judgment call behind the ordering: does skipping an item mean
+an existing report can be *wrong or silently incomplete*, or just less
+capable/convenient. Only the first tier clears that bar.
+
+**Should-fix -- Phase 2's remainder (not must, but real bugs):**
+- **No CFI fallback for assembly with no unwind data (finding #13).**
+  None of LK's hand-written `.S` (memcpy/memset/bcopy/bzero, context
+  switch, spinlocks) carries `.debug_frame` rows, so time spent there
+  shows as a disconnected single frame with no caller -- that
+  caller's own time is undercounted. Fix: fall back to the raw LR as
+  the caller's PC when `_find_fde` finds nothing, instead of stopping.
+- **Old and new capture runs mix in one log (finding #6).** `--log`
+  opens in append mode and `pi4_pc_histogram.py` counts every `SAMPLE`
+  line in the file with no way to tell one run from another. Fix: a
+  run-id (boot timestamp or counter) on each `SAMPLE` line;
+  `pi4_pc_histogram.py` filters to the latest by default.
+- **`profiler stat` counts its own `printf` calls (finding #10).** The
+  counters start before two UART prints and stop after reading them,
+  so `stat`'s own console output is folded into the measured cycles.
+  Fix: print all setup output, *then* start counting.
+- **No labelling on shared counters/buffers (finding #11).** `stat`
+  silently reprograms counter 0 out from under an active `pmustart`
+  session, and timer/PMU samples share one buffer with no field
+  saying which mode produced which sample. Fix: tag each sample with
+  mode + event id; make `stat` refuse to run over an active
+  `pmustart`.
+- **`setup.sh` isn't idempotent (finding #14).** A second run on the
+  same `build/lk` fails on a file patch 0004 leaves behind
+  (`gic.h`) that a scoped `git reset --hard` doesn't clean up. Fix:
+  `git clean -fd` scoped to that one path before the reset.
+
+**Capability expansion -- Phase 3 (not fixes, real new capability):**
+1. All-core cycle sampling as the *default* mode, not just something
+   `pmustart` happens to now do on every core as a side effect of the
+   Phase 1 fix -- tag each sample by CPU as the standard path, the
+   real analogue of `perf record -a`.
+2. A self-describing dump format (build-id, per-CPU sample counts,
+   run-id header/footer) -- needed both for host-side integrity
+   checking and for the eventual target's Trace32 memory-dump
+   extraction path.
+3. A real `profiler stat`: any command (not just the built-in loop),
+   all 6 counters at once, derived IPC.
+4. Cap or redesign stack capture: bound the 128-byte copy to each
+   thread's actual stack instead of a fixed guess, or build the
+   on-target unwinder `docs/DESIGN.md` originally proposed so only
+   return addresses ever leave the device.
+
+**Deferred by design -- Phase 4 (target-specific, premature now):**
+- Finalize the buffer-format/memory-budget tradeoff from Phase 3
+  against the real target's RAM constraints, once they're known.
+- FIQ-routed PMU sampling on the target itself -- new code, not
+  portable from the Pi (it can't exercise Secure state at all).
+- Re-verify `test_dwarf_unwind.py`'s hardcoded GCC-10.3 addresses
+  against whatever toolchain actually builds for the target.
+
+**Lower priority, fold into whichever commit next touches the same
+file rather than doing as standalone work:**
+- Stale docs/help text: README's leftover "M5 not yet implemented"
+  claim, `CLAUDE.md`'s "Current task" section, the `pmu` command's
+  own message, and the dangling `[[project_lk_perf_no_fpu_neon]]`
+  memory-link reference at this file's own line ~1072 (open-risks
+  section).
+- `resolve_lines()` can return no line for the very start of a
+  function when two `.debug_line` entries share an address.
+- `docs/DESIGN.md` claims per-core state sits on separate cache
+  lines; `profiler_head`/`profiler_total` and the r7/r11 arrays
+  actually share lines across cores.
+- `profiler dump` prints each stack byte with its own `printf` call
+  and has no per-line checksum.
+- The PMU interrupt handler assumes counter 0 is still the selected
+  counter, rather than checking.
+
 ## Why Pi 4B over the Arm Cortex-A55 FVP route
 
 The FVP was investigated first and set aside for concrete, confirmed
