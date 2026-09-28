@@ -201,13 +201,34 @@ Revised scope, closest analogue to `perf` noted per item:
    armclang/armcc rather than GCC, confirm that toolchain's `.debug_frame`
    output matches the same assumptions -- CFI encoding details can
    differ between compilers.
-3. **`profiler stat` (`perf stat`, counting mode).** Cheapest real PMU
-   capability and arguably the most useful one for optimization work:
-   IPC, cache misses, branch mispredicts for a region, before/after a
-   change. Supersedes the old "PMU event validation" step -- make it a
-   real command, not a one-off check. Also: confirm on this hardware
-   whether BCM2711's PMU interrupt is a per-core SPI or a shared PPI,
-   the M4-style DTB `arm-pmu` node parsing needs to know which.
+3. **`profiler stat` (`perf stat`, counting mode). Done and confirmed
+   working on real hardware (2026-09-28, commits `0dc3437`/`df94539`).**
+   Reads PMCEID0/PMCEID1, configures event counter 0 for
+   `L1D_CACHE_REFILL` (event `0x03`), enables it alongside the cycle
+   counter, runs a workload, reports cycles / iters-per-cycle /
+   cache-refills-per-iter. Printed a message before each new
+   coprocessor access on purpose, so a fault would show exactly where
+   in the UART log -- turned out not to matter: **no fault anywhere.**
+
+   This resolves a real open question, not just adds a feature: the
+   QEMU target's own `pmu` command had confirmed PMU coprocessor access
+   *faults* there (no secure-monitor boot stage to clear the NSACR
+   trap) -- untested until now whether real Pi 4B firmware clears that
+   trap the way real secure-world boot normally does. It does. Real
+   output on hardware: `PMCEID0=0x7fff0f3f` (most architectural events
+   implemented), `PMCR=0x41023001` (6 programmable event counters,
+   matches a real Cortex-A72's PMU), `5000000 iters, 10098142 cycles,
+   12 L1D_CACHE_REFILL` for the simple arithmetic-loop workload (~2
+   cycles/iter, near-zero cache misses -- both exactly what a
+   register-resident loop touching one `volatile` variable should
+   produce). `app/profiler/profiler.c`'s `pmu` command message updated
+   to stop implying this is still an open question on real hardware --
+   only the PMU *interrupt* path (event-overflow sampling, step 4
+   below) remains unverified here.
+
+   Still open: confirm on this hardware whether BCM2711's PMU
+   interrupt is a per-core SPI or a shared PPI -- the M4-style DTB
+   `arm-pmu` node parsing needs to know which, for step 4.
 4. **`profiler report`/`annotate` (symbols + source lines +
    instruction-level hotspots).** Nearest-symbol lookup exists; add
    `.debug_line` for source-line attribution, and use the ELF's
