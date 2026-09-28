@@ -461,32 +461,39 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         printf("stat: done\n");
     } else if (!strcmp(sub, "pmu")) {
         // Stage 5 (PMU-overflow-triggered sampling) is real-hardware-only
-        // on this project -- confirmed two independent ways, not assumed:
+        // on this project -- confirmed two independent ways on the
+        // QEMU target, not assumed:
         //
-        // 1. No PMU interrupt route exists to arm at all. Dumping this
-        //    exact QEMU invocation's own generated device tree
+        // 1. No PMU interrupt route exists to arm at all there. Dumping
+        //    that exact QEMU invocation's own generated device tree
         //    (`qemu-system-arm -machine virt -cpu cortex-a15 -machine
         //    dumpdtb=...`) shows the `pmu {};` node present but empty --
         //    no `compatible`, no `interrupts` property.
-        // 2. PMU coprocessor register access itself is unsafe here, not
-        //    just the interrupt path: even the single already-public,
-        //    already-proven LK accessor arch_cycle_count()
+        // 2. PMU coprocessor register access itself was unsafe there,
+        //    not just the interrupt path: even the single already-
+        //    public, already-proven LK accessor arch_cycle_count()
         //    (arch/arm/include/arch/arch_ops.h, `mrc p15,0,%0,c9,c13,0`
         //    = PMCCNTR, used throughout bolt-aarch32's bolt_bench)
-        //    reliably faults with "undefined abort" the moment it
-        //    executes on this bare-metal image -- verified directly,
-        //    not inferred. Real hardware/firmware normally clears the
-        //    NSACR PMU-access trap during secure-world boot before
-        //    handing off to the kernel; this minimal image has no
-        //    secure-monitor stage to do that. An earlier, more ambitious
-        //    version of this command (PMCR/PMCEID/PMSELR/PMXEVTYPER
-        //    register probing) crashed the same way and was removed
-        //    rather than left in a state that panics the target.
-        printf("pmu: Stage 5 needs real hardware -- see this command's own\n");
-        printf("pmu: source comment for the two independent, verified reasons\n");
-        printf("pmu: (no PMU IRQ route in this QEMU target's device tree, and\n");
-        printf("pmu: PMU coprocessor access itself faults without a secure-\n");
-        printf("pmu: monitor boot stage to clear the NSACR trap).\n");
+        //    reliably faulted with "undefined abort" the moment it
+        //    executed on that bare-metal image -- verified directly,
+        //    not inferred. QEMU's minimal image has no secure-monitor
+        //    boot stage to clear the NSACR PMU-access trap.
+        //
+        // M5: on THIS real hardware, PMU access works cleanly -- see
+        // `profiler stat` above, confirmed on real Pi 4B silicon: reads
+        // PMCEID0/1, programs an event counter, runs a workload, reads
+        // real counts back, no fault anywhere. The Pi's own firmware
+        // does clear that trap during its real secure-world boot, as
+        // hypothesized (not previously confirmed) when this comment
+        // was first written for the QEMU target. Only the PMU
+        // *interrupt* path (event-overflow-triggered sampling, as
+        // opposed to plain counting) remains unverified on real
+        // hardware -- that's the actual PMU-event-driven-sampling
+        // milestone, still ahead.
+        printf("pmu: counting mode confirmed working on real hardware --\n");
+        printf("pmu: see `profiler stat`. What's still unverified here is\n");
+        printf("pmu: the PMU *interrupt* path (event-overflow-triggered\n");
+        printf("pmu: sampling) -- see this command's own source comment.\n");
     } else if (!strcmp(sub, "fpcheck")) {
         // Diagnostic: dereference each core's ring buffer's OWN
         // last-recorded fp directly on target, no QMP involved.
