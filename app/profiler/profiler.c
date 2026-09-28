@@ -105,7 +105,14 @@
 #include <stdio.h>
 #include <string.h>
 #if BCM2711
+#include <dev/interrupt/arm_gic.h>
 #include <platform/bcm28xx.h>
+// Not declared in arm_gic.h despite being a real, global (non-static)
+// function (dev/interrupt/arm_gic/arm_gic.c) -- the enum types it
+// takes are public, just not this prototype.
+status_t gic_configure_interrupt(unsigned int vector,
+                                  enum interrupt_trigger_mode tm,
+                                  enum interrupt_polarity pol);
 #endif
 
 // IRQ 27 = non-secure physical timer PPI on qemu-virt-arm/cortex-a15 --
@@ -241,6 +248,17 @@ static void profiler_pmu_route_and_unmask(void) {
                                (PROFILER_PMU_SPI_BASE / 4) * 4);
     *itargetsr = 0x08040201;
     for (int i = 0; i < 4; i++) {
+        // gic_v2.c's own init (arm_gicv2_init) unconditionally
+        // configures every SPI as edge-triggered ("Initialize all the
+        // SPIs to edge triggered") -- but the real DTB marks this
+        // interrupt IRQ_TYPE_LEVEL_HIGH, and the PMU signal genuinely
+        // is level (asserted until the software clears PMOVSR), not a
+        // pulse. Left at the GIC's edge default, this silently never
+        // fires (confirmed: no crash, but zero samples, on the first
+        // real hardware attempt at this). Reconfigure explicitly
+        // rather than assume the GIC's default matches the DTB.
+        gic_configure_interrupt(PROFILER_PMU_SPI_BASE + i,
+                                 IRQ_TRIGGER_MODE_LEVEL, IRQ_POLARITY_ACTIVE_HIGH);
         unmask_interrupt(PROFILER_PMU_SPI_BASE + i);
     }
 }

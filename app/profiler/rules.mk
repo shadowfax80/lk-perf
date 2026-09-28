@@ -7,6 +7,7 @@ MODULE_SRCS += \
 
 MODULE_DEPS += \
 	kernel \
-	lib/console
+	lib/console \
+	dev/interrupt/arm_gic
 
 include make/module.mk
