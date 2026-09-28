@@ -686,6 +686,56 @@ Phases 2-4 (report correctness, all-core-by-design sampling, the
 self-describing dump format, pre-A55-port hardening) are tracked but
 not started -- see the plan from this review for the full breakdown.
 
+**Phase 2, must-fix subset done (2026-09-28).** Of Phase 2's items,
+three were judged must-fix (an existing report can be wrong or
+silently incomplete without them, not just less convenient) and are
+now fixed and verified on real hardware; the rest of Phase 2 is
+deferred as should-fix, not must:
+
+- **Reports/folded output grouped by exact instruction, not function
+  (finding #4).** `symbolize()` baked the raw offset and PC into every
+  frame name, so two samples in the same hot function almost never
+  produced the same string -- a real capture of 1203 samples all
+  inside `profiler_workload_inner` used to scatter across ~1203
+  near-0% rows in the flat report, and the folded FlameGraph output
+  almost never merged two samples into the same stack either. Fixed by
+  making `symbolize()` return the function name alone; per-instruction
+  detail is still `--annotate`'s job, not the flat report's. Also
+  cached the ELF symbol table (`_load_symtab()`, keyed by path+mtime)
+  -- `symbolize()`/`find_function()` each used to reopen and rebuild
+  it from scratch on *every* call, measured by the review at ~88ms/call,
+  tens of minutes for a full `--folded`/`--annotate` pass. Verified: the
+  1203-sample capture above now reports one `profiler_workload_inner`
+  row at 99.0%; a second real capture of 2400 samples reports a clean
+  50.0%/50.0% split matching `bench`'s known alternation.
+- **`pi4_run.py` silently truncated long-running commands (finding
+  #7).** It waited for `--idle` seconds of silence, capped at
+  `--max-wait` (15s default) -- too short for a `profiler bench` that
+  runs for tens of seconds with no output at all, let alone the dump
+  afterward, and then typed the *next* command straight into LK's
+  still-busy 16-byte UART receive buffer. Fixed by waiting for LK's
+  own `"] "` shell prompt (`lib/console/console.c` prints exactly this
+  before reading the next line) instead of a silence heuristic;
+  `--max-wait` is now a much larger (90s) hard timeout for a genuine
+  hang, not the normal completion signal. Verified: `profiler bench
+  900000000` ran for ~24s (already past the old 15s ceiling) with no
+  timeout, and the following `profiler dump` captured all 2400
+  samples, exactly matching `profiler status` before and after --
+  zero truncation.
+- **One bad sample aborted the entire report (finding #12).** A CFA
+  rule needing a register (r7 or r11) that this specific sample didn't
+  capture -- only whichever one matched the *interrupted* PC's own
+  Thumb/ARM mode is ever recorded, see `profiler.c:340` -- raised
+  `ValueError` straight out of the per-sample loop and discarded every
+  other sample with it. Fixed by catching the failure per-sample and
+  falling back to a leaf-only chain, so one bad sample only costs its
+  own multi-frame detail. Verified with a genuinely forced failure (a
+  real mixed-Thumb/ARM CFI scenario reusing `test_dwarf_unwind.py`'s
+  own `thumb_edge.elf` fixture, not a mock) alongside a normal sample
+  in the same run: the bad one degrades to depth 1 with a printed
+  warning, the good one still unwinds fully to depth 3, and the script
+  exits 0 either way.
+
 ## Why Pi 4B over the Arm Cortex-A55 FVP route
 
 The FVP was investigated first and set aside for concrete, confirmed
