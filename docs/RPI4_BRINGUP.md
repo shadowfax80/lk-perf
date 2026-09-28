@@ -159,10 +159,42 @@ Revised scope, closest analogue to `perf` noted per item:
      QEMU-era Stage 2/3 work already documented, and exactly why DWARF
      CFI (not the FP chain) is the real long-term unwinding mechanism.
 
-   **Not done yet:** full multi-frame unwinding still needs a
-   stack-memory capture this doesn't add (registers only) -- see
-   `profiler.c`'s header comment. `dwarf_unwind.py` is ready for it
-   once that capture exists.
+   **Full multi-frame DWARF-CFI unwinding, working on real hardware
+   (2026-09-28):** each sample now also captures
+   `PROFILER_STACK_CAPTURE_BYTES` (128) of raw stack memory starting at
+   `sp`, and `pi4_pc_histogram.py` feeds it to `dwarf_unwind.py`'s
+   existing `DwarfCFIUnwinder` (built and tested weeks ago, unchanged
+   here) via a `read_memory` callback backed by that captured window --
+   a read outside it returns 0, which `unwind()` already treats as a
+   clean stop, so nothing in `dwarf_unwind.py` needed to change.
+   Verified offline first (replayed `test_dwarf_unwind.py`'s own
+   ground-truth 4-frame scenario through a synthetic `dump`-shaped log
+   and got back the identical chain), then for real:
+   - `profiler smp 8000000`: all 8 samples (2 per core, all 4 cores)
+     unwind to the identical, correct 4-frame chain --
+     `initial_thread_func` -> `profiler_smp_worker` ->
+     `profiler_workload_inner`. Confirmed correct against the
+     disassembly, not assumed: `profiler_workload_mid`/`_outer` don't
+     appear because GCC tail-call-optimized both into plain `b.w`
+     branches (no `bl`, no frame, `lr` never touched) -- there is
+     genuinely only one real call frame between `smp_worker` and
+     `workload_inner` in the actual compiled code, and the unwinder
+     correctly reflects that rather than the C-level 3-function
+     abstraction.
+   - `lr=0x9e3779b9` (that data constant, not a return address) shows
+     up in the raw sample but the unwinder does **not** get fooled by
+     it -- it reads the real saved return address from the captured
+     stack memory instead of trusting the live (temporarily
+     scratch-clobbered) `lr` register, which is exactly the case DWARF
+     CFI was chosen over simpler LR/FP-chain unwinding to handle
+     correctly.
+
+   M5's core mechanism -- real timer-tick sampling *and* real
+   multi-frame DWARF-CFI unwinding, both on actual Pi 4B hardware -- is
+   now done and verified. Remaining polish: a real `-mthumb`-compiled
+   unwinder regression case (still only hand-written .S, see item 2
+   below), and whatever `profiler stat`/report-annotate/PMU work is
+   still ahead per the rest of this section.
 2. **Unwinder correctness for real `-mthumb` code.** The two fixes
    above, done. Still to do: a real `-mthumb`-compiled regression case
    (not just hand-written .S), and, if the target platform is built with
