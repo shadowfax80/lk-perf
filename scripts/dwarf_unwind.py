@@ -25,6 +25,7 @@ meaningful beyond "was the target Thumb".
 """
 from __future__ import annotations
 
+import os
 from typing import Callable, Optional
 
 from elftools.elf.elffile import ELFFile
@@ -231,41 +232,67 @@ class DwarfCFIUnwinder:
         return chain
 
 
-def symbolize(elf_path: str, pcs: list[int]) -> list[str]:
-    """Best-effort nearest-symbol-at-or-below-PC lookup, for readable
-    output. Not a substitute for real DWARF line-table lookups, just
-    enough to identify which function each frame is in.
+_symtab_cache: dict[str, tuple[float, list[tuple[int, str, int, bool]]]] = {}
 
-    Thumb function symbols carry the ISA bit in st_value (that's how the
-    ELF marks "this is Thumb code, not ARM"); it's stripped before
-    comparing against a real (even) PC, and reported separately as
-    "(thumb)" so mixed ARM/Thumb chains stay legible.
+
+def _load_symtab(elf_path: str) -> list[tuple[int, str, int, bool]]:
+    """(addr, name, size, is_thumb) for every STT_FUNC symbol, sorted by
+    addr ascending. Cached per (path, mtime) -- symbolize()/
+    find_function() each used to reopen the ELF and rebuild this same
+    table from scratch on *every* call, which made a full --folded or
+    --annotate pass over a real capture (thousands of samples) take
+    tens of minutes (measured: ~88ms/call). Keyed by mtime, not just
+    path, so a stale cache can't survive a rebuild -- this project has
+    already been bitten once by a stale-lk.elf pitfall (see
+    docs/RPI4_BRINGUP.md's M5 annotate section).
     """
+    mtime = os.path.getmtime(elf_path)
+    cached = _symtab_cache.get(elf_path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    funcs = []
     with open(elf_path, "rb") as f:
         elf = ELFFile(f)
         symtab = elf.get_section_by_name(".symtab")
-        funcs = []
         if symtab is not None:
             for sym in symtab.iter_symbols():
                 if sym["st_info"]["type"] == "STT_FUNC" and sym["st_value"] != 0:
                     is_thumb = bool(sym["st_value"] & ISA_BIT)
-                    funcs.append((strip_isa_bit(sym["st_value"]), sym.name, is_thumb))
-        funcs.sort()
+                    funcs.append((strip_isa_bit(sym["st_value"]), sym.name,
+                                  sym["st_size"], is_thumb))
+    funcs.sort(key=lambda t: t[0])
+    _symtab_cache[elf_path] = (mtime, funcs)
+    return funcs
 
+
+def symbolize(elf_path: str, pcs: list[int]) -> list[str]:
+    """Nearest-function-at-or-below-PC lookup, one name per PC, grouped
+    at FUNCTION granularity -- not the exact instruction. Two PCs
+    inside the same function always symbolize to the identical string,
+    so Counter-based aggregation over this output (the leaf-hotspot
+    ranking, folded FlameGraph stacks) groups by function the way
+    `perf report` does, not by address.
+
+    Review finding #4, fixed: this used to bake the exact offset and
+    raw PC into every name (`func+0xOFF (0xPC)`), so two samples in the
+    same hot function almost never produced the same string -- the
+    flat report showed dozens of ~1-sample rows instead of one real
+    hotspot, and the folded output almost never merged two samples
+    into the same flame-graph stack at all. Per-instruction detail is
+    what `pi4_pc_histogram.py --annotate` is for; this is the coarser,
+    function-level view everything else actually needs.
+    """
+    funcs = _load_symtab(elf_path)
     names = []
     for raw_pc in pcs:
         pc = strip_isa_bit(raw_pc)
-        best_addr, best_name, best_thumb = None, None, False
-        for addr, name, is_thumb in funcs:
+        best_name = None
+        for addr, name, _size, _is_thumb in funcs:
             if addr <= pc:
-                best_addr, best_name, best_thumb = addr, name, is_thumb
+                best_name = name
             else:
                 break
-        if best_name is None:
-            names.append(f"0x{pc:x}")
-        else:
-            mode = " (thumb)" if best_thumb else ""
-            names.append(f"{best_name}+0x{pc - best_addr:x} (0x{pc:x}){mode}")
+        names.append(best_name if best_name is not None else f"0x{pc:x}")
     return names
 
 
@@ -277,18 +304,12 @@ def find_function(elf_path: str, pc: int) -> Optional[tuple[str, int, int, bool]
     covers this address at all.
     """
     pc = strip_isa_bit(pc)
-    with open(elf_path, "rb") as f:
-        elf = ELFFile(f)
-        symtab = elf.get_section_by_name(".symtab")
-        best = None
-        if symtab is not None:
-            for sym in symtab.iter_symbols():
-                if sym["st_info"]["type"] != "STT_FUNC" or sym["st_value"] == 0:
-                    continue
-                addr = strip_isa_bit(sym["st_value"])
-                if addr <= pc and (best is None or addr > best[1]):
-                    is_thumb = bool(sym["st_value"] & ISA_BIT)
-                    best = (sym.name, addr, sym["st_size"], is_thumb)
+    best = None
+    for addr, name, size, is_thumb in _load_symtab(elf_path):
+        if addr <= pc:
+            best = (name, addr, size, is_thumb)
+        else:
+            break
     return best
 
 

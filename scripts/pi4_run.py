@@ -3,10 +3,21 @@
 scripted sequence of shell commands and capture everything printed.
 
 Reuses pi4_serial_boot.py's image-transfer/baud-switch logic, then
-sends each command (with a CR) and waits until the Pi goes quiet for
-`--idle` seconds before moving to the next one -- no assumption about
-what LK's shell prompt looks like, just "has this command's output
-settled".
+sends each command (with a CR) and waits for LK's own shell prompt
+("] ", fputs'd by lib/console/console.c right before it reads the next
+line) to come back before sending the next one.
+
+Review finding #7, fixed: this used to wait for `--idle` seconds of
+silence instead, capped at `--max-wait` overall -- a real bug, not
+just imprecision. A full `profiler dump` can run for tens of seconds
+with no gap anywhere near that long (measured: ~6MB at the calibrated
+~213 KiB/s is ~29s), so the old defaults (0.5s idle, 15s max) silently
+cut it off mid-stream and then typed the *next* command straight into
+LK's still-busy 16-byte UART receive buffer, corrupting or dropping
+bytes with no error from either side. Waiting for the real prompt has
+no such ceiling for a well-behaved command; `--max-wait` is now a much
+larger hard safety timeout for a genuine hang, not the normal
+completion signal.
 
 Usage:
     python scripts/pi4_run.py build/lk/build-rpi4-test/lk.bin --log pi4.log \
@@ -27,22 +38,33 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent))
 from pi4_serial_boot import Console, reboot_to_chainloader, resolve_port, send_image
 
+PROMPT = b"] "
 
-def run_command(port: serial.Serial, console: Console, cmd: str,
-                 idle: float, max_wait: float) -> None:
+
+def run_command(port: serial.Serial, console: Console, cmd: str, max_wait: float) -> bool:
+    """Send one command, wait for LK's own "] " prompt to reappear.
+    Returns False (and warns) if it doesn't within max_wait -- a real
+    hang or a crash, not just a slow command."""
     console.write(f"\n$ {cmd}\n".encode())
     port.write(cmd.encode() + b"\r")
     port.flush()
 
     deadline = time.monotonic() + max_wait
-    last_data = time.monotonic()
+    tail = b""
     while time.monotonic() < deadline:
         chunk = port.read(port.in_waiting or 1)
-        if chunk:
-            console.write(chunk)
-            last_data = time.monotonic()
-        elif time.monotonic() - last_data > idle:
-            return
+        if not chunk:
+            continue
+        console.write(chunk)
+        tail = (tail + chunk)[-len(PROMPT):]
+        if tail == PROMPT:
+            return True
+
+    print(f"warning: no prompt within {max_wait}s after {cmd!r} -- "
+          f"the Pi may be hung or still mid-command; stopping here "
+          f"rather than typing the next command into a busy shell",
+          file=sys.stderr)
+    return False
 
 
 def main() -> None:
@@ -57,10 +79,9 @@ def main() -> None:
     ap.add_argument("--log", help="append everything received to this file")
     ap.add_argument("--wait", type=float, default=None,
                     help="seconds to wait for the SBOOT? prompt (default: forever)")
-    ap.add_argument("--idle", type=float, default=0.5,
-                    help="seconds of silence that mark a command's output as done")
-    ap.add_argument("--max-wait", type=float, default=15.0,
-                    help="max seconds to wait for any single command")
+    ap.add_argument("--max-wait", type=float, default=90.0,
+                    help="hard timeout per command if LK's prompt never comes back "
+                         "(default: 90s, generous enough for a full profiler dump)")
     ap.add_argument("--reboot", action="store_true",
                     help="if LK is running (no SBOOT? prompt), send it `reboot` "
                          "first instead of waiting for a manual power-cycle")
@@ -89,10 +110,12 @@ def main() -> None:
             port.reset_input_buffer()
 
         # Let the boot banner settle before the first command.
-        run_command(port, console, "", args.idle, args.max_wait)
+        if not run_command(port, console, "", args.max_wait):
+            sys.exit(1)
 
         for cmd in args.commands:
-            run_command(port, console, cmd, args.idle, args.max_wait)
+            if not run_command(port, console, cmd, args.max_wait):
+                sys.exit(1)
 
 
 if __name__ == "__main__":

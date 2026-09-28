@@ -153,8 +153,26 @@ def main() -> None:
     if not samples:
         sys.exit(f"error: no SAMPLE lines found in {args.log}")
 
+    # Review finding #12, fixed: a single sample whose CFA rule needs a
+    # register this sample didn't capture (only whichever of r7/r11
+    # matched the interrupted PC's own Thumb/ARM mode is ever recorded,
+    # see profiler.c:340) used to raise straight out of this loop and
+    # abort the ENTIRE report, discarding every other sample with it.
+    # Falls back to a leaf-only, single-frame chain instead -- the same
+    # view Stage 1's PC-only sampling always gave -- so one bad sample
+    # only costs its own multi-frame detail, not the whole run.
+    chains = []
+    unwind_errors = 0
     with DwarfCFIUnwinder(args.elf) as unwinder:
-        chains = [unwind_sample(unwinder, s) for s in samples]
+        for s in samples:
+            try:
+                chains.append(unwind_sample(unwinder, s))
+            except (ValueError, NotImplementedError):
+                unwind_errors += 1
+                chains.append([s["pc"]])
+    if unwind_errors:
+        print(f"warning: {unwind_errors}/{len(samples)} sample(s) failed to unwind "
+              f"past the leaf frame (kept as leaf-only, not dropped)\n", file=sys.stderr)
 
     leaf_pcs = [strip_isa_bit(c[0]) for c in chains]
     total = len(samples)
