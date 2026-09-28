@@ -146,6 +146,48 @@
 // interrupted code's actual frame-pointer register.
 #define PROFILER_SPSR_T_BIT (1u << 5)
 
+// M5 `profiler stat`: raw ARMv7 PMU (Performance Monitors) coprocessor
+// accessors. Stage 5's own "pmu" command above already confirmed this
+// coprocessor faults on the QEMU target (no secure-monitor boot stage
+// to clear the NSACR trap); real hardware/firmware normally does clear
+// it, but that's untested here until `stat` actually runs -- these are
+// deliberately separate, minimal functions (not a struct/abstraction)
+// so a UART-probe bisection (this project's own established debugging
+// discipline, see docs/RPI4_BRINGUP.md's M1-M4 history) can pin down
+// exactly which register access is the first to fault, if any.
+// PMCCNTR's own accessor already exists and is proven safe on real ARM
+// hardware elsewhere (arch_cycle_count(), arch/arm/include/arch/arch_ops.h,
+// used throughout bolt-aarch32's bolt_bench) -- reimplemented here
+// rather than depending on that header, to keep every PMU register
+// this command touches in one place.
+static inline uint32_t pmu_read_pmceid0(void) {
+    uint32_t v; __asm__ volatile("mrc p15, 0, %0, c9, c12, 6" : "=r"(v)); return v;
+}
+static inline uint32_t pmu_read_pmceid1(void) {
+    uint32_t v; __asm__ volatile("mrc p15, 0, %0, c9, c12, 7" : "=r"(v)); return v;
+}
+static inline uint32_t pmu_read_pmcr(void) {
+    uint32_t v; __asm__ volatile("mrc p15, 0, %0, c9, c12, 0" : "=r"(v)); return v;
+}
+static inline void pmu_write_pmcr(uint32_t v) {
+    __asm__ volatile("mcr p15, 0, %0, c9, c12, 0" :: "r"(v));
+}
+static inline void pmu_write_pmcntenset(uint32_t v) {
+    __asm__ volatile("mcr p15, 0, %0, c9, c12, 1" :: "r"(v));
+}
+static inline void pmu_write_pmselr(uint32_t v) {
+    __asm__ volatile("mcr p15, 0, %0, c9, c12, 5" :: "r"(v));
+}
+static inline uint32_t pmu_read_pmccntr(void) {
+    uint32_t v; __asm__ volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(v)); return v;
+}
+static inline void pmu_write_pmxevtyper(uint32_t v) {
+    __asm__ volatile("mcr p15, 0, %0, c9, c13, 1" :: "r"(v));
+}
+static inline uint32_t pmu_read_pmxevcntr(void) {
+    uint32_t v; __asm__ volatile("mrc p15, 0, %0, c9, c13, 2" : "=r"(v)); return v;
+}
+
 // Defined in arch/arm/arm/exceptions.S by
 // overlay/lk/0002-capture-interrupted-fp.patch +
 // overlay/lk/0003-percpu-fp-capture.patch (per-CPU as of Stage 4) --
@@ -267,7 +309,7 @@ static int profiler_smp_worker(void *arg) {
 
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
-        printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|pmu|fpcheck>\n");
+        printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|stat|pmu|fpcheck>\n");
         return -1;
     }
 
@@ -355,6 +397,68 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         }
         printf("profiler: smp done (sink=%u, ignore -- just prevents dead-code elim)\n",
                profiler_sink);
+    } else if (!strcmp(sub, "stat")) {
+        // M5 `perf stat`-equivalent: PMU counting mode, real hardware
+        // only (see the "pmu" branch below for why this was never
+        // attempted on the QEMU target). Printing before each new
+        // coprocessor access on purpose -- if this crashes, the UART
+        // log shows exactly which register access was the first to
+        // fault, the same bisection discipline this project's own
+        // M1-M4 hardware bring-up already used (see
+        // docs/RPI4_BRINGUP.md).
+        uint32_t iters = argc >= 3 ? (uint32_t)argv[2].u : 5000000;
+
+        printf("stat: reading PMCEID0/PMCEID1 ...\n");
+        uint32_t pmceid0 = pmu_read_pmceid0();
+        uint32_t pmceid1 = pmu_read_pmceid1();
+        printf("stat: PMCEID0=0x%08x PMCEID1=0x%08x\n", pmceid0, pmceid1);
+
+        // Event 0x03 = L1D_CACHE_REFILL (L1 data cache miss), an
+        // architectural ARMv7 PMUv2 event -- PMCEID0 bit N marks
+        // whether event N (0-31) is implemented on this core.
+        #define PROFILER_PMU_EVENT_L1D_CACHE_REFILL 0x03
+        bool have_l1d_refill = (pmceid0 & (1u << PROFILER_PMU_EVENT_L1D_CACHE_REFILL)) != 0;
+        printf("stat: L1D_CACHE_REFILL (event 0x03) %s\n",
+               have_l1d_refill ? "implemented" : "NOT implemented -- counting it anyway, expect garbage");
+
+        printf("stat: reading PMCR ...\n");
+        uint32_t pmcr = pmu_read_pmcr();
+        printf("stat: PMCR=0x%08x (N=%u counters)\n", pmcr, (pmcr >> 11) & 0x1f);
+
+        printf("stat: selecting event counter 0 for L1D_CACHE_REFILL ...\n");
+        pmu_write_pmselr(0);
+        pmu_write_pmxevtyper(PROFILER_PMU_EVENT_L1D_CACHE_REFILL);
+
+        printf("stat: enabling cycle counter + event counter 0 ...\n");
+        pmu_write_pmcntenset((1u << 31) | (1u << 0));
+
+        printf("stat: resetting counters and starting (PMCR E|P|C) ...\n");
+        pmu_write_pmcr(pmcr | (1u << 0) | (1u << 1) | (1u << 2));
+
+        printf("stat: running workload (%u iters) ...\n", iters);
+        profiler_workload_a(iters);
+
+        printf("stat: reading PMCCNTR/PMXEVCNTR ...\n");
+        uint32_t cycles = pmu_read_pmccntr();
+        pmu_write_pmselr(0);
+        uint32_t l1d_refills = pmu_read_pmxevcntr();
+
+        printf("stat: stopping (PMCR E=0) ...\n");
+        pmu_write_pmcr(pmcr);
+
+        printf("stat: %u iters, %u cycles, %u L1D_CACHE_REFILL\n", iters, cycles, l1d_refills);
+        if (cycles > 0 && iters > 0) {
+            // uint64_t throughout: iters*1000 alone can already exceed
+            // uint32_t range at the default 5,000,000 iters.
+            uint64_t iters_per_cycle_milli = (uint64_t)iters * 1000 / cycles;
+            uint64_t refills_per_iter_tenthousandth = (uint64_t)l1d_refills * 10000 / iters;
+            printf("stat: %u.%03u iters/cycle, %u.%04u L1D_CACHE_REFILL/iter\n",
+                   (uint32_t)(iters_per_cycle_milli / 1000),
+                   (uint32_t)(iters_per_cycle_milli % 1000),
+                   (uint32_t)(refills_per_iter_tenthousandth / 10000),
+                   (uint32_t)(refills_per_iter_tenthousandth % 10000));
+        }
+        printf("stat: done\n");
     } else if (!strcmp(sub, "pmu")) {
         // Stage 5 (PMU-overflow-triggered sampling) is real-hardware-only
         // on this project -- confirmed two independent ways, not assumed:
