@@ -409,9 +409,119 @@ static int profiler_smp_worker(void *arg) {
     return 0;
 }
 
+// M5 edge-case validation (`profiler edgetest`): deliberately targets
+// specific things the sampling/unwinding pipeline hasn't been tested
+// against on real hardware yet.
+//
+// 1. A genuinely deep, non-tail-call chain. workload_outer/mid above
+//    are BOTH tail calls ("return child(x);" with nothing after --
+//    confirmed via disassembly to compile to a plain `b.w`, no `bl`,
+//    no frame at all), so they've never actually tested multi-level
+//    unwinding through real stack frames on this target -- every
+//    multi-frame result so far reached its depth some other way
+//    (through profiler_smp_worker's own real `bl`, or by luck).
+//    Every level here does work AFTER its child call returns, so
+//    none of them can be tail-call-eliminated: each one's own return
+//    address into ITS caller must survive across the `bl` it makes,
+//    forcing a real spilled LR and a real frame at every level.
+//    8 levels deep specifically to likely exceed
+//    PROFILER_STACK_CAPTURE_BYTES (128) by the outer few levels, to
+//    see the unwinder degrade gracefully (truncate) rather than
+//    silently produce a wrong deep chain.
+__NO_INLINE static uint32_t profiler_deep_8(uint32_t x) {
+    volatile uint32_t v = x * 3u + 1u;
+    return v;
+}
+__NO_INLINE static uint32_t profiler_deep_7(uint32_t x) { return profiler_deep_8(x) + 7; }
+__NO_INLINE static uint32_t profiler_deep_6(uint32_t x) { return profiler_deep_7(x) + 6; }
+__NO_INLINE static uint32_t profiler_deep_5(uint32_t x) { return profiler_deep_6(x) + 5; }
+__NO_INLINE static uint32_t profiler_deep_4(uint32_t x) { return profiler_deep_5(x) + 4; }
+__NO_INLINE static uint32_t profiler_deep_3(uint32_t x) { return profiler_deep_4(x) + 3; }
+__NO_INLINE static uint32_t profiler_deep_2(uint32_t x) { return profiler_deep_3(x) + 2; }
+__NO_INLINE static uint32_t profiler_deep_1(uint32_t x) { return profiler_deep_2(x) + 1; }
+
+static void profiler_workload_deepchain(uint32_t iters) {
+    uint32_t acc = 0;
+    for (uint32_t i = 0; i < iters; i++) {
+        acc += profiler_deep_1(i);
+    }
+    profiler_sink = acc;
+}
+
+// 2. Real (non-tail) recursion: the SAME instruction address recurs at
+// every depth, on purpose -- DwarfCFIUnwinder.unwind()'s cycle guard
+// (`if cur_pc in chain: break`) can't distinguish genuine recursion
+// (same PC, different/advancing SP each level) from an actual
+// CFI-table-driven infinite loop (same PC *and* SP) purely by PC.
+// This is the concrete case that distinction matters for -- expect
+// (and verify, don't assume) that the unwind stops after 2 levels of
+// real recursion here, one level "too early" by the C-source picture,
+// even though nothing is actually wrong with the CFI data.
+__NO_INLINE static uint32_t profiler_recurse(uint32_t depth, uint32_t acc) {
+    if (depth == 0) {
+        return acc;
+    }
+    uint32_t r = profiler_recurse(depth - 1, acc + depth);
+    return r ^ depth;  // work after the recursive call -> real frame, not a tail call
+}
+
+static void profiler_workload_recurse(uint32_t iters) {
+    uint32_t acc = 0;
+    for (uint32_t i = 0; i < iters; i++) {
+        acc += profiler_recurse(20, i);
+    }
+    profiler_sink = acc;
+}
+
+// 3. Force a real frame-pointer (r7, the Thumb FP convention)
+// call chain -- everything else in this project compiles at -O2 with
+// frame pointers omitted (confirmed repeatedly: fp=0 or garbage in
+// most captured samples so far), so the r7-based CFA path
+// scripts/dwarf_unwind.py's unwinder supports has only ever been
+// exercised by the hand-written thumb_edge.S test, never by real
+// compiled code on real hardware.
+__attribute__((optimize("no-omit-frame-pointer")))
+__NO_INLINE static uint32_t profiler_fp_forced_inner(uint32_t x) {
+    volatile uint32_t v = x * 7u;
+    return v + 1;
+}
+__attribute__((optimize("no-omit-frame-pointer")))
+__NO_INLINE static uint32_t profiler_fp_forced_outer(uint32_t x) {
+    uint32_t r = profiler_fp_forced_inner(x);
+    return r + 2;
+}
+
+static void profiler_workload_fpforce(uint32_t iters) {
+    uint32_t acc = 0;
+    for (uint32_t i = 0; i < iters; i++) {
+        acc += profiler_fp_forced_outer(i);
+    }
+    profiler_sink = acc;
+}
+
+// 4. A genuine ARM-mode function called from this project's otherwise
+// all-Thumb code (`-mthumb` is the default build flag here) -- real
+// BL/BX interworking, mode switch included. Every other ISA-bit test
+// so far has been the offline, hand-built scripts/test_dwarf_unwind.py
+// scenario; this is the first on real hardware, with a real sample
+// landing inside genuinely ARM-mode code.
+__attribute__((target("arm")))
+__NO_INLINE static uint32_t profiler_arm_mode_func(uint32_t x) {
+    volatile uint32_t v = x * 5u + 2u;
+    return v;
+}
+
+static void profiler_workload_armmode(uint32_t iters) {
+    uint32_t acc = 0;
+    for (uint32_t i = 0; i < iters; i++) {
+        acc += profiler_arm_mode_func(i);
+    }
+    profiler_sink = acc;
+}
+
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
-        printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|stat|pmustart|pmustop|pmu|fpcheck>\n");
+        printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|edgetest|stat|pmustart|pmustop|pmu|fpcheck>\n");
         return -1;
     }
 
@@ -498,6 +608,25 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
             thread_join(workers[i], NULL, INFINITE_TIME);
         }
         printf("profiler: smp done (sink=%u, ignore -- just prevents dead-code elim)\n",
+               profiler_sink);
+    } else if (!strcmp(sub, "edgetest")) {
+        // M5 edge-case validation -- see the four profiler_workload_*
+        // functions' own comments above for exactly what each one
+        // targets. Runs all four back to back so one profiler
+        // start/edgetest/stop/dump captures samples across all of
+        // them; iters is per-workload, kept modest since deepchain and
+        // recurse both do real per-call work (unlike bench/nest's pure
+        // arithmetic loops).
+        uint32_t iters = argc >= 3 ? (uint32_t)argv[2].u : 2000000;
+        printf("profiler: edgetest deepchain (%u iters) ...\n", iters);
+        profiler_workload_deepchain(iters);
+        printf("profiler: edgetest recurse (%u iters) ...\n", iters);
+        profiler_workload_recurse(iters);
+        printf("profiler: edgetest fpforce (%u iters) ...\n", iters);
+        profiler_workload_fpforce(iters);
+        printf("profiler: edgetest armmode (%u iters) ...\n", iters);
+        profiler_workload_armmode(iters);
+        printf("profiler: edgetest done (sink=%u, ignore -- just prevents dead-code elim)\n",
                profiler_sink);
     } else if (!strcmp(sub, "stat")) {
         // M5 `perf stat`-equivalent: PMU counting mode, real hardware
