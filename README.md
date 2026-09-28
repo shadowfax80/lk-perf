@@ -51,7 +51,7 @@ python3 scripts/test_dwarf_unwind.py
 ```
 
 At the LK shell, once booted:
-`profiler <start|stop|status|clear|bench [iters]|nest [iters]|smp [iters]|pmu|fpcheck>`.
+`profiler <start|stop|status|clear|bench [iters]|nest [iters]|smp [iters]|pmu>`.
 Live sample extraction over serial (replacing the old QEMU/QMP-based
 `pc_histogram.py`, removed along with all QEMU references) is M5 in
 `docs/RPI4_BRINGUP.md` -- not yet implemented.

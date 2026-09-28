@@ -606,6 +606,86 @@ A manual power-cycle is still needed when the Pi is hung, when the
 running image isn't a TARGET=rpi4 LK build with this patch, or after
 `poweroff`.
 
+## Code review, Phase 1 fixes (2026-09-28)
+
+A full code review of the project (profiler app, all LK patches, host
+scripts) found 15 issues, ranked by severity. Phase 1 -- the ones that
+could hang or crash the target outright, not just mislead a report --
+is done and verified on real hardware:
+
+- **PMU overflow could hang a core (review finding #1).** `pmustart`/
+  `pmustop` only ever touched whichever core happened to run the shell
+  command -- its own banked PMU registers plus a single SHARED
+  `profiler_pmu_enabled` flag. If they ran on different cores, the
+  armed-but-never-disarmed core's next overflow found
+  `profiler_on_tick()` already reading "disabled" and returned without
+  clearing `PMOVSR`; since the PMU SPI is level-triggered, that refires
+  the instant the handler returns and the core never leaves interrupt
+  context again. Fixed by making the enabled flag per-core and
+  broadcasting arm/disarm to every core via LK's `mp_sync_exec()`, plus
+  unconditionally acknowledging any real PMU-overflow vector for a
+  core's own index regardless of that flag (defense in depth for the
+  transition window). Verified: 4 rapid `pmustart`/`pmustop` cycles
+  (including one with an SMP workload running through the middle) with
+  no hang, and PMU sampling now genuinely runs on all 4 cores at once
+  as a side effect -- 303/304/304/304 samples in one stress run.
+- **Per-CPU index could silently disagree with `arch_curr_cpu_num()`
+  on a different target (finding #9).** `exceptions.S`'s hand-written
+  `bic r3, r3, #0xff000000` was snapshotted from a build where
+  `SMP_CPU_ID_BITS` was still 24 (the pre-rpi4 QEMU default); bcm28xx's
+  rules.mk sets it to 8, which changes the real formula to plain
+  `mpidr & 0xff`. The two only ever agreed on this board because
+  BCM2711's MPIDR happens to have zero bits in [23:8] -- a target with
+  a real Aff1 field there would index a different per-CPU slot in this
+  assembly than the C side reads back, corrupting
+  `profiler_fp_r7`/`r11` across cores with no signal anything was
+  wrong. Fixed by computing the index in assembly from the exact same
+  `SMP_CPU_ID_BITS`/`SMP_CPU_CLUSTER_SHIFT` build macros the C formula
+  uses, so it can't drift again regardless of target. Verified via
+  disassembly (matches the intended formula exactly on this board) and
+  functionally via repeated `profiler smp`/PMU-sampling runs across all
+  4 cores with no cross-core corruption.
+- **Console print lock could self-deadlock (finding #2).** `out_count()`
+  re-took the same non-recursive `print_spin_lock` that `vfprintf()`
+  already holds for the whole call (added when 0005 fixed the SMP
+  console race) -- harmless until anything registers a print callback,
+  at which point the first `printf` after that spins forever on a lock
+  its own core already holds. Fixed by removing the now-redundant inner
+  lock. Not independently reproducible on real hardware right now:
+  nothing in this codebase currently calls
+  `register_print_callback()`, so this was a latent bug in the shipped
+  code, not one exercised by anything here yet -- confirmed correct by
+  inspection (its one caller, `__debug_stdio_write`, is only ever
+  reached through `vfprintf()`), not by a live repro.
+- **No minimum PMU sample period (finding #3).** `pmustart` only
+  rejected `count == 0`; a small reload could make the counter overflow
+  again before the interrupt handler -- GIC dispatch, several PMU/GIC
+  register accesses, a 128-byte stack memcpy -- finished, leaving a
+  core doing nothing but re-entering its own handler. Fixed with a
+  conservative floor (`PROFILER_PMU_MIN_COUNT`, 10000) -- not a
+  precisely measured threshold, just comfortably above that handler's
+  known-nontrivial cost, the same reasoning behind Linux's own
+  `perf_event_max_sample_rate`. Verified: `pmustart 8 100` and
+  `pmustart 0x11 500` both rejected with a clear message.
+- **Event IDs parsed as decimal only (finding #8).** `pmustart`'s
+  argument was always read via decimal-only parsing, despite the
+  command's own usage text showing hex event IDs -- `pmustart 11`
+  silently programmed decimal 11 (0x0B) instead of the intended
+  CPU_CYCLES (0x11), with no warning since the A72 implements both.
+  Fixed via `strtoul(..., 0)`, which auto-detects a leading `0x`.
+  Verified: `pmustart 11 ...` now reports arming event `0xb`, and
+  `pmustart 0x11 ...` reports `0x11` -- distinct and correct.
+- **`profiler fpcheck` could crash the Pi (finding #15).** Dereferenced
+  whatever a core's last-captured r7/r11 happened to hold; at `-O2`
+  those are ordinary registers, so a garbage value (e.g. a loop
+  counter) pointed at unmapped memory and the resulting data abort
+  hung the board. A leftover from the pre-DWARF-CFI, frame-pointer
+  stage with no use now. Removed.
+
+Phases 2-4 (report correctness, all-core-by-design sampling, the
+self-describing dump format, pre-A55-port hardening) are tracked but
+not started -- see the plan from this review for the full breakdown.
+
 ## Why Pi 4B over the Arm Cortex-A55 FVP route
 
 The FVP was investigated first and set aside for concrete, confirmed

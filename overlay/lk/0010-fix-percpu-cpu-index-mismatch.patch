@@ -1,0 +1,40 @@
+diff --git a/arch/arm/arm/exceptions.S b/arch/arm/arm/exceptions.S
+index e32a18f..8e5552a 100644
+--- a/arch/arm/arm/exceptions.S
++++ b/arch/arm/arm/exceptions.S
+@@ -204,13 +204,29 @@ FUNCTION(arm_irq)
+ 
+     /* r0 now holds pointer to iframe */
+ 
+-    /* lk-perf (stage 4): compute this core's index using the exact
+-     * same MPIDR-masking instruction arch_curr_cpu_num() compiles to
+-     * (arch/arm/include/arch/arch_ops.h) -- read from this build's own
+-     * lk.elf.debug.lst, not re-derived by hand, so this can never
+-     * disagree with the C-side per-CPU array indexing. */
++    /* lk-perf (stage 4, fixed): compute this core's index using the
++     * SAME expression as arch_curr_cpu_num() (arch/arm/include/arch/
++     * arch_ops.h), built from the identical SMP_CPU_ID_BITS/
++     * SMP_CPU_CLUSTER_SHIFT build-time macros instead of a hardcoded
++     * mask snapshotted from one past build's disassembly. The earlier
++     * `bic r3, r3, #0xff000000` matched only because that snapshot was
++     * taken when SMP_CPU_ID_BITS was still 24 (the pre-rpi4 QEMU
++     * default, arch/arm/rules.mk); platform/bcm28xx/rules.mk sets it to
++     * 8 for rpi4, which changes arch_curr_cpu_num()'s real formula to
++     * plain `mpidr & 0xff` -- the two only ever agreed on this board
++     * because BCM2711's MPIDR happens to have zero bits in [23:8], not
++     * because the mask was actually equivalent. A target whose MPIDR
++     * uses those bits (e.g. a real Aff1 cluster field) would silently
++     * index a different per-CPU slot in this assembly than the C side
++     * uses to read it back, corrupting profiler_fp_r7/r11 across cores
++     * with no build-time or runtime signal that anything was wrong. */
+     mrc     p15, 0, r3, c0, c0, 5      /* MPIDR */
+-    bic     r3, r3, #0xff000000        /* matches arch_curr_cpu_num() exactly */
++    LOADCONST(r1, ((1 << SMP_CPU_ID_BITS) - 1))
++    and     r1, r3, r1                 /* mpidr & ((1<<SMP_CPU_ID_BITS)-1) */
++    lsr     r1, r1, #8
++    lsl     r1, r1, #SMP_CPU_CLUSTER_SHIFT
++    and     r3, r3, #0xff              /* mpidr & 0xff */
++    orr     r3, r3, r1                 /* == arch_curr_cpu_num() */
+     lsl     r3, r3, #2                 /* word index -> byte offset */
+ 
+     /* stash the interrupted r7/r11 (Thumb/ARM frame-pointer candidates)

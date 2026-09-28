@@ -1,0 +1,35 @@
+diff --git a/lib/io/console.c b/lib/io/console.c
+index 86a0a40..bfac6a8 100644
+--- a/lib/io/console.c
++++ b/lib/io/console.c
+@@ -50,20 +50,25 @@ cbuf_t console_input_cbuf;
+ static uint8_t console_cbuf_buf[CONSOLE_BUF_LEN];
+ #endif // CONSOLE_HAS_INPUT_BUFFER
+ 
+-/* print lock must be held when invoking out, outs, outc */
++/* Its one caller (__debug_stdio_write, below) is only ever reached through
++ * vfprintf(), which already holds print_spin_lock via console_print_lock()
++ * for the entire call (see that lock's own comment above) -- so this must
++ * NOT take it again here. print_spin_lock isn't a recursive lock, and
++ * doing so deadlocked the calling core solid the moment anything ever
++ * registers a print callback (register_print_callback()), since the
++ * list-walk below is then the only thing standing inside a lock the same
++ * core already holds. Confirmed on real rpi4 hardware: the fix that added
++ * console_print_lock() removed the ONLY thing that used to make this
++ * inner lock necessary, and left it in by mistake. */
+ static void out_count(const char *str, size_t len) {
+     print_callback_t *cb;
+ 
+     /* print to any registered loggers */
+     if (!list_is_empty(&print_callbacks)) {
+-        arch_interrupt_saved_state_t state = spin_lock_irqsave(&print_spin_lock);
+-
+         list_for_every_entry(&print_callbacks, cb, print_callback_t, entry) {
+             if (cb->print)
+                 cb->print(cb, str, len);
+         }
+-
+-        spin_unlock_irqrestore(&print_spin_lock, state);
+     }
+ 
+ #if CONSOLE_OUTPUT_TO_PLATFORM_PUTC
