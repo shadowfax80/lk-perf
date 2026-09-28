@@ -515,46 +515,51 @@ privilege to do so was never available on this boot chain in the first
 place. Attempting it isn't a "todo"; it's out of reach for this
 specific validation environment regardless of effort spent.
 
-**This is a fact about the Pi validation environment, not a
-demonstrated fact about the target platform.** A cellular baseband processor
-almost certainly has its own real secure-boot chain, for reasons
-unrelated to profiling (DRM, crypto, radio certification) -- unlike
-this from-scratch bare-metal Pi bring-up, which never had one. Whether
-the target platform's actual boot chain grants its own OS/RTOS the secure access
-FIQ or pseudo-NMI sampling would need is a genuinely open question,
-not something this project can answer from the Pi side. Don't read
-"lk-perf hit this limitation on the Pi" as "the target platform also has this
-limitation" -- that would need checking on the real target, separately.
+**Confirmed (2026-09-28): the target platform runs in Secure mode, always AArch32
+SVC.** This directly answers the question above, not just narrows it.
+the target platform's RTOS has exactly the privilege this Pi bring-up never had --
+Secure-state access to reconfigure `GICD_IGROUPRn` and assign the PMU's
+overflow interrupt to Group 0/FIQ, which is precisely the mechanism
+that bypasses `CPSR.I` masking. **This gap is real and permanent on
+the Pi, but not on the target platform** -- it's specific to this validation
+environment's non-secure boot chain, not to the sampling mechanism
+itself, exactly as suspected but now confirmed rather than assumed.
+"Always SVC" is also a direct, useful cross-check on this project's
+own design: this Pi bring-up's interrupted-SP derivation (`frame + 1`,
+see the M5 section above) and its `usp`/`ulr`-are-dead-registers
+finding both depend on threads never leaving SVC mode -- the target platform
+sharing that property means this specific piece of the mechanism
+transfers as validated, not just as a hopeful analogy.
 
 **The position:**
 1. Document the blind spot as a known, quantified bias in every report
    from this profiler, not a blocker to using it. Every statistical
    sampling profiler has *some* systematic bias; the useful move is
    making this one visible, not pretending it doesn't exist.
-2. Don't attempt FIQ/pseudo-NMI on the Pi. It's not reachable from a
-   non-secure boot chain here, and even if it were, the result
-   wouldn't transfer to the target platform anyway -- the target platform's own GIC
-   configuration, secure boot chain, and RTOS are all different from
-   LK-on-Pi, so this would need its own, separate implementation on the
-   real target regardless of what happened here. Spending real effort
-   defeating a non-secure boot chain on validation hardware, for a
-   capability that has to be rebuilt from scratch on the actual target
-   anyway, is effort spent on the wrong side of the port.
+2. Still don't attempt FIQ/pseudo-NMI *on the Pi*. The GIC-group
+   reconfiguration it needs is genuinely unreachable from this specific
+   non-secure boot chain regardless of effort spent -- that fact hasn't
+   changed. What has changed is why it's not worth building here even
+   in principle: the target platform's own GIC configuration and RTOS are
+   different enough from LK-on-Pi that the actual implementation has to
+   be written for that target directly, not ported from here.
 3. What *is* worth building here, being genuinely cheap and actually
-   informative: a running counter of total cycles spent with interrupts
-   masked (hook the same `spin_lock_irqsave`/IRQ-entry paths already
-   instrumented for other reasons), reported alongside every `profiler
-   stat`/`dump` -- turning "some unknown fraction of this run was
-   invisible to sampling" into a real number, the same way `perf`
-   itself reports lost/dropped samples rather than staying silent about
-   them. Not built yet; a reasonable next small addition, distinct from
-   trying to close the gap itself.
-4. When this work reaches the target platform's real target, the first question to
-   check there -- before assuming either way -- is whether its boot
-   chain grants secure/TrustZone access an RTOS profiler could use for
-   FIQ or priority-based sampling. If yes, that closes this gap for
-   real, on the target that actually matters, in a way the Pi never
-   could validate.
+   informative regardless of target: a running counter of total cycles
+   spent with interrupts masked (hook the same
+   `spin_lock_irqsave`/IRQ-entry paths already instrumented for other
+   reasons), reported alongside every `profiler stat`/`dump` -- turning
+   "some unknown fraction of this run was invisible to sampling" into a
+   real number, the same way `perf` itself reports lost/dropped
+   samples rather than staying silent about them. Not built yet; a
+   reasonable next small addition, distinct from closing the gap itself.
+4. **Real action item for the eventual the target platform port, not just a
+   question to check anymore**: implement FIQ-routed (or priority-based)
+   PMU sampling there, using this Pi's `profiler pmustart`/`pmustop` as
+   the reference for the counter-programming/overflow-handling side
+   (identical PMU architecture) while writing target-platform-specific code for
+   the interrupt-group/FIQ-vector side this Pi categorically can't
+   exercise. This closes the blind spot for real, on the target that
+   actually matters -- confirmed feasible, not just hoped for.
 
 ## Why Pi 4B over the Arm Cortex-A55 FVP route
 
