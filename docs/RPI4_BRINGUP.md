@@ -223,27 +223,66 @@ Revised scope, closest analogue to `perf` noted per item:
    register-resident loop touching one `volatile` variable should
    produce). `app/profiler/profiler.c`'s `pmu` command message updated
    to stop implying this is still an open question on real hardware --
-   only the PMU *interrupt* path (event-overflow sampling, step 4
-   below) remains unverified here.
-
-   Still open: confirm on this hardware whether BCM2711's PMU
-   interrupt is a per-core SPI or a shared PPI -- the M4-style DTB
-   `arm-pmu` node parsing needs to know which, for step 4.
+   only the PMU *interrupt* path (event-overflow sampling) remained
+   unverified at the time this was written -- see item 5, also now done.
 4. **`profiler report`/`annotate` (symbols + source lines +
    instruction-level hotspots).** Nearest-symbol lookup exists; add
    `.debug_line` for source-line attribution, and use the ELF's
    `$t`/`$a` mapping symbols to disassemble each region in the correct
    instruction set. `perf script`-compatible output would let existing
    viewers (FlameGraph, Firefox Profiler, hotspot) consume it directly.
-5. **PMU-event sampling**, alongside (not instead of) timer sampling,
-   plus an explicit, documented position on the interrupts-masked blind
-   spot: timer-IRQ sampling can't fire while interrupts are masked, so
-   critical sections and ISRs get no samples and their time is
-   misattributed to whatever runs right after unmasking. Linux covers
-   this with FIQ/pseudo-NMI; LK on the Pi runs non-secure and can't
-   configure the GIC for FIQ delivery the way the target platform's real boot chain
-   probably can -- worth deciding explicitly rather than leaving it as
-   an unstated bias in the numbers.
+5. **PMU-event sampling. Done and confirmed working on real hardware
+   (2026-09-28, commits `e9ed753`/`6aebf9c`).** `profiler pmustart
+   <event> <count>` / `pmustop`: a real second sampling mode alongside
+   timer-tick (`start`/`stop`), sharing the same ring buffers -- "sample
+   every N occurrences of event X" instead of "sample every timer
+   tick", the actual capability that separates this from a plain
+   statistical profiler.
+
+   BCM2711's PMU interrupt is **not** a PPI like the timer -- confirmed
+   from the real Raspberry Pi kernel's own device tree source
+   (bcm2711.dtsi): 4 separate per-core SPIs (`GIC_SPI 16-19` = real GIC
+   IDs 48-51), each explicitly affinity-bound to one CPU. Getting this
+   working needed two fixes neither hardware bring-up here had hit
+   before, since every prior IRQ (timer, UART) was either a PPI or a
+   single shared SPI:
+   - `dev/interrupt/arm_gic/gic_v2.c`'s GIC init routes **every** SPI to
+     CPU0 by default -- without reprogramming `GICD_ITARGETSR`, all 4
+     PMU interrupts would land on core 0 regardless of which core's
+     counter actually overflowed. Fixed with one register write (all 4
+     IDs share one `ITARGETSR` register).
+   - The same GIC init also configures **every** SPI as edge-triggered
+     by default, but the PMU's overflow signal is level (stays asserted
+     until software clears `PMOVSR`), matching the DTB's own
+     `IRQ_TYPE_LEVEL_HIGH`. Left at the GIC's edge default, it silently
+     never fired -- confirmed the hard way: the first real hardware
+     attempt ran clean, no crash, correct routing, and produced exactly
+     zero samples. Fixed by calling `gic_configure_interrupt()`
+     (a real function, just missing from `arm_gic.h`'s own public
+     declarations -- added the `extern` in `profiler.c`) to explicitly
+     set `IRQ_TRIGGER_MODE_LEVEL` before unmasking.
+
+   Real result after both fixes: `profiler pmustart 8 100000` (event
+   0x08 = INST_RETIRED, every 100,000 instructions) through `profiler
+   bench 5000000`: 1599 samples, split 800/799 between
+   `profiler_workload_a`/`profiler_workload_b` -- exactly the two
+   functions `bench` alternates between -- all correctly unwound to
+   the expected 2-frame chain, timestamps evenly spaced (consistent
+   with a steady instruction-retirement rate).
+
+   Single-core only in this version, explicitly scoped: PMU control
+   registers are banked per-core in hardware, so arming every core
+   needs cross-core signaling (e.g. an SGI to each core) this doesn't
+   do yet. One event at a time, correctly wired end to end, first --
+   multi-event multiplexing remains out of scope per the original plan.
+
+   Still open, not addressed by this: an explicit, documented position
+   on the interrupts-masked blind spot -- timer-IRQ *and* PMU-IRQ
+   sampling both can't fire while interrupts are masked, so critical
+   sections and ISRs get no samples and their time is misattributed to
+   whatever runs right after unmasking. Linux covers this with
+   FIQ/pseudo-NMI; LK on the Pi runs non-secure and can't configure the
+   GIC for FIQ delivery the way the target platform's real boot chain probably can.
 6. **How samples leave the device.** UART at 115200 baud is ~11 KiB/s --
    fine for a small image, a real bottleneck for the sample dumps this
    plans for (M5's richer per-sample record puts a full 4-core buffer
