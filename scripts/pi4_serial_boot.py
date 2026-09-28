@@ -5,7 +5,8 @@ terminal -- the edit/build/test loop without moving the SD card.
 
 The chainloader prints "SBOOT?" once a second while it waits. This
 script waits for that prompt (power-cycle the Pi if it's currently
-running an earlier payload), sends "LKBT" <size:u32 LE> <crc32:u32 LE>,
+running an earlier payload, or pass --reboot to have a running
+TARGET=rpi4 LK image reset itself back into the chainloader), sends "LKBT" <size:u32 LE> <crc32:u32 LE>,
 waits for "OK", streams the image, and waits for "CRC OK". After that
 everything the Pi prints goes to stdout (and --log, if given), and
 lines typed here are sent to the Pi with a CR, which is enough for
@@ -112,6 +113,34 @@ def wait_for(port: serial.Serial, console: Console, want: tuple[str, ...],
             console.write((line + "\n").encode())
 
 
+def reboot_to_chainloader(port: serial.Serial, console: Console,
+                          lk_baud: int, probe: float = 2.5) -> None:
+    """If a TARGET=rpi4 LK image is running instead of the chainloader,
+    send it `reboot` (PM-watchdog SoC reset, overlay patch 0008) so the
+    firmware boots the SD-card chainloader again -- no power-cycle.
+    Leaves the port at its original (chainloader) baud either way."""
+    loader_baud = port.baudrate
+    deadline = time.monotonic() + probe
+    while time.monotonic() < deadline:
+        line = read_line(port, deadline)
+        if line is not None and line.startswith("SBOOT?"):
+            print("chainloader already waiting; no reboot needed")
+            return
+
+    print(f"no chainloader prompt; sending `reboot` to LK at {lk_baud} baud")
+    port.baudrate = lk_baud
+    port.reset_input_buffer()
+    port.write(b"\rreboot\r")
+    port.flush()
+    end = time.monotonic() + 0.5
+    while time.monotonic() < end:
+        data = port.read(port.in_waiting or 1)
+        if data:
+            console.write(data)
+    port.baudrate = loader_baud
+    port.reset_input_buffer()
+
+
 def send_image(port: serial.Serial, console: Console, image: bytes,
                wait: float | None) -> None:
     print(f"waiting for the chainloader on {port.port} "
@@ -184,6 +213,9 @@ def main() -> None:
                     help="seconds to wait for the SBOOT? prompt (default: forever)")
     ap.add_argument("--no-term", action="store_true",
                     help="exit once the image is running instead of staying attached")
+    ap.add_argument("--reboot", action="store_true",
+                    help="if LK is running (no SBOOT? prompt), send it `reboot` "
+                         "first instead of waiting for a manual power-cycle")
     args = ap.parse_args()
 
     with open(args.image, "rb") as f:
@@ -200,6 +232,8 @@ def main() -> None:
 
     with port:
         port.reset_input_buffer()
+        if args.reboot:
+            reboot_to_chainloader(port, console, args.post_jump_baud)
         send_image(port, console, image, args.wait)
         if args.post_jump_baud != args.baud:
             port.baudrate = args.post_jump_baud

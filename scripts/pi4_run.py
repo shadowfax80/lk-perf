@@ -25,7 +25,7 @@ except ImportError:
     sys.exit("error: pyserial is required (python -m pip install pyserial)")
 
 sys.path.insert(0, str(Path(__file__).parent))
-from pi4_serial_boot import Console, resolve_port, send_image
+from pi4_serial_boot import Console, reboot_to_chainloader, resolve_port, send_image
 
 
 def run_command(port: serial.Serial, console: Console, cmd: str,
@@ -61,6 +61,9 @@ def main() -> None:
                     help="seconds of silence that mark a command's output as done")
     ap.add_argument("--max-wait", type=float, default=15.0,
                     help="max seconds to wait for any single command")
+    ap.add_argument("--reboot", action="store_true",
+                    help="if LK is running (no SBOOT? prompt), send it `reboot` "
+                         "first instead of waiting for a manual power-cycle")
     args = ap.parse_args()
 
     with open(args.image, "rb") as f:
@@ -77,6 +80,8 @@ def main() -> None:
 
     with port:
         port.reset_input_buffer()
+        if args.reboot:
+            reboot_to_chainloader(port, console, args.post_jump_baud)
         send_image(port, console, image, args.wait)
 
         if args.post_jump_baud != args.baud:

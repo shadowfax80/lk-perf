@@ -561,6 +561,51 @@ transfers as validated, not just as a hopeful analogy.
    exercise. This closes the blind spot for real, on the target that
    actually matters -- confirmed feasible, not just hoped for.
 
+## Software reboot (2026-09-28)
+
+LK's generic `reboot`/`poweroff` shell commands existed but did nothing
+on bcm28xx: the platform never overrode `platform_halt()`, so both fell
+through to "HALT: spinning forever". `overlay/lk/0008-bcm28xx-watchdog-reboot.patch`
+fixes that with the PM block watchdog, the same sequence Linux's
+`bcm2835_wdt` restart handler uses (the only software-reachable
+full-SoC reset on these parts):
+
+- **reboot**: `PM_WDOG = PASSWORD | 10` (~150us at 65536 ticks/s), then
+  `PM_RSTC.WRCFG = full reset`. PM is at phys `0xFE100000`, inside the
+  existing 64MB low-peripheral mapping (VA `0xE2100000`) -- no new
+  mapping needed, and it's reachable from non-secure SVC.
+- **poweroff**: first sets `PM_RSTS` to partition 63 (`0x555`), the
+  firmware's "halt, don't boot" marker, then the same reset. **Built but
+  not hardware-tested** -- recovering from it needs a physical
+  power-cycle.
+- `uart_flush_tx()` was an empty stub in the PL011 driver; it now waits
+  for TXFE and !BUSY, so the "Rebooting..." line isn't cut off by the
+  reset.
+- `platform_halt` is declared `__WEAK` in `platform.h` itself, so both
+  this and `platform/power.c`'s default are weak and link order picks
+  one -- the same pattern other LK platforms rely on. Confirmed from
+  `lk.elf`'s disassembly that the linked copy is the bcm28xx one (it
+  passes both hooks to `platform_halt_default`).
+
+After the reset the firmware boots the SD card again, i.e. the serial
+chainloader, which prompts `SBOOT?` at 115200 -- so a reboot replaces
+the manual power-cycle between test images. `pi4_serial_boot.py` and
+`pi4_run.py` take `--reboot`: they listen for `SBOOT?` for 2.5s, and if
+it doesn't show (so LK is running), send `reboot` at the LK baud
+(3,000,000), drop back to 115200 and load as usual.
+
+**Verified on the real Pi 4B:** after one initial power-cycle, `reboot`
+printed `Rebooting, reason 'software reset'` in full and the chainloader
+came back by itself; then 3/3 consecutive `pi4_run.py --reboot` cycles
+(detect running LK -> reboot -> chainloader banner -> reload -> shell
+command) with no power-cycle, ~18s each end to end (the image transfer
+at 115200 is most of that). The line can carry one NUL byte during
+the reset, harmless but it makes `grep` treat logs as binary (`grep -a`).
+
+A manual power-cycle is still needed when the Pi is hung, when the
+running image isn't a TARGET=rpi4 LK build with this patch, or after
+`poweroff`.
+
 ## Why Pi 4B over the Arm Cortex-A55 FVP route
 
 The FVP was investigated first and set aside for concrete, confirmed
@@ -771,7 +816,8 @@ cd build/lk && make rpi4-test -j$(nproc)            # -> build-rpi4-test/lk.bin
 # serial PC
 scp -P <port> root@<pod-ip>:lk-perf/build/lk/build-rpi4-test/lk.bin .
 python scripts/pi4_serial_boot.py lk.bin --log lk-rpi4.log      # port auto-detected
-# then power-cycle the Pi
+# then power-cycle the Pi -- or, if a TARGET=rpi4 LK image is already
+# running, add --reboot and no power-cycle is needed (see "Software reboot")
 ```
 
 `lk.bin` is the raw image LK builds next to `lk.elf`, linked to run at
@@ -871,10 +917,8 @@ step 6 (real PMU events via `PMCEID0`/`PMCEID1`). They're listed under
 
 ### Things that would make iteration faster (optional)
 
-- A `reboot` shell command in LK: write the BCM2711 PM watchdog, `PM_RSTC`
-  and `PM_WDOG` at peripheral base `+0x100000`. Pi then comes back to
-  `SBOOT?` without a physical power-cycle, and the host script could
-  trigger it itself.
+- ~~A `reboot` shell command in LK~~ -- **done 2026-09-28**, see
+  "Software reboot" below.
 - A faster baud rate in the chainloader and script. The UART clock is
   already 48MHz, so 921600 is `IBRD=3`/`FBRD=16`. This needs a
   bootloader update on the SD card.

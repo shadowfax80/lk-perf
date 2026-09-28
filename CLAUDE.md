@@ -23,9 +23,15 @@ Don't start porting work until `--boot-test` shows the heartbeat.
   It doesn't change during normal work; images go over the USB-serial
   cable with `scripts/pi4_serial_boot.py <image> --log <file>`. The port
   is auto-detected.
-- There's no reset line, so **the user power-cycles the Pi by hand**.
-  Ask them to, then read the log. Don't claim the Pi rebooted until the
-  log shows the chainloader banner.
+- There's no reset line. If a TARGET=rpi4 LK image is running, pass
+  `--reboot` to `pi4_serial_boot.py`/`pi4_run.py`: LK resets itself via
+  the PM watchdog (overlay patch 0008) back into the chainloader.
+  Otherwise (Pi hung, other payload, after `poweroff`) **the user
+  power-cycles the Pi by hand**: ask them to, then read the log. Either
+  way, don't claim the Pi rebooted until the log shows the chainloader
+  banner.
+- Use `python3` on this Windows machine: it's the interpreter with
+  pyserial installed (`python` is a different install without it).
 - One program per serial port: close PuTTY before running the scripts,
   and stop the scripts before the user opens PuTTY or moves the Pi.
 - Nothing writes the SD card at runtime, so unplugging the Pi is always
