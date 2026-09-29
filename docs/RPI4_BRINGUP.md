@@ -606,6 +606,43 @@ A manual power-cycle is still needed when the Pi is hung, when the
 running image isn't a TARGET=rpi4 LK build with this patch, or after
 `poweroff`.
 
+## UART baud doubled to 6,000,000, no reflash (2026-09-29)
+
+The prior 3,000,000 baud (see UART baud calibration above) depended on
+the chainloader's own hardcoded mailbox clock request (48MHz,
+`experiments/pi4-serialboot/main.c`) -- only the SD-card-flashed
+chainloader could change that, needing a reflash. `overlay/lk/
+0011-uart-higher-baud-no-reflash.patch` instead has **LK make its own
+mailbox "set clock rate" request at its own boot** (`bcm2711_set_uart_clock()`,
+requesting 96MHz, in `platform/bcm28xx/platform.c`), before programming
+`IBRD=1`/`FBRD=0` -- the same clean exact-divide relationship as the
+original 48MHz/3,000,000 pairing. The chainloader itself is completely
+unchanged; raising the baud further only ever needs a new LK build sent
+over serial.
+
+IBRD/FBRD are computed generically from whatever clock the firmware
+*actually* granted (read back from the mailbox response, not assumed),
+with an explicit fallback to the original 48MHz/3,000,000 configuration
+if the firmware ever grants less than the new target needs. LK runs
+with the MMU and caches already on by this point (unlike the bare
+chainloader), so the request buffer needs explicit
+`arch_clean_cache_range`/`arch_invalidate_cache_range` and its address
+converted to a VideoCore bus address, not passed as a raw kernel
+virtual pointer -- getting this wrong would have the VideoCore reading
+the wrong physical memory entirely.
+
+**Confirmed on real hardware**: clean boot banner and shell round-trip
+at 6,000,000 baud on first attempt, then a 796-sample (~296KB)
+`profiler dump` transfer with zero corruption and exactly one `SAMPLE
+done` marker.
+
+**Deliberately not pushed further**: a further doubling to 12,000,000
+(192MHz, same clean pattern) was considered and explicitly not
+attempted -- 1,000,000 and 1,500,000 baud, also exact divisors, already
+failed to sync on this adapter at the old 48MHz clock while 3,000,000
+worked, so 12,000,000 is a genuine unknown, not a predictable next
+step. 6,000,000 is the settled rate.
+
 ## Code review, Phase 1 fixes (2026-09-28)
 
 A full code review of the project (profiler app, all LK patches, host

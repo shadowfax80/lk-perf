@@ -1,0 +1,111 @@
+diff --git a/platform/bcm28xx/platform.c b/platform/bcm28xx/platform.c
+index 92a006d..4807163 100644
+--- a/platform/bcm28xx/platform.c
++++ b/platform/bcm28xx/platform.c
+@@ -12,6 +12,7 @@
+ 
+ #include <dev/uart.h>
+ #include <arch.h>
++#include <arch/ops.h>
+ #include <lk/init.h>
+ #include <kernel/vm.h>
+ #include <kernel/spinlock.h>
+@@ -216,11 +217,96 @@ LK_INIT_HOOK(bcm2711_gic_init, bcm2711_gic_init, LK_INIT_LEVEL_VM);
+ #define UART0_CR    (*(volatile uint32_t *)(UART0_BASE + 0x30))
+ #define UART0_FR_BUSY (1u << 3)
+ 
++// Target for the higher-baud attempt below: 6,000,000 needs a 96MHz UART
++// clock for an exact IBRD=1/FBRD=0 divide (mirroring the already-verified
++// 48MHz/3,000,000 relationship exactly -- see bcm2711_uart_speed_init()'s
++// own comment for why the code computes this generically rather than
++// assuming the constant here was actually granted).
++#define BCM2711_UART_TARGET_CLOCK_HZ 96000000u
++#define BCM2711_UART_TARGET_BAUD     6000000u
++#define BCM2711_UART_FALLBACK_CLOCK_HZ 48000000u
++
++#define BCM2711_MBOX_FULL  0x80000000u
++#define BCM2711_MBOX_EMPTY 0x40000000u
++
++// Requests a UART clock rate from the VideoCore firmware and returns the
++// rate it actually granted -- the exact same property-tag mailbox
++// mechanism experiments/pi4-serialboot's own mbox_set_uart_clock()
++// already proves works on this board, just issued here, at LK's own
++// boot, instead of baked into the chainloader binary. That means
++// raising the baud rate needs only a new LK build sent over serial,
++// never an SD-card reflash: the chainloader keeps setting 48MHz for
++// its own fixed 115200 handshake exactly as before, and LK simply
++// re-requests a different rate for itself once it's running, before
++// the chainloader's own image-transfer work is even relevant anymore.
++//
++// Unlike the chainloader (MMU off, caches off), LK is already running
++// with the MMU on and caches enabled by this point --
++// mmu_initial_mappings[] is parsed by start.S before any C code runs
++// -- so the request buffer needs an explicit cache clean before the
++// VideoCore reads it and an invalidate before this code reads the
++// response back, the same pattern mailbox.c's own
++// mailbox_get_framebuffer() already uses. The mailbox address itself
++// must be the VideoCore BUS address (mask to the low 30 bits, add
++// BCM_SDRAM_BUS_ADDR_BASE), not the raw kernel virtual pointer --
++// using the virtual pointer directly would have the VideoCore reading
++// from the wrong physical memory entirely.
++static uint32_t bcm2711_set_uart_clock(uint32_t hz) {
++    static volatile uint32_t __ALIGNED(16) mbox[9];
++    mbox[0] = 9 * 4;
++    mbox[1] = 0;
++    mbox[2] = 0x00038002;   // tag: set clock rate
++    mbox[3] = 12;
++    mbox[4] = 8;
++    mbox[5] = 2;            // clock id: UART
++    mbox[6] = hz;
++    mbox[7] = 0;
++    mbox[8] = 0;
++
++    arch_clean_cache_range((addr_t)mbox, sizeof(mbox));
++
++    uint32_t bus_addr = ((uint32_t)(uintptr_t)mbox & 0x3fffffff) + BCM_SDRAM_BUS_ADDR_BASE;
++
++    while (*REG32(ARM0_MAILBOX_STATUS) & BCM2711_MBOX_FULL) {}
++    *REG32(ARM0_MAILBOX_WRITE) = (bus_addr & ~0xFu) | 8u;  // channel 8: property tags, ARM->VC
++
++    for (;;) {
++        while (*REG32(ARM0_MAILBOX_STATUS) & BCM2711_MBOX_EMPTY) {}
++        if ((*REG32(ARM0_MAILBOX_READ) & 0xFu) == 8u) {
++            break;
++        }
++    }
++
++    arch_invalidate_cache_range((addr_t)mbox, sizeof(mbox));
++    return mbox[6];
++}
++
+ static void bcm2711_uart_speed_init(void) {
++    uint32_t clock_hz = bcm2711_set_uart_clock(BCM2711_UART_TARGET_CLOCK_HZ);
++    uint32_t ibrd, fbrd;
++
++    if (clock_hz >= 16u * BCM2711_UART_TARGET_BAUD) {
++        // Computed from whatever the firmware actually granted, not the
++        // bare request above -- the property-tag interface can clamp to
++        // whatever rate its clock generator can really produce.
++        uint32_t div16 = 16u * BCM2711_UART_TARGET_BAUD;
++        uint32_t rem = clock_hz % div16;
++        ibrd = clock_hz / div16;
++        fbrd = (rem * 64u + div16 / 2u) / div16;  // round to nearest
++    } else {
++        // Firmware couldn't grant enough clock for the target baud at
++        // all -- fall back to the known-good, previously
++        // hardware-verified 48MHz/3,000,000 configuration instead of
++        // silently running at some untested rate.
++        clock_hz = bcm2711_set_uart_clock(BCM2711_UART_FALLBACK_CLOCK_HZ);
++        ibrd = 1;
++        fbrd = 0;
++    }
++
+     while (UART0_TFR & UART0_FR_BUSY) {}
+     UART0_CR = 0;
+-    UART0_IBRD = 1;
+-    UART0_FBRD = 0;
++    UART0_IBRD = ibrd;
++    UART0_FBRD = fbrd;
+     UART0_LCRH = (1 << 4) | (3 << 5);  // FIFO enable, 8N1 -- latches IBRD/FBRD
+     UART0_CR = (1 << 0) | (1 << 8) | (1 << 9);  // uarten, txe, rxe
+ }
