@@ -42,32 +42,89 @@ from dwarf_unwind import (
 )
 
 SAMPLE_RE = re.compile(
-    r"SAMPLE cpu=(?P<cpu>\d+) pc=(?P<pc>[0-9a-fA-F]+) lr=(?P<lr>[0-9a-fA-F]+) "
-    r"fp=(?P<fp>[0-9a-fA-F]+) sp=(?P<sp>[0-9a-fA-F]+) spsr=(?P<spsr>[0-9a-fA-F]+) "
-    r"tid=(?P<tid>[0-9a-fA-F]+) ts=(?P<ts>[0-9a-fA-F]+)(?: stack=(?P<stack>[0-9a-fA-F]+))?"
+    r"SAMPLE seq=(?P<seq>[0-9a-fA-F]+) cpu=(?P<cpu>\d+) pc=(?P<pc>[0-9a-fA-F]+) "
+    r"lr=(?P<lr>[0-9a-fA-F]+) fp=(?P<fp>[0-9a-fA-F]+) sp=(?P<sp>[0-9a-fA-F]+) "
+    r"spsr=(?P<spsr>[0-9a-fA-F]+) tid=(?P<tid>[0-9a-fA-F]+) ts=(?P<ts>[0-9a-fA-F]+) "
+    r"stack=(?P<stack>[0-9a-fA-F]+) crc=(?P<crc>[0-9a-fA-F]+)"
 )
 
 SPSR_T_BIT = 1 << 5  # Thumb state -- same bit app/profiler.c reads
 
 
+def _sample_checksum(cpu: int, seq: int, pc: int, lr: int, fp: int, sp: int,
+                      spsr: int, tid: int, ts: int, stack: bytes) -> int:
+    """Exact mirror of profiler.c's profiler_sample_checksum() -- FNV-1a-style,
+    folding each binary field into a running multiply-xor state. See that
+    function's own comment for the algorithm and why it's over binary
+    values, not the printed hex text."""
+    c = 0x811c9dc5
+
+    def mix(v: int) -> None:
+        nonlocal c
+        c = ((c ^ (v & 0xffffffff)) * 16777619) & 0xffffffff
+
+    mix(cpu); mix(seq); mix(pc); mix(lr); mix(fp); mix(sp); mix(spsr); mix(tid)
+    mix(ts & 0xffffffff); mix((ts >> 32) & 0xffffffff)
+    for b in stack:
+        mix(b)
+    return c
+
+
 def parse_samples(log_path: str) -> list[dict]:
+    """Parses "SAMPLE ..." lines, verifying each one's seq/crc fields.
+
+    Found on real hardware (2026-09-29): a sustained UART transfer of a
+    large dump occasionally corrupts a byte with an exact 64-byte
+    period (a USB packet-boundary artifact in the host's serial
+    adapter/driver), independent of baud rate, and not fixable by a
+    settling delay since it recurs throughout a long continuous burst.
+    Most such corruption already breaks hex-parseability (a NUL byte
+    isn't a valid hex digit) and gets silently dropped by this regex
+    not matching at all -- `seq` (a plain per-dump counter) turns that
+    silent drop into a countable gap. `crc` additionally catches a
+    corrupted-but-still-valid-hex line (e.g. one digit flipped to
+    another), which the regex alone can never detect. Either way the
+    affected sample is dropped, not trusted -- the same "count it,
+    don't crash on it" resilience already used for a failed unwind
+    (review finding #12), not a reason to abort the whole report.
+    """
     samples = []
+    expected_seq = 0
+    crc_mismatches = 0
+    seq_gaps = 0
     with open(log_path, "r", errors="replace") as f:
         for line in f:
             m = SAMPLE_RE.search(line)
             if not m:
                 continue
+            seq = int(m["seq"], 16)
+            if seq != expected_seq:
+                seq_gaps += max(seq - expected_seq, 1)
+            expected_seq = seq + 1
+
+            try:
+                stack = bytes.fromhex(m["stack"])
+            except ValueError:
+                crc_mismatches += 1
+                continue
+
+            cpu, pc, lr = int(m["cpu"]), int(m["pc"], 16), int(m["lr"], 16)
+            fp, sp = int(m["fp"], 16), int(m["sp"], 16)
+            spsr, tid, ts = int(m["spsr"], 16), int(m["tid"], 16), int(m["ts"], 16)
+            expected_crc = _sample_checksum(cpu, seq, pc, lr, fp, sp, spsr, tid, ts, stack)
+            if int(m["crc"], 16) != expected_crc:
+                crc_mismatches += 1
+                continue
+
             samples.append({
-                "cpu": int(m["cpu"]),
-                "pc": int(m["pc"], 16),
-                "lr": int(m["lr"], 16),
-                "fp": int(m["fp"], 16),
-                "sp": int(m["sp"], 16),
-                "spsr": int(m["spsr"], 16),
-                "tid": int(m["tid"], 16),
-                "ts": int(m["ts"], 16),
-                "stack": bytes.fromhex(m["stack"]) if m["stack"] else b"",
+                "cpu": cpu, "pc": pc, "lr": lr, "fp": fp, "sp": sp,
+                "spsr": spsr, "tid": tid, "ts": ts, "stack": stack,
             })
+
+    if crc_mismatches or seq_gaps:
+        print(f"warning: {crc_mismatches} sample(s) failed their checksum, "
+              f"{seq_gaps} sample(s) missing entirely (seq gap) -- both "
+              f"dropped, not trusted", file=sys.stderr)
     return samples
 
 

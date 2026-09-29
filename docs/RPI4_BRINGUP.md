@@ -633,8 +633,11 @@ the wrong physical memory entirely.
 
 **Confirmed on real hardware**: clean boot banner and shell round-trip
 at 6,000,000 baud on first attempt, then a 796-sample (~296KB)
-`profiler dump` transfer with zero corruption and exactly one `SAMPLE
-done` marker.
+`profiler dump` transfer with exactly one `SAMPLE done` marker. (This
+transfer was later found, on closer inspection, to have carried 2
+corrupted bytes undetected -- see "Dump integrity: seq/crc" below;
+noted here rather than silently left as an overstated "zero
+corruption" claim.)
 
 **Deliberately not pushed further**: a further doubling to 12,000,000
 (192MHz, same clean pattern) was considered and explicitly not
@@ -642,6 +645,45 @@ attempted -- 1,000,000 and 1,500,000 baud, also exact divisors, already
 failed to sync on this adapter at the old 48MHz clock while 3,000,000
 worked, so 12,000,000 is a genuine unknown, not a predictable next
 step. 6,000,000 is the settled rate.
+
+## Dump integrity: seq/crc (2026-09-29)
+
+A closer look at real captures (both 3,000,000 and 6,000,000 baud)
+found occasional byte corruption with an exact **64-byte period** --
+the USB Full-Speed bulk packet size -- clustered in bursts within a
+large, continuous, gapless print (a `profiler dump` prints hundreds of
+near-identical lines back to back with no pauses). This points to the
+host's serial adapter/driver, not this project's own UART timing: a
+settling delay right after the baud switch (`switch_baud()`, added to
+`scripts/pi4_serial_boot.py`/`pi4_run.py`) was tried first and does fix
+a *separate*, real issue right at the switch boundary, but doesn't
+touch this one -- the corruption recurs throughout a long burst, at a
+variable rate run to run (2 corrupted bytes in one capture, 18 samples'
+worth in another with the same workload), consistent with host-side
+USB/scheduling jitter rather than something a fixed delay can prevent.
+
+Most such corruption already breaks hex-parseability (a NUL byte isn't
+a valid hex digit), which `pi4_pc_histogram.py`'s regex already
+silently dropped -- but *silently*, with no way to know a sample went
+missing, and no defense at all against a bit-flip landing on another
+valid hex digit. `profiler dump` now prints two more fields per line:
+- `seq=`: a plain per-dump counter. A gap means a line was lost or
+  malformed entirely.
+- `crc=`: an FNV-1a-style hash (`profiler_sample_checksum()`) over the
+  sample's real binary fields, not the printed text -- catches a
+  corrupted-but-still-valid-hex line the regex alone could never see.
+  Mirrored exactly on the host in `pi4_pc_histogram.py`'s
+  `_sample_checksum()`; cross-checked against an independent
+  reimplementation before trusting it, since no local host compiler
+  was available to build-and-run the real C function directly.
+
+Either failure drops that one sample -- counted, not silently lost --
+same "don't trust it, don't abort the whole report" resilience already
+used for a failed unwind (review finding #12). **Verified on real
+hardware**: a capture that lost 18 samples to seq gaps (0 crc
+mismatches that run) still produced a correct report over the
+remaining 782 -- `pi4_pc_histogram.py` printed the exact loss count
+instead of the previous unexplained "790 shown vs 800 total" mismatch.
 
 ## Code review, Phase 1 fixes (2026-09-28)
 

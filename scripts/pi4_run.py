@@ -36,7 +36,7 @@ except ImportError:
     sys.exit("error: pyserial is required (python -m pip install pyserial)")
 
 sys.path.insert(0, str(Path(__file__).parent))
-from pi4_serial_boot import Console, reboot_to_chainloader, resolve_port, send_image
+from pi4_serial_boot import Console, reboot_to_chainloader, resolve_port, send_image, switch_baud
 
 PROMPT = b"] "
 
@@ -106,8 +106,7 @@ def main() -> None:
         send_image(port, console, image, args.wait)
 
         if args.post_jump_baud != args.baud:
-            port.baudrate = args.post_jump_baud
-            port.reset_input_buffer()
+            switch_baud(port, args.post_jump_baud)
 
         # Let the boot banner settle before the first command.
         if not run_command(port, console, "", args.max_wait):

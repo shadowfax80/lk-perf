@@ -627,6 +627,33 @@ static void profiler_workload_armmode(uint32_t iters) {
     profiler_sink = acc;
 }
 
+// `profiler dump`'s per-sample integrity check (see that command's own
+// comment for why): FNV-1a-style, folding each binary field into a
+// running multiply-xor state -- cheap on-target (no lookup table, one
+// multiply per field) and trivial to reproduce exactly on the host in
+// Python. Deliberately over the sample's real binary values, not the
+// printed hex text, so it catches corruption of the printed text
+// itself without caring how that text was formatted.
+static uint32_t profiler_sample_checksum(uint32_t cpu, uint32_t seq, uint32_t pc, uint32_t lr,
+                                          uint32_t fp, uint32_t sp, uint32_t spsr, uint32_t tid,
+                                          uint64_t ts, const uint8_t *stack) {
+    uint32_t c = 0x811c9dc5u;
+    c ^= cpu; c *= 16777619u;
+    c ^= seq; c *= 16777619u;
+    c ^= pc; c *= 16777619u;
+    c ^= lr; c *= 16777619u;
+    c ^= fp; c *= 16777619u;
+    c ^= sp; c *= 16777619u;
+    c ^= spsr; c *= 16777619u;
+    c ^= tid; c *= 16777619u;
+    c ^= (uint32_t)(ts & 0xffffffffu); c *= 16777619u;
+    c ^= (uint32_t)(ts >> 32); c *= 16777619u;
+    for (int i = 0; i < PROFILER_STACK_CAPTURE_BYTES; i++) {
+        c ^= stack[i]; c *= 16777619u;
+    }
+    return c;
+}
+
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
         printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|edgetest|stat|pmustart|pmustop|pmu>\n");
@@ -661,13 +688,36 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         // M5: text dump, one tagged line per sample, oldest-to-newest
         // per core -- simple and robust over the console's existing
         // printf path rather than a new binary protocol, and cheap
-        // enough at the calibrated 3,000,000 baud (see
-        // docs/RPI4_BRINGUP.md). scripts/pi4_pc_histogram.py parses
-        // the "SAMPLE " lines out of a captured log; the trailing
-        // `stack=<hex>` field is PROFILER_STACK_CAPTURE_BYTES raw
-        // bytes starting at `sp`, which the host feeds to
-        // dwarf_unwind.py's read_memory callback for real multi-frame
-        // unwinding instead of the leaf-only view earlier M5 work had.
+        // enough at the calibrated baud (see docs/RPI4_BRINGUP.md).
+        // scripts/pi4_pc_histogram.py parses the "SAMPLE " lines out of
+        // a captured log; the trailing `stack=<hex>` field is
+        // PROFILER_STACK_CAPTURE_BYTES raw bytes starting at `sp`,
+        // which the host feeds to dwarf_unwind.py's read_memory
+        // callback for real multi-frame unwinding instead of the
+        // leaf-only view earlier M5 work had.
+        //
+        // `seq`/`crc` (added 2026-09-29): a real, sustained UART
+        // transfer of a large dump was found on real hardware to
+        // occasionally corrupt a byte with an exact 64-byte period
+        // (a USB Full-Speed bulk packet boundary artifact in the
+        // host's serial adapter/driver, not something this project's
+        // own UART timing controls) -- present at both 3,000,000 and
+        // 6,000,000 baud, with no settling delay able to fix it since
+        // it recurs throughout a long continuous burst, not just at
+        // the baud-switch transient. Most such corruption already
+        // breaks hex-parseability (a NUL byte isn't a valid hex
+        // digit), which the host's regex already silently drops --
+        // but silently, with no way to know a sample went missing,
+        // and no defense at all against a bit-flip that lands on
+        // another valid hex digit. `seq` is a plain per-dump counter:
+        // a gap in the sequence means the host lost or malformed a
+        // line entirely. `crc` is a cheap FNV-1a-style hash over the
+        // sample's actual binary fields (not the printed text) --
+        // the host recomputes it from what it parsed and drops any
+        // sample where they disagree, the same "count it, don't trust
+        // it, don't abort the whole report" resilience already used
+        // for a failed unwind (review finding #12).
+        uint32_t seq = 0;
         for (int c = 0; c < SMP_MAX_CPUS; c++) {
             uint32_t count = profiler_total[c] < PROFILER_BUF_SIZE ?
                              profiler_total[c] : PROFILER_BUF_SIZE;
@@ -675,16 +725,24 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
                              0 : profiler_head[c];
             for (uint32_t n = 0; n < count; n++) {
                 uint32_t idx = (start + n) % PROFILER_BUF_SIZE;
-                printf("SAMPLE cpu=%d pc=%08x lr=%08x fp=%08x sp=%08x "
+                uint32_t pc = profiler_pc_buf[c][idx];
+                uint32_t lr = profiler_lr_buf[c][idx];
+                uint32_t fp = profiler_fp_buf[c][idx];
+                uint32_t sp = profiler_sp_buf[c][idx];
+                uint32_t spsr = profiler_spsr_buf[c][idx];
+                uint32_t tid = profiler_tid_buf[c][idx];
+                uint64_t ts = profiler_ts_buf[c][idx];
+                const uint8_t *stack = profiler_stack_buf[c][idx];
+                uint32_t crc = profiler_sample_checksum((uint32_t)c, seq, pc, lr, fp, sp,
+                                                         spsr, tid, ts, stack);
+                printf("SAMPLE seq=%08x cpu=%d pc=%08x lr=%08x fp=%08x sp=%08x "
                        "spsr=%08x tid=%08x ts=%016llx stack=",
-                       c, profiler_pc_buf[c][idx], profiler_lr_buf[c][idx],
-                       profiler_fp_buf[c][idx], profiler_sp_buf[c][idx],
-                       profiler_spsr_buf[c][idx], profiler_tid_buf[c][idx],
-                       (unsigned long long)profiler_ts_buf[c][idx]);
+                       seq, c, pc, lr, fp, sp, spsr, tid, (unsigned long long)ts);
                 for (int b = 0; b < PROFILER_STACK_CAPTURE_BYTES; b++) {
-                    printf("%02x", profiler_stack_buf[c][idx][b]);
+                    printf("%02x", stack[b]);
                 }
-                printf("\n");
+                printf(" crc=%08x\n", crc);
+                seq++;
             }
         }
         printf("SAMPLE done\n");

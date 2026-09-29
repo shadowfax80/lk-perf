@@ -113,6 +113,24 @@ def wait_for(port: serial.Serial, console: Console, want: tuple[str, ...],
             console.write((line + "\n").encode())
 
 
+def switch_baud(port: serial.Serial, new_baud: int, settle_s: float = 0.15) -> None:
+    """Switch to a new baud rate and let the USB-serial adapter/driver
+    settle before trusting anything it delivers next.
+
+    Found on real hardware (2026-09-29): a burst of corrupted bytes
+    with an exact 64-byte period -- the USB Full-Speed bulk packet
+    size -- clustered in the first few KB right after a baud switch,
+    at both 3,000,000 and 6,000,000 baud (so not specific to the
+    higher rate). Consistent with the adapter/driver still
+    reconfiguring its own UART divisor while data is already arriving
+    at the new rate. A settling delay before the input-buffer reset
+    (which then discards exactly the bytes affected) fixes this on
+    the host; no target-side change needed."""
+    port.baudrate = new_baud
+    time.sleep(settle_s)
+    port.reset_input_buffer()
+
+
 def reboot_to_chainloader(port: serial.Serial, console: Console,
                           lk_baud: int, probe: float = 2.5) -> None:
     """If a TARGET=rpi4 LK image is running instead of the chainloader,
@@ -128,8 +146,7 @@ def reboot_to_chainloader(port: serial.Serial, console: Console,
             return
 
     print(f"no chainloader prompt; sending `reboot` to LK at {lk_baud} baud")
-    port.baudrate = lk_baud
-    port.reset_input_buffer()
+    switch_baud(port, lk_baud)
     port.write(b"\rreboot\r")
     port.flush()
     end = time.monotonic() + 0.5
@@ -137,8 +154,7 @@ def reboot_to_chainloader(port: serial.Serial, console: Console,
         data = port.read(port.in_waiting or 1)
         if data:
             console.write(data)
-    port.baudrate = loader_baud
-    port.reset_input_buffer()
+    switch_baud(port, loader_baud)
 
 
 def send_image(port: serial.Serial, console: Console, image: bytes,
@@ -236,8 +252,7 @@ def main() -> None:
             reboot_to_chainloader(port, console, args.post_jump_baud)
         send_image(port, console, image, args.wait)
         if args.post_jump_baud != args.baud:
-            port.baudrate = args.post_jump_baud
-            port.reset_input_buffer()
+            switch_baud(port, args.post_jump_baud)
         if not args.no_term:
             terminal(port, console)
 
