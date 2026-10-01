@@ -191,6 +191,12 @@ static inline void pmu_write_pmcntenset(uint32_t v) {
 static inline void pmu_write_pmselr(uint32_t v) {
     __asm__ volatile("mcr p15, 0, %0, c9, c12, 5" :: "r"(v));
 }
+static inline uint32_t pmu_read_pmselr(void) {
+    uint32_t v; __asm__ volatile("mrc p15, 0, %0, c9, c12, 5" : "=r"(v)); return v;
+}
+static inline void pmu_write_pmcntenclr(uint32_t v) {
+    __asm__ volatile("mcr p15, 0, %0, c9, c12, 2" :: "r"(v));
+}
 static inline uint32_t pmu_read_pmccntr(void) {
     uint32_t v; __asm__ volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(v)); return v;
 }
@@ -213,6 +219,17 @@ static inline void pmu_write_pmintenclr(uint32_t v) {
 // bits read from PMOVSR clears exactly those overflow flags.
 static inline void pmu_write_pmovsr(uint32_t v) {
     __asm__ volatile("mcr p15, 0, %0, c9, c12, 3" :: "r"(v));
+}
+
+// Reload event counter 0 (the PMU-sampling counter) from interrupt context. PMSELR is
+// a single selector shared by every PMXEVCNTR/PMXEVTYPER access: writing it here without
+// restoring it would redirect the next counter access of whatever code this interrupt
+// preempted (or, if that code had selected another counter, reload the wrong one).
+static inline void profiler_pmu_reload_counter0(uint32_t reload) {
+    uint32_t sel = pmu_read_pmselr();
+    pmu_write_pmselr(0);
+    pmu_write_pmxevcntr(reload);
+    pmu_write_pmselr(sel);
 }
 
 #if BCM2711
@@ -319,9 +336,12 @@ struct profiler_pmu_arm_ctx {
 static void profiler_pmu_arm_this_cpu(void *context) {
     struct profiler_pmu_arm_ctx *ctx = (struct profiler_pmu_arm_ctx *)context;
     uint cpu = arch_curr_cpu_num();
+    // Runs from an IPI on every core: keep the preempted code's PMSELR selection.
+    uint32_t sel = pmu_read_pmselr();
     pmu_write_pmselr(0);
     pmu_write_pmxevtyper(ctx->event);
     pmu_write_pmxevcntr(profiler_pmu_reload);
+    pmu_write_pmselr(sel);
     pmu_write_pmcntenset(1u << 0);
     // Set this core's flag BEFORE enabling its overflow interrupt, not
     // after -- otherwise a real overflow landing in between finds
@@ -421,7 +441,7 @@ void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
         // hardware.
         if (is_pmu_vector) {
             pmu_write_pmovsr(1u << 0);
-            pmu_write_pmxevcntr(profiler_pmu_reload);
+            profiler_pmu_reload_counter0(profiler_pmu_reload);
         }
 #endif
         return;
@@ -448,7 +468,7 @@ void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
 #if BCM2711
     if (is_pmu_overflow) {
         pmu_write_pmovsr(1u << 0);           // write-1-to-clear counter0's overflow flag
-        pmu_write_pmxevcntr(profiler_pmu_reload);  // reprogram for the next window
+        profiler_pmu_reload_counter0(profiler_pmu_reload);  // next window
     }
 #endif
 }
@@ -822,25 +842,31 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         uint32_t pmcr = pmu_read_pmcr();
         printf("stat: PMCR=0x%08x (N=%u counters)\n", pmcr, (pmcr >> 11) & 0x1f);
 
-        printf("stat: selecting event counter 0 for L1D_CACHE_REFILL ...\n");
-        pmu_write_pmselr(0);
+        // Event counter 1, not 0: counter 0 belongs to `pmustart` sampling, which
+        // may be armed right now. Likewise no PMCR.P (it would reset counter 0 too):
+        // zero counter 1 directly.
+        printf("stat: selecting event counter 1 for L1D_CACHE_REFILL ...\n");
+        pmu_write_pmselr(1);
         pmu_write_pmxevtyper(PROFILER_PMU_EVENT_L1D_CACHE_REFILL);
+        pmu_write_pmxevcntr(0);
 
-        printf("stat: enabling cycle counter + event counter 0 ...\n");
-        pmu_write_pmcntenset((1u << 31) | (1u << 0));
+        printf("stat: enabling cycle counter + event counter 1 ...\n");
+        pmu_write_pmcntenset((1u << 31) | (1u << 1));
 
-        printf("stat: resetting counters and starting (PMCR E|P|C) ...\n");
-        pmu_write_pmcr(pmcr | (1u << 0) | (1u << 1) | (1u << 2));
+        printf("stat: resetting the cycle counter and starting (PMCR E|C) ...\n");
+        pmu_write_pmcr(pmcr | (1u << 0) | (1u << 2));
 
         printf("stat: running workload (%u iters) ...\n", iters);
         profiler_workload_a(iters);
 
         printf("stat: reading PMCCNTR/PMXEVCNTR ...\n");
         uint32_t cycles = pmu_read_pmccntr();
-        pmu_write_pmselr(0);
+        pmu_write_pmselr(1);
         uint32_t l1d_refills = pmu_read_pmxevcntr();
 
-        printf("stat: stopping (PMCR E=0) ...\n");
+        // Stop only counter 1; PMCR goes back to what it was (enabled if sampling is).
+        printf("stat: stopping (counter 1 off, PMCR restored) ...\n");
+        pmu_write_pmcntenclr(1u << 1);
         pmu_write_pmcr(pmcr);
 
         printf("stat: %u iters, %u cycles, %u L1D_CACHE_REFILL\n", iters, cycles, l1d_refills);
