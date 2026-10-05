@@ -220,19 +220,28 @@ def parse_session(lines: list[str]) -> dict | None:
 
 def image_hash(elf_path, lo: int, hi: int) -> int | None:
     """FNV-1a over the ELF's loadable bytes in [lo, hi) -- the same bytes the
-    target hashes for DUMPBEGIN's build= field. None if the range is not
-    fully present in the file."""
+    target hashes for DUMPBEGIN's build= field. None if [lo, hi) is not
+    inside the file-backed load image.
+
+    K13: alignment gaps between load segments are hashed as zeros. The target
+    hashes RAM, which holds the uploaded binary, and `objcopy -O binary`
+    fills those gaps with zeros (a 2-byte gap in an ARM-mode build used to
+    make every dump of that image look like a mismatch)."""
     from elftools.elf.elffile import ELFFile
-    data = bytearray()
+    if hi < lo:
+        return None
+    data = bytearray(hi - lo)
+    spans = []
     with open(elf_path, "rb") as f:
         for seg in ELFFile(f).iter_segments():
-            if seg["p_type"] != "PT_LOAD":
+            if seg["p_type"] != "PT_LOAD" or not seg["p_filesz"]:
                 continue
             va, size = seg["p_vaddr"], seg["p_filesz"]
+            spans.append((va, va + size))
             a, b = max(lo, va), min(hi, va + size)
             if a < b:
-                data += seg.data()[a - va:b - va]
-    if len(data) != hi - lo:
+                data[a - lo:b - lo] = seg.data()[a - va:b - va]
+    if not spans or lo < min(a for a, _ in spans) or hi > max(b for _, b in spans):
         return None
     h = 0x811c9dc5
     for byte in data:

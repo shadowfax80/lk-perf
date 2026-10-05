@@ -8,6 +8,7 @@
 | exporter | Timestamped perf-script export ([EXPORT.md](EXPORT.md), [verification](results/PERF_EXPORT_VERIFICATION.md)) |
 | `0f7f5e3` (K6) | IRQ-masked time accounting, delayed-sample attribution, delay-compensated PMU reload, console printing without IRQ masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
 | `84c25a9` (K12) | Opt-in pseudo-NMI sampling by GIC priority masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
+| K13 | Image hash over gaps between load segments ([§7.3](#73-sample-text-format)) |
 | K8 | Scheduler events: context switches, wakeups (with reason and wait queue), thread names, ARM clock and throttling; report and Perfetto systrace export ([§4.8](#48-scheduler-events)) |
 | K9 | Small fixes: one write per dump record, `pmu` message, function-start line lookup, design-doc and README corrections ([§8.4](#84-symbol-and-source-mapping)) |
 | K7 | `profiler stat` counts any console command on every core: up to six events plus cycles, 64-bit, derived IPC and ratios ([§6.3](#63-profiler-stat)); K4 (no printing inside the window) and K5 (`setup.sh` re-runnable) before it |
@@ -507,7 +508,7 @@ SAMPLE done
 | `fmt` | Dump format version: 3 since K10 (adds `tperiod`, `tmixed`, `tmissed`); format 2 dumps still parse, and their timer mode is reported as LK's tick |
 | `run` | Session id: CNTPCT when the session began (`profiler clear`, or first use after boot) |
 | `dump` | Dump number within the session |
-| `image`, `build` | Address range `[_start, __rodata_end)` and the FNV-1a hash of its bytes, which the host recomputes from the ELF |
+| `image`, `build` | Address range `[_start, __rodata_end)` and the FNV-1a hash of its bytes, which the host recomputes from the ELF; alignment gaps between load segments count as the zeros `objcopy` uploads (K13) |
 | `modes`, `event`, `period`, `mixed` | Sampling modes armed in the session (bit 0 timer, bit 1 PMU), the last PMU event and period, and whether a different PMU configuration was used earlier in the session |
 | `tperiod`, `tmixed` | Timer-mode period in microseconds (0: timer mode not used) and whether a different period was used earlier in the session |
 | `total`, `retained`, `overwritten`, `pmumissed`, `tmissed` | Per core: samples taken, kept in the ring, overwritten, PMU overflows lost inside masked spans, and timer periods that ended entirely inside masked code |

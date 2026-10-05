@@ -220,6 +220,23 @@ class K6Tests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("arm-none-eabi-as") and shutil.which("arm-none-eabi-ld"),
                          "needs arm-none-eabi binutils")
+    def test_image_hash_fills_segment_gaps_with_zeros(self):
+        # K13: two load segments with a 2-byte gap, as objcopy uploads it.
+        if shutil.which("arm-none-eabi-as") is None:
+            self.skipTest("arm-none-eabi toolchain not installed")
+        tmp = Path(self.temp.name)
+        (tmp / "g.S").write_text(".section .a,\"ax\"\n.byte 1,2,3\n"
+                                 ".section .b,\"a\"\n.byte 4,5\n")
+        (tmp / "g.ld").write_text("SECTIONS { .a 0x8000 : { *(.a) } :ta\n"
+                                  ".b 0x8005 : { *(.b) } :tb }\n"
+                                  "PHDRS { ta PT_LOAD; tb PT_LOAD; }\n")
+        subprocess.run(["arm-none-eabi-as", "g.S", "-o", "g.o"], check=True, cwd=tmp)
+        subprocess.run(["arm-none-eabi-ld", "-T", "g.ld", "g.o", "-o", "g.elf"], check=True,
+                       cwd=tmp)
+        self.assertEqual(image_hash(tmp / "g.elf", 0x8000, 0x8007), _fnv([1, 2, 3, 0, 0, 4, 5]))
+        self.assertIsNone(image_hash(tmp / "g.elf", 0x7ffe, 0x8007))   # outside the image
+        self.assertIsNone(image_hash(tmp / "g.elf", 0x8000, 0x8009))
+
     def test_image_hash_matches_elf_bytes_and_detects_mismatch(self):
         tmp = Path(self.temp.name)
         payload = bytes(range(1, 33))
