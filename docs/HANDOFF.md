@@ -80,7 +80,7 @@ snapshot, not a live guarantee.
 
 | Holder | Since | Purpose |
 |---|---|---|
-| — (free) | 2026-10-05 | Released by Claude after K8/K9; shared checkout at the K8 commit, untracked `scripts/flamegraph.pl` (Codex) left in place |
+| Claude | 2026-10-05 | K13 (image hash over segment gaps), K14 (BOLT-safe masking-site capture), for bolt-aarch32 B1 |
 
 ## Pi state (last release, copied from bolt-aarch32)
 
@@ -98,6 +98,8 @@ current source. *Owner* is empty until someone claims it.
 
 | Order | ID | Item | Priority | Owner | Status | Notes |
 |---|---|---|---|---|---|---|
+| 1 | K13 | Host image hash (K2) fails when the ELF has gaps between load segments (seen on an ARM-mode bolt-aarch32 build); hash gaps as the zero fill objcopy uploads | P2 | Claude | In progress | Found in bolt-aarch32 B1 |
+| 2 | K14 | IRQ-mask site capture uses `mov rX, pc` inlined into every `arch_disable_ints()`: BOLT refuses every function containing it (44 kernel functions); capture the site as the return address in out-of-line code instead | P2 | Claude | In progress | Found in bolt-aarch32 B1; whole-image BOLT needs it |
 | 1 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Blocked | Feasibility done (Claude, K11): A72 implements `EDPCSR` and the CPU reaches every core's debug block, but the SoC disables non-invasive debug (`DBGAUTHSTATUS` 0xaa), so `EDPCSR` reads `ffffffff`. Untested lever: `enable_jtag_gpio=1` in `config.txt` (SD-card change, needs user approval). On the target: `profiler dbginfo`; [results](results/k11_edpcsr_feasibility_20261005/README.md) |
 | 2 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
 
