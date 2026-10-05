@@ -1,5 +1,14 @@
 # Raspberry Pi 4B bring-up plan
 
+**Known-limitations update (2026-10-05, Codex):** scheduling, wakeups,
+blocking reasons/durations, and CPU-frequency history are not captured.
+Stack samples and gaps cannot establish scheduler latency, off-CPU wait
+causes, or frequency changes. Added this limitation to README, architecture,
+export documentation, and the generated metadata/stderr notice. Additional
+target instrumentation/event export would be required; no such capability
+was implemented or claimed. The targeted metadata export regression passed;
+no target code or Pi state changed.
+
 **Standard-tool exporter milestone (2026-10-05, Codex):**
 `scripts/pi4_perf_export.py` now exports one completed dump as timestamped
 perf-script text with a metadata sidecar. It preserves sample/CPU/time fields,

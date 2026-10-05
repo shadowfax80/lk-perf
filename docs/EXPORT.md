@@ -19,6 +19,13 @@ Hotspot's native `perf.data` input remain separate interfaces.
    and PMU modes use ordinary IRQ delivery on the Non-secure SVC Pi and intended
    target. A sample delivered after unmasking cannot reconstruct the masked
    execution. The exporter cannot correct or quantify this bias.
+3. **Scheduling, wakeups, blocking, and CPU-frequency history are not
+   captured.** There are no context-switch/wakeup events, blocking
+   reasons/durations, or frequency-change records. Sample gaps cannot tell
+   whether a thread was sleeping, blocked, preempted, or simply not sampled.
+   Perfetto cannot derive scheduler latency, off-CPU wait causes, or frequency
+   history from this export. These analyses require additional target
+   instrumentation and corresponding event export.
 
 These limitations are also written into every metadata sidecar and mentioned
 on stderr after a successful export. They apply regardless of which viewer

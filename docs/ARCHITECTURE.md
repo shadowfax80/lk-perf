@@ -549,6 +549,7 @@ The intended platform is **Non-secure SVC**, as corrected in the latest hardware
 | Missing assembly CFI | Stop the walk | No validated LR fallback; caller contributions underrepresented |
 | Bad symbol attribution | Matching ELF supplied by operator | Nearest-start mapping lacks function-extent validation; return-address boundaries remain |
 | A55 transfer | Mechanism demonstrated on A72 | Target routing, ABI, event support, performance, and footprint unvalidated |
+| Scheduling/wakeups/blocking/frequency | Timestamped stack samples and CPU/thread identity only | No context-switch/wakeup events, blocking reasons/durations, or CPU-frequency history; additional target event instrumentation/export is required |
 
 The stack-bound issue concerns **reading above SP**, including near a stack's high address when a thread has little active stack. It should not be dismissed solely as a low-SP stack-overflow scenario. A 128-byte fixed copy is neither proof of readable range nor a complete call-chain snapshot.
 

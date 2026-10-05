@@ -42,6 +42,10 @@ KNOWN_LIMITATIONS = [
     "values within this export, not operating-system PIDs or thread lifetimes.",
     "Timestamps are target generic-timer microseconds, not a host/Linux clock. "
     "External importers may round timestamps or omit CPU/event/period fields.",
+    "Scheduling, wakeups, blocking reasons/durations, and CPU-frequency history "
+    "are not captured. Stack samples cannot establish scheduler latency, "
+    "off-CPU wait causes, or frequency changes; additional instrumentation "
+    "and event export are required.",
 ]
 
 
@@ -263,7 +267,8 @@ def main() -> None:
               f"leaf-only unwind fallbacks={quality['unwind_exception_samples']}",
               file=sys.stderr)
     print("known limitations: missing stack frames and IRQ-masked execution "
-          "cannot be recovered; see metadata sidecar", file=sys.stderr)
+          "cannot be recovered; scheduling/wakeup/blocking/frequency history "
+          "is not captured; see metadata sidecar", file=sys.stderr)
 
 
 if __name__ == "__main__":

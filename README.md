@@ -31,6 +31,9 @@ usage and the verified importer contract. This does not generate `perf.data`.
 **Known limitations:** missing stack frames cannot be reconstructed from
 incomplete captured context, and execution while IRQs are masked is invisible
 to both sampling modes. Exporting or changing viewers cannot recover either.
+Scheduling, wakeups, blocking reasons/durations, and CPU-frequency history
+are also absent from capture; analyzing them requires additional event
+instrumentation rather than stack samples alone.
 
 **Scope: a PoC for a real target platform's actual perf use case.**
 Stack unwinding uses DWARF CFI (`.debug_frame`), not ARM's own EXIDX --
