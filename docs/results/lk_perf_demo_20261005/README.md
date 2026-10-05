@@ -120,6 +120,12 @@ in [verification.json](verification.json).
 
 ## Analyze in Perfetto
 
+You can also [open the published capture directly in Perfetto](https://ui.perfetto.dev/#!/?url=https://raw.githubusercontent.com/shadowfax80/lk-perf/main/docs/results/lk_perf_demo_20261005/demo.perf),
+using its documented [public trace URL mechanism](https://perfetto.dev/docs/visualization/deep-linking-to-perfetto-ui).
+Graphical interaction was not automated in this session because no browser
+control surface was available; the real CLI import and all saved queries
+were verified.
+
 Download [demo.perf](demo.perf), open [Perfetto UI](https://ui.perfetto.dev/),
 and use **Open trace file**. Perfetto documents
 [perf-script import](https://perfetto.dev/docs/getting-started/other-formats).
