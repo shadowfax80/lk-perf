@@ -127,6 +127,15 @@ Earlier milestones (M1–M5, DWARF unwinder, review Phases 1–2) are recorded i
 
 ## Handoff log
 
+### 2026-10-05 — Claude: architecture doc updated for K6/K12; published as a web page
+
+- `docs/ARCHITECTURE.md` now describes the code at `84c25a9`: new §4.6 (IRQ
+  masking: accounting, attribution, pseudo-NMI, with diagrams and hazard
+  rules), updated capture fields, buffer sizing (173 bytes/slot), compensated
+  PMU reload, reports, workflow, limits, evidence and source map.
+- Published as a private claude.ai page (link in the session); docs-only, no
+  lock or Pi use.
+
 ### 2026-10-05 — Claude: K12 done (route 3, GIC-priority pseudo-NMI on the Pi); lock and Pi released
 
 - Overlay `0014`: opt-in masking by GIC priority. In this mode thread-context
