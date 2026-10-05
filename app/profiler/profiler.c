@@ -444,7 +444,8 @@ static bool profiler_nmi_enable(void) {
     }
     arm_nmi_pmr = PROFILER_GICC_PMR;
     arm_nmi_any = 1;
-    struct profiler_nmi_ctx ctx = { { 0 } };
+    struct profiler_nmi_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
     mp_sync_exec(MP_IPI_TARGET_ALL, 0, profiler_nmi_on_this_cpu, &ctx);
     bool all = true;
     for (int c = 0; c < SMP_MAX_CPUS; c++)
@@ -505,6 +506,12 @@ uint32_t profiler_tid_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
 // sample landing within 128 bytes of a real overflow is already a
 // separate, worse problem than this capture.
 uint8_t profiler_stack_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE][PROFILER_STACK_CAPTURE_BYTES];
+// K1: how many of those bytes were really copied. The copy stops at the top
+// of the stack the interrupted SP is on, so a sample from a thread with less
+// than PROFILER_STACK_CAPTURE_BYTES above its SP no longer reads past its
+// stack allocation; the rest of the slot is zero. 0 means SP was not on a
+// known stack (e.g. mid context switch) and nothing was copied.
+uint8_t profiler_slen_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
 uint64_t profiler_ts_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
 // K6: why a sample may sit at an unmask point instead of where the time
 // went. The trigger is held pending while the core runs with CPSR.I set
@@ -550,6 +557,31 @@ static inline uint32_t profiler_cntfrq(void) {
 
 static inline uint32_t profiler_sat32(uint64_t v) {
     return v > 0xffffffffu ? 0xffffffffu : (uint32_t)v;
+}
+
+// K1: bytes that can be read upward from the interrupted SP without leaving
+// its stack. Created threads record their stack (thread_t::stack/stack_size);
+// idle threads and the bootstrap thread record none and run on the per-core
+// boot stacks (abort_stack, ARCH_DEFAULT_STACK_SIZE per core, core n's top at
+// abort_stack + (n + 1) * ARCH_DEFAULT_STACK_SIZE, see arch/arm/arm/start.S).
+// An SP outside the stack that is expected for the current thread -- for
+// example in the window of a context switch where the current-thread pointer
+// already names the next thread -- gets 0: no bytes are copied.
+extern uint8_t abort_stack[ARCH_DEFAULT_STACK_SIZE * SMP_MAX_CPUS];
+
+static uint32_t profiler_stack_room(uint cpu, uintptr_t sp, const thread_t *t) {
+    uintptr_t lo, hi;
+    if (t && t->stack && t->stack_size) {
+        lo = (uintptr_t)t->stack;
+        hi = lo + t->stack_size;
+    } else {
+        lo = (uintptr_t)abort_stack + (uintptr_t)cpu * ARCH_DEFAULT_STACK_SIZE;
+        hi = lo + ARCH_DEFAULT_STACK_SIZE;
+    }
+    if (sp < lo || sp > hi)
+        return 0;
+    uintptr_t room = hi - sp;
+    return room < PROFILER_STACK_CAPTURE_BYTES ? (uint32_t)room : PROFILER_STACK_CAPTURE_BYTES;
 }
 
 // Called from dev/interrupt/arm_gic/gic_v2.c on every IRQ (weak default is
@@ -605,9 +637,12 @@ void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
     // USR-mode bank, dead here; see the file-level comment above).
     profiler_sp_buf[cpu][idx] = (uint32_t)(frame + 1);
     profiler_spsr_buf[cpu][idx] = frame->spsr;
-    profiler_tid_buf[cpu][idx] = (uint32_t)(uintptr_t)get_current_thread();
-    memcpy(profiler_stack_buf[cpu][idx], (const void *)(frame + 1),
-           PROFILER_STACK_CAPTURE_BYTES);
+    thread_t *cur = get_current_thread();
+    profiler_tid_buf[cpu][idx] = (uint32_t)(uintptr_t)cur;
+    uint32_t room = profiler_stack_room(cpu, (uintptr_t)(frame + 1), cur);
+    memcpy(profiler_stack_buf[cpu][idx], (const void *)(frame + 1), room);
+    memset(profiler_stack_buf[cpu][idx] + room, 0, PROFILER_STACK_CAPTURE_BYTES - room);
+    profiler_slen_buf[cpu][idx] = (uint8_t)room;
     profiler_ts_buf[cpu][idx] = current_time_hires();
 
     // K6: interrupt delay and the most recent masked region on this core.
@@ -884,7 +919,8 @@ static inline uint32_t profiler_fnv(uint32_t c, uint32_t v) {
 static uint32_t profiler_sample_checksum(uint32_t cpu, uint32_t seq, uint32_t pc, uint32_t lr,
                                           uint32_t fp, uint32_t sp, uint32_t spsr, uint32_t tid,
                                           uint64_t ts, const uint8_t *stack, uint32_t src,
-                                          uint32_t lat, uint32_t msite, uint32_t mgap) {
+                                          uint32_t lat, uint32_t msite, uint32_t mgap,
+                                          uint32_t slen) {
     uint32_t c = 0x811c9dc5u;
     c ^= cpu; c *= 16777619u;
     c ^= seq; c *= 16777619u;
@@ -903,6 +939,7 @@ static uint32_t profiler_sample_checksum(uint32_t cpu, uint32_t seq, uint32_t pc
     c = profiler_fnv(c, lat);
     c = profiler_fnv(c, msite);
     c = profiler_fnv(c, mgap);
+    c = profiler_fnv(c, slen);   // K1
     return c;
 }
 
@@ -1033,6 +1070,7 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         memset(profiler_lat_buf, 0, sizeof(profiler_lat_buf));
         memset(profiler_msite_buf, 0, sizeof(profiler_msite_buf));
         memset(profiler_mgap_buf, 0, sizeof(profiler_mgap_buf));
+        memset(profiler_slen_buf, 0, sizeof(profiler_slen_buf));
         for (int c = 0; c < SMP_MAX_CPUS; c++)
             profiler_pmu_missed[c] = 0;
         if (arm_irqmask_on)
@@ -1103,17 +1141,18 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
                 uint32_t lat = profiler_lat_buf[c][idx];
                 uint32_t msite = profiler_msite_buf[c][idx];
                 uint32_t mgap = profiler_mgap_buf[c][idx];
+                uint32_t slen = profiler_slen_buf[c][idx];
                 uint32_t crc = profiler_sample_checksum((uint32_t)c, seq, pc, lr, fp, sp,
                                                          spsr, tid, ts, stack, src, lat,
-                                                         msite, mgap);
+                                                         msite, mgap, slen);
                 printf("SAMPLE seq=%08x cpu=%d pc=%08x lr=%08x fp=%08x sp=%08x "
                        "spsr=%08x tid=%08x ts=%016llx stack=",
                        seq, c, pc, lr, fp, sp, spsr, tid, (unsigned long long)ts);
                 for (int b = 0; b < PROFILER_STACK_CAPTURE_BYTES; b++) {
                     printf("%02x", stack[b]);
                 }
-                printf(" src=%c lat=%08x msite=%08x mgap=%08x crc=%08x\n",
-                       src ? (char)src : '?', lat, msite, mgap, crc);
+                printf(" src=%c lat=%08x msite=%08x mgap=%08x slen=%08x crc=%08x\n",
+                       src ? (char)src : '?', lat, msite, mgap, slen, crc);
                 seq++;
             }
         }

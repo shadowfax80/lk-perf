@@ -1,0 +1,8 @@
+arch_idle 1
+arch_idle;[irq-masked: [irq handler, GIC ID 153]] 3
+cmd_profiler;profiler_spin_ticks 3874
+cmd_profiler;profiler_masked_spin;[irq-masked: profiler_masked_spin] 215
+cmd_profiler;profiler_masked_spin 1
+_printf_engine;__debug_stdio_write;uart_putc 1
+command_loop;read_debug_line;getchar;__debug_stdio_read;platform_dgetc;uart_getc;cbuf_read_char 2
+console_start;command_loop;mutex_acquire_timeout 1

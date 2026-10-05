@@ -8,6 +8,7 @@
 | exporter | Timestamped perf-script export ([EXPORT.md](EXPORT.md), [verification](results/PERF_EXPORT_VERIFICATION.md)) |
 | `0f7f5e3` (K6) | IRQ-masked time accounting, delayed-sample attribution, delay-compensated PMU reload, console printing without IRQ masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
 | `84c25a9` (K12) | Opt-in pseudo-NMI sampling by GIC priority masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
+| K1 | Stack copy bounded by the top of the sampled stack, `slen` field, unwinder stops at the stack top ([§4.4](#44-captured-context), [§8.2](#82-per-sample-algorithm)) |
 
 lk-perf is a statistical sampling profiler for Little Kernel (LK) workloads executing in AArch32 on multiple cores. The target captures interrupted execution state and a bounded stack snapshot; Python tools recover call chains from the matching debug ELF and produce function histograms, disassembly annotations, and FlameGraph input. It is a standalone performance tool. It has no dependency on BOLT and does not validate BOLT transformations.
 
@@ -232,7 +233,8 @@ Timer and PMU enables are independent and write into the same arrays. Each recor
 | `spsr` | `frame->spsr` | Interrupted CPSR, including mode and ARM/Thumb state |
 | `tid` | `get_current_thread()` cast to a 32-bit pointer value | Thread-object identity at capture, not a durable numeric TID |
 | `ts` | `current_time_hires()` | 64-bit microsecond timestamp derived from the generic timer time base |
-| `stack` | 128 bytes copied from the interrupted SP | Captured memory window used for offline unwind reads |
+| `stack` | Up to 128 bytes copied from the interrupted SP, stopping at the top of the stack SP is on; the rest zeroed | Captured memory window used for offline unwind reads |
+| `slen` | Bytes actually copied | Below 128 when the copy reached the stack top (which is then `sp + slen`); 0 when SP was on no known stack |
 | `src` | Which vector fired | `t` scheduler timer, `p` PMU overflow |
 | `lat` | Timer: `CNTPCT - CNTP_CVAL`; PMU: counter 0 value before reload | How late the interrupt was taken (ticks or events); large when it waited behind masked code |
 | `msite` | Per-core cause tracking (§4.6) | The masked region that most recently held this core, as a masking PC or `0xffff0000 \| GIC ID` |
@@ -304,11 +306,11 @@ Samples use separate named global arrays rather than a C struct array. This make
 | `profiler_sp_buf`, `profiler_spsr_buf`, `profiler_tid_buf` | `[SMP_MAX_CPUS][4096]` each | 12 combined |
 | `profiler_ts_buf` | `[SMP_MAX_CPUS][4096]` | 8 |
 | `profiler_stack_buf` | `[SMP_MAX_CPUS][4096][128]` | 128 |
-| `profiler_src_buf`; `profiler_lat_buf`, `profiler_msite_buf`, `profiler_mgap_buf` | `[SMP_MAX_CPUS][4096]` each | 1 + 12 |
+| `profiler_src_buf`, `profiler_slen_buf`; `profiler_lat_buf`, `profiler_msite_buf`, `profiler_mgap_buf` | `[SMP_MAX_CPUS][4096]` each | 2 + 12 |
 | `profiler_head`, `profiler_total`, `profiler_pmu_missed` | `[SMP_MAX_CPUS]` each | Per-core metadata |
 | `arm_irqmask_cpu` (LK, overlay 0012) | `[SMP_MAX_CPUS]`, 64-site table each | About 1.6 KiB per core |
 
-The sample payload is **173 bytes per slot**: `9 × 4 + 8 + 128 + 1`. With four configured cores and 4096 slots each, the sample arrays occupy **2,834,432 bytes (about 2.7 MiB)**, excluding counters, FP capture globals, accounting tables and other state. Stack storage alone is 2 MiB. This is a static BSS cost regardless of whether profiling is enabled.
+The sample payload is **174 bytes per slot**: `9 × 4 + 8 + 128 + 2`. With four configured cores and 4096 slots each, the sample arrays occupy **2,850,816 bytes (about 2.7 MiB)**, excluding counters, FP capture globals, accounting tables and other state. Stack storage alone is 2 MiB. This is a static BSS cost regardless of whether profiling is enabled.
 
 ### 5.2 Producer and retention semantics
 
@@ -400,12 +402,12 @@ This **CRC-32** checks the image transfer. It is a different algorithm from the 
 The current target emits one line per retained sample:
 
 ```text
-SAMPLE seq=<hex> cpu=<decimal> pc=<hex> lr=<hex> fp=<hex> sp=<hex> spsr=<hex> tid=<hex> ts=<hex> stack=<hex bytes> src=<t|p> lat=<hex> msite=<hex> mgap=<hex> crc=<hex>
+SAMPLE seq=<hex> cpu=<decimal> pc=<hex> lr=<hex> fp=<hex> sp=<hex> spsr=<hex> tid=<hex> ts=<hex> stack=<hex bytes> src=<t|p> lat=<hex> msite=<hex> mgap=<hex> slen=<hex> crc=<hex>
 ```
 
-`src`, `lat`, `msite` and `mgap` were added by K6 (2026-10-05); dumps from
-older images omit them, and the host tools accept both forms (the checksum
-covers the extra fields only when they are present).
+`src`, `lat`, `msite` and `mgap` were added by K6 and `slen` by K1
+(2026-10-05); dumps from older images omit them, and the host tools accept
+all three forms (the checksum covers the extra fields only when present).
 
 | Field | Target text width | Contract |
 |---|---:|---|
@@ -418,6 +420,7 @@ covers the extra fields only when they are present).
 | `lat` | 8 hex digits | How late the interrupt was taken: CNTPCT ticks past the timer deadline (`t`) or PMU events counted past the overflow (`p`) |
 | `msite` | 8 hex digits | The masked region that most recently ended on this core, chained through IRQ handlers taken at the same unmask: the masking PC, or `0xffff0000 | GIC ID` for an IRQ handler; 0 when accounting is off |
 | `mgap` | 8 hex digits | CNTPCT ticks between that region's end and this sample; `ffffffff` when accounting is off |
+| `slen` | 8 hex digits | Bytes of `stack` actually copied (0–128); the rest of `stack` is zero fill |
 | `crc` | 8 hex digits | FNV-1a-style 32-bit field checksum |
 
 Before `SAMPLE done`, images with K6 also print the masked-time accounting
@@ -442,7 +445,7 @@ for v in [cpu, seq, pc, lr, fp, sp, spsr, tid, ts_low32, ts_high32]:
 for byte in stack[0:128]:
     c = ((c XOR byte) * 16777619) modulo 2^32
 if K6 fields present:
-    for v in [ord(src), lat, msite, mgap]:
+    for v in [ord(src), lat, msite, mgap] (+ [slen] if present):
         c = ((c XOR v) * 16777619) modulo 2^32
 ```
 
@@ -467,9 +470,9 @@ Unwind data stays on the host; the target neither loads CFI nor performs a CFI w
 ### 8.2 Per-sample algorithm
 
 1. Strip ARM/Thumb interworking bit 0 from the sampled PC.
-2. Initialize registers with r13=SP, r14=LR, and r7 or r11=`fp` according to SPSR.T. Create a memory reader backed only by the captured stack bytes.
+2. Initialize registers with r13=SP, r14=LR, and r7 or r11=`fp` according to SPSR.T. Create a memory reader backed only by the captured stack bytes (the first `slen` of them when present). If the copy stopped at a stack top (0 < `slen` < 128), that top is `sp + slen`.
 3. Find the Frame Description Entry (FDE) containing the lookup PC; select its last decoded row at or before that PC.
-4. Resolve the Canonical Frame Address (CFA) as `register + offset`. This becomes the caller SP.
+4. Resolve the Canonical Frame Address (CFA) as `register + offset`. This becomes the caller SP. If a stack top is known and the CFA reaches it, this frame is the root of its stack and the walk ends here; whatever lies at the top (for LK threads, a stale return address in the initial context frame) is not a caller.
 5. Resolve each general-purpose register's rule, carrying live/unmodified register values forward where available.
 6. Obtain the caller address from resolved LR, strip bit 0, and append it unless it repeats an existing `(PC, CFA)` pair.
 7. Repeat with a **return-address lookup at PC−1**, until no FDE/row exists, LR is absent/zero, the pair repeats, or the configured iteration limit is reached.
@@ -491,7 +494,7 @@ The cycle key includes CFA so real recursion at the same call site with differen
 | CFA expressions | Raise `NotImplementedError` |
 | Register expression/value-expression/architectural rules | Raise `NotImplementedError` |
 
-Reads outside `[sample SP, sample SP + captured length)` return zero. A zero recovered LR stops the chain; an unavailable value in another register may instead cause a later failure or incomplete reconstruction. Out-of-window reads and genuine zero words are not distinguished. There is no target-memory access during host analysis.
+Reads outside `[sample SP, sample SP + slen)` return zero (`slen` is 128 for older dumps). A zero recovered LR stops the chain; an unavailable value in another register may instead cause a later failure or incomplete reconstruction. Out-of-window reads and genuine zero words are not distinguished. There is no target-memory access during host analysis.
 
 Missing FDEs stop the walk. A raw-LR fallback for assembly without CFI is not implemented; treating LR as a caller unconditionally would be unsafe where assembly repurposes it. A missing register or unsupported rule raising `ValueError`/`NotImplementedError` is caught per sample by the report tool, which replaces that sample's chain with its leaf PC and prints an aggregate warning. It discards any partially reconstructed chain in that exception case. ELF initialization failures and arbitrary other exceptions are not covered by that fallback.
 
@@ -620,7 +623,7 @@ Confirm that the log contains the completed dump marker and command completion, 
 
 Design and measured results are in §4.6. In the default mode, masked execution is never sampled: it is measured (accounting) and its delayed samples are attributed, but the samples themselves sit at unmask points. In pseudo-NMI mode, PMU samples reach masked thread code directly. What remains blind in both modes: interrupt handlers (exception entry sets CPSR.I), timer-mode samples in masked code, and the instruction-level location inside a masked region in the default mode. Timer-mode sampling also still phase-locks to masking, because LK re-arms its scheduler tick from the time the tick is handled (65% vs 50% in the ground-truth test, HANDOFF K10); use PMU mode for unbiased shares. Per-site accounting keeps 64 sites per core, and the hooks add a few `CNTPCT` reads to each masked region (plus a memory-mapped write per transition in pseudo-NMI mode). The target is Non-secure SVC, where FIQ routing is unavailable.
 
-Hardware results: [results/k6_irqmask_20261005](results/k6_irqmask_20261005/README.md), [results/k12_pseudo_nmi_20261005](results/k12_pseudo_nmi_20261005/README.md).
+Hardware results: [results/k6_irqmask_20261005](results/k6_irqmask_20261005/README.md), [results/k12_pseudo_nmi_20261005](results/k12_pseudo_nmi_20261005/README.md). Stack bounds: [results/k1_stack_bounds_20261005](results/k1_stack_bounds_20261005/README.md).
 
 ### 11.2 Limitations by failure class
 
@@ -633,8 +636,8 @@ Hardware results: [results/k6_irqmask_20261005](results/k6_irqmask_20261005/READ
 | IRQ-masked execution | Accounting, delayed-sample attribution, compensated PMU reload; opt-in pseudo-NMI | IRQ handlers and timer-mode samples stay blind; timer mode phase-locks (K10) |
 | Pseudo-NMI critical sections | Stack-saved mask state, CPSR.I-guarded state changes, spurious-IAR race handling, non-rescheduling PMU path | Any future handler raised above the mask must follow the same rules |
 | One unsupported unwind | Keep a leaf-only sample on the handled exceptions | Outer frames vanish; not all failure classes are caught |
-| Deep/large frames | Snapshot-backed reads stop beyond available memory | No explicit truncation reason; zero read can resemble valid termination |
-| Stack-copy bounds | Fixed-size snapshot | No thread-stack bounds check before target `memcpy`; copy can read beyond a shallow thread's stack allocation |
+| Deep/large frames | Snapshot-backed reads stop beyond available memory; `slen` says whether the copy ended at the stack top or at the 128-byte limit | A walk cut by the 128-byte limit still has no explicit stop reason |
+| Stack-copy bounds | Copy bounded by the top of the sampled stack (thread stack, or per-core boot stack for idle/bootstrap threads); nothing copied when SP is on no known stack (K1) | Bounds come from LK's thread records and boot-stack layout; another stack kind (e.g. a separate IRQ stack on a target port) would need its own bounds |
 | Concurrent clear/dump | Operational stop-before-export sequence | No enforced freeze, synchronized timer stop, or record-generation validation |
 | Buffer overflow | Preserve most recent per-core slots; status marks wrap | Older samples lost; no exported overwrite counter/session totals |
 | Mixed sampling modes/runs | Operator chooses one mode and fresh log; each record now carries its trigger (`src`) | Records lack event, run, build, and format identity |
@@ -644,7 +647,7 @@ Hardware results: [results/k6_irqmask_20261005](results/k6_irqmask_20261005/READ
 | A55 transfer | Mechanism demonstrated on A72 | Target routing, ABI, event support, performance, and footprint unvalidated |
 | Scheduling/wakeups/blocking/frequency | Timestamped stack samples and CPU/thread identity only | No context-switch/wakeup events, blocking reasons/durations, or CPU-frequency history; additional target event instrumentation/export is required |
 
-The stack-bound issue concerns **reading above SP**, including near a stack's high address when a thread has little active stack. It should not be dismissed solely as a low-SP stack-overflow scenario. A 128-byte fixed copy is neither proof of readable range nor a complete call-chain snapshot.
+The stack-bound issue concerned **reading above SP** near a stack's high address, when a thread has little active stack. It was the normal case, not an edge case: every sample of the four-core workload had only 20 bytes above SP and read 108 bytes past its stack before K1. A 128-byte copy is still not a complete call-chain snapshot for deep stacks.
 
 ### 11.3 What “valid sample” currently means
 
@@ -669,6 +672,7 @@ The following summarizes the repository's prior observations; it is not a claim 
 | UART integrity | 6-Mbaud console operation; sequence/checksum validation reported losses in real captures |
 | IRQ-masked time (K6) | Ground truth 50% masked: accounting 49.6%, PMU samples 48.2% on the masked side, all delayed samples attributed; console masking (up to 350 µs per line) removed |
 | Pseudo-NMI (K12) | Ground truth: 50.5% of PMU samples inside masked code, 0 delayed; stress with mode switching and a 6-minute soak (944,589 samples) clean |
+| Stack bounds (K1) | Four-core workload: all samples bounded at 20 bytes (previously 108 bytes past the stack), clean `initial_thread_func` root; idle samples bounded exactly at the per-core boot-stack top |
 | Offline regressions | `scripts/test_dwarf_unwind.py`: nested/Thumb address handling, register propagation, noreturn-boundary FDE lookup, recursive cycle guard; `scripts/test_irqmask_report.py`: K6/K12 record format, MASK lines, delay classification, exporter acceptance |
 
 The offline test builds fixtures using `arm-none-eabi-gcc`/`ld` and pyelftools. Some expected fixture addresses/rows are toolchain-specific. It exercises unwind logic, not Pi IRQ capture, target stack readability, PMU state sharing, UART reliability, or full-session provenance. The console-callback deadlock fix was validated by inspection rather than an independent hardware reproduction, as the hardware notes explicitly record.
@@ -680,7 +684,7 @@ These are architectural directions, **not additional claimed work items or a rep
 | Direction | Design change needed | Acceptance evidence |
 |---|---|---|
 | Coherent capture lifecycle | Synchronous producer stop/freeze and guarded clear/export with an explicit state model | Concurrent all-core start/stop/dump/clear stress with no mixed generations |
-| Safe and richer context | Bounds-check against the sampled thread stack; capture both r7/r11 and required GPRs or declare a smaller supported CFI subset | Shallow/high-SP, large-frame, mixed-mode, and alternate-CFA fixtures on hardware |
+| Safe and richer context | Bounds check: done (K1). Remaining: capture both r7/r11 and required GPRs or declare a smaller supported CFI subset | Large-frame, mixed-mode, and alternate-CFA fixtures on hardware |
 | Self-describing session | Versioned header/footer, run/build identity, mode/event/period, expected per-core retained/total/loss counts | Reject wrong ELF and incomplete/trailing-corrupt dumps; isolate appended runs |
 | Reporting integrity | Function range validation, consistent return-address attribution, explicit unwind stop reasons | Assembly gaps, function-boundary calls, missing CFI, and corrupted context regressions |
 | Bias/overhead accounting | IRQ-masked duration: done (K6). Remaining: measured sampler cost, timer-mode grid (K10), cross-core PC sampling for handlers (K11) | Controlled masked-region workload (`masktest`) and sampling-rate sweeps |

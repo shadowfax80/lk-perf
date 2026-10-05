@@ -145,6 +145,7 @@ class DwarfCFIUnwinder:
         registers: dict[int, int],
         read_memory: Callable[[int, int], int],
         max_frames: int = 64,
+        stack_top: int | None = None,
     ) -> list[int]:
         """Return the list of PCs in this call chain, innermost first.
 
@@ -160,6 +161,12 @@ class DwarfCFIUnwinder:
         `addr` and returns them as an unsigned little-endian int --
         backed by a live serial dump on real hardware, or a raw stack
         snapshot in a test/offline case.
+
+        `stack_top`, when known, is the highest address of the stack the
+        sample was taken on. A frame whose CFA (its caller's SP) reaches it
+        has no caller on this stack: the walk stops there instead of
+        following whatever stale return address sits at the stack top
+        (LK's initial thread frame, for example).
         """
         cur_pc = strip_isa_bit(pc)
         chain = [cur_pc]
@@ -196,6 +203,8 @@ class DwarfCFIUnwinder:
                 break
 
             cfa = self._resolve_cfa(row, regs)
+            if stack_top is not None and cfa >= stack_top:
+                break  # this frame is the root of its stack
 
             # Resolve every general-purpose register's rule for this
             # row, not just LR -- an outer frame's CFA rule may depend

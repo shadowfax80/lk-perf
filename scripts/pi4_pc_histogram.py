@@ -58,6 +58,8 @@ SAMPLE_RE = re.compile(
     # K6 fields, absent in older dumps (their checksum then omits them too)
     r"(?: src=(?P<src>[tp?]) lat=(?P<lat>[0-9a-fA-F]+) msite=(?P<msite>[0-9a-fA-F]+) "
     r"mgap=(?P<mgap>[0-9a-fA-F]+))?"
+    # K1: bytes of `stack` actually copied (the rest is zero fill)
+    r"(?: slen=(?P<slen>[0-9a-fA-F]+))?"
     r" crc=(?P<crc>[0-9a-fA-F]+)"
 )
 
@@ -90,16 +92,19 @@ def _fnv(values) -> int:
     return c
 
 
-def sample_extra(m: re.Match) -> tuple[int, int, int, int] | None:
-    """The K6 fields of a SAMPLE match as checksum inputs, or None."""
+def sample_extra(m: re.Match) -> tuple[int, ...] | None:
+    """The K6 (and K1 `slen`) fields of a SAMPLE match as checksum inputs, or None."""
     if m["src"] is None:
         return None
-    return (ord(m["src"]), int(m["lat"], 16), int(m["msite"], 16), int(m["mgap"], 16))
+    extra = (ord(m["src"]), int(m["lat"], 16), int(m["msite"], 16), int(m["mgap"], 16))
+    if m["slen"] is not None:
+        extra += (int(m["slen"], 16),)
+    return extra
 
 
 def _sample_checksum(cpu: int, seq: int, pc: int, lr: int, fp: int, sp: int,
                       spsr: int, tid: int, ts: int, stack: bytes,
-                      extra: tuple[int, int, int, int] | None = None) -> int:
+                      extra: tuple[int, ...] | None = None) -> int:
     """Exact mirror of profiler.c's profiler_sample_checksum() -- FNV-1a-style,
     folding each binary field into a running multiply-xor state. See that
     function's own comment for the algorithm and why it's over binary
@@ -170,10 +175,15 @@ def parse_samples(log_path: str) -> list[dict]:
             sample = {
                 "cpu": cpu, "pc": pc, "lr": lr, "fp": fp, "sp": sp,
                 "spsr": spsr, "tid": tid, "ts": ts, "stack": stack,
-                "src": None, "lat": None, "msite": None, "mgap": None,
+                "src": None, "lat": None, "msite": None, "mgap": None, "slen": None,
             }
             if extra:
                 sample.update(src=m["src"], lat=extra[1], msite=extra[2], mgap=extra[3])
+                if len(extra) > 4:
+                    if extra[4] > len(stack):
+                        crc_mismatches += 1   # inconsistent record: not trusted
+                        continue
+                    sample["slen"] = extra[4]
             samples.append(sample)
 
     if crc_mismatches or seq_gaps:
@@ -396,8 +406,13 @@ def unwind_sample(unwinder: DwarfCFIUnwinder, s: dict) -> list[int]:
     thumb = (s["spsr"] & SPSR_T_BIT) != 0
     fp_reg = 7 if thumb else 11
     registers = {SP_REG: s["sp"], LR_REG: s["lr"], fp_reg: s["fp"]}
-    read_memory = make_read_memory(s["stack"], s["sp"])
-    return unwinder.unwind(s["pc"], registers, read_memory)
+    # K1: only the copied bytes are stack; reads past them are a clean stop
+    stack = s["stack"] if s.get("slen") is None else s["stack"][:s["slen"]]
+    read_memory = make_read_memory(stack, s["sp"])
+    # A copy cut short (0 < slen < window) ended exactly at the stack top.
+    top = (s["sp"] + s["slen"]
+           if s.get("slen") is not None and 0 < s["slen"] < len(s["stack"]) else None)
+    return unwinder.unwind(s["pc"], registers, read_memory, stack_top=top)
 
 
 def main() -> None:
@@ -458,6 +473,13 @@ def main() -> None:
     print(f"{total} samples across {len(per_cpu)} cpu(s): {dict(sorted(per_cpu.items()))}")
     print(f"{len(threads)} distinct thread(s) sampled (by thread_t* -- see profiler.c)")
     print(f"unwind depth histogram (frames per sample): {dict(sorted(depths.items()))}")
+    bounded = [s for s in samples if s.get("slen") is not None]
+    if bounded:
+        short = sum(1 for s in bounded if 0 < s["slen"] < len(s["stack"]))
+        none = sum(1 for s in bounded if s["slen"] == 0)
+        print(f"stack window: {short} sample(s) bounded by their stack top (< "
+              f"{len(bounded[0]['stack'])} bytes above SP), {none} with SP on no known "
+              f"stack (nothing copied)")
     print()
     print(f"{'count':>8}  {'%':>6}  leaf function (source line)")
     for name, count in leaf_counts.most_common(30):

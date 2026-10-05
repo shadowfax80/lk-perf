@@ -1,0 +1,40 @@
+4098 samples across 2 cpu(s): {0: 4, 2: 4094}
+2 distinct thread(s) sampled (by thread_t* -- see profiler.c)
+unwind depth histogram (frames per sample): {1: 4, 2: 4090, 3: 2, 7: 2}
+stack window: 4 sample(s) bounded by their stack top (< 128 bytes above SP), 0 with SP on no known stack (nothing copied)
+
+   count       %  leaf function (source line)
+    3874   94.5%  profiler_spin_ticks  (profiler.c:542)
+     216    5.3%  profiler_masked_spin  (profiler.c:759)
+       4    0.1%  arch_idle  (ops.S:52)
+       2    0.0%  cbuf_read_char  (cbuf.c:297)
+       1    0.0%  uart_putc  (uart.c:114)
+       1    0.0%  mutex_acquire_timeout  (mutex.c:85)
+
+IRQ-masked time (invisible to IRQ sampling), accounting on at dump time:
+  cpu0:  0.06% masked (0.06% in IRQ handlers), 23 regions, longest 19.1 us at [irq handler, GIC ID 153]
+  cpu1:  0.02% masked (0.01% in IRQ handlers), 34 regions, longest 3.8 us at [irq handler, GIC ID 15]
+  cpu2: 47.16% masked (1.37% in IRQ handlers), 6134 regions, longest 300.2 us at profiler_masked_spin
+  cpu3:  0.02% masked (0.01% in IRQ handlers), 62 regions, longest 3.2 us at [irq handler, GIC ID 15]
+
+  % of time   regions     longest  masking site
+    11.441%       300     300.2us  profiler_masked_spin
+     0.337%      5708       2.4us  [irq handler, GIC ID 50]
+     0.014%        17      19.1us  [irq handler, GIC ID 153]
+     0.005%        73       1.9us  cbuf_read_char
+     0.005%        12       4.4us  [irq handler, GIC ID 15]
+     0.004%        18       2.0us  [irq handler, GIC ID 30]
+     0.004%        73       1.6us  event_wait_timeout
+     0.002%         6       3.0us  [irq handler, GIC ID 14]
+     0.001%        20       0.4us  mutex_acquire_timeout
+     0.001%        20       0.3us  mutex_release
+     0.001%         4       1.4us  [irq handler, GIC ID 48]
+     0.000%         2       0.7us  mp_sync_exec_etc
+
+Samples delayed by IRQ masking (taken late, so the PC is the unmask point):
+  PMU, events: 218/4098 delayed (threshold 1748), 218 attributed to the region that held them
+       215  profiler_masked_spin
+         3  [irq handler, GIC ID 153]
+
+wrote c_idle_pmu.folded -- render with: perl scripts/flamegraph.pl c_idle_pmu.folded > flame.svg
+warning: 0 sample(s) failed their checksum, 2 sample(s) missing entirely (seq gap) -- both dropped, not trusted

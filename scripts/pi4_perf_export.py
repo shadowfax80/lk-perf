@@ -88,13 +88,17 @@ def read_capture(log: Path) -> tuple[list[dict], dict]:
                            ("seq", "pc", "lr", "fp", "sp", "spsr", "tid", "crc"))
                     or len(match["ts"]) != 16 or len(match["stack"]) != 256
                     or (match["src"] is not None
-                        and any(len(match[field]) != 8 for field in ("lat", "msite", "mgap")))):
+                        and any(len(match[field]) != 8 for field in ("lat", "msite", "mgap")))
+                    or (match["slen"] is not None
+                        and (match["src"] is None or len(match["slen"]) != 8
+                             or int(match["slen"], 16) > 128))):
                 quality["malformed_records"] += 1
                 continue
             sample = {field: int(match[field], 16) for field in
                       ("seq", "pc", "lr", "fp", "sp", "spsr", "tid", "ts")}
             sample["cpu"] = int(match["cpu"])
             sample["stack"] = bytes.fromhex(match["stack"])
+            sample["slen"] = int(match["slen"], 16) if match["slen"] is not None else None
             if sample["cpu"] > 0xffffffff:
                 quality["malformed_records"] += 1
                 continue

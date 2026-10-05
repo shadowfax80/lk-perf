@@ -1,0 +1,36 @@
+799 samples across 4 cpu(s): {0: 200, 1: 199, 2: 200, 3: 200}
+4 distinct thread(s) sampled (by thread_t* -- see profiler.c)
+unwind depth histogram (frames per sample): {3: 799}
+stack window: 799 sample(s) bounded by their stack top (< 128 bytes above SP), 0 with SP on no known stack (nothing copied)
+
+   count       %  leaf function (source line)
+     799  100.0%  profiler_workload_inner  (profiler.c:731)
+
+IRQ-masked time (invisible to IRQ sampling), accounting on at dump time:
+  cpu0:  0.10% masked (0.09% in IRQ handlers), 271 regions, longest 17.1 us at [irq handler, GIC ID 153]
+  cpu1:  0.07% masked (0.06% in IRQ handlers), 284 regions, longest 4.6 us at [irq handler, GIC ID 15]
+  cpu2:  0.09% masked (0.06% in IRQ handlers), 419 regions, longest 3.9 us at [irq handler, GIC ID 15]
+  cpu3:  0.06% masked (0.06% in IRQ handlers), 253 regions, longest 3.6 us at [irq handler, GIC ID 15]
+
+  % of time   regions     longest  masking site
+     0.019%       132       3.0us  [irq handler, GIC ID 30]
+     0.009%       200       1.4us  [irq handler, GIC ID 48]
+     0.009%       200       2.1us  [irq handler, GIC ID 49]
+     0.008%       200       1.8us  [irq handler, GIC ID 50]
+     0.008%       200       2.1us  [irq handler, GIC ID 51]
+     0.008%        17      17.1us  [irq handler, GIC ID 153]
+     0.007%        33       4.6us  [irq handler, GIC ID 15]
+     0.003%        70       1.7us  cbuf_read_char
+     0.002%        70       1.6us  event_wait_timeout
+     0.001%         6       3.1us  [irq handler, GIC ID 14]
+     0.001%        38       1.4us  mutex_acquire_timeout
+     0.001%        38       1.2us  mutex_release
+     0.001%         4       3.8us  thread_exit
+     0.001%         4       4.0us  thread_yield
+     0.000%         4       1.7us  thread_join
+
+Samples delayed by IRQ masking (taken late, so the PC is the unmask point):
+  PMU, events: 0/799 delayed (threshold 1912), 0 attributed to the region that held them
+
+wrote a_pmu_smp.folded -- render with: perl scripts/flamegraph.pl a_pmu_smp.folded > flame.svg
+warning: 0 sample(s) failed their checksum, 1 sample(s) missing entirely (seq gap) -- both dropped, not trusted

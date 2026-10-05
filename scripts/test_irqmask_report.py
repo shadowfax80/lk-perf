@@ -22,13 +22,18 @@ FREQ = 54000000
 
 
 def sample_line(seq=0, cpu=0, pc=0x8000, lr=0, fp=0x1000, sp=0x1000, spsr=0x33,
-                tid=0x80002000, ts=1000000, stack=bytes(128), k6=None, crc=None):
-    """k6 = (src, lat, msite, mgap) or None for an older-format record."""
+                tid=0x80002000, ts=1000000, stack=bytes(128), k6=None, slen=None, crc=None):
+    """k6 = (src, lat, msite, mgap) or None for an older-format record; slen (K1)
+    is appended only with k6."""
     extra = None if k6 is None else (ord(k6[0]), k6[1], k6[2], k6[3])
+    if extra is not None and slen is not None:
+        extra += (slen,)
     crc = _sample_checksum(cpu, seq, pc, lr, fp, sp, spsr, tid, ts, stack, extra) \
         if crc is None else crc
     tail = "" if k6 is None else \
         f" src={k6[0]} lat={k6[1]:08x} msite={k6[2]:08x} mgap={k6[3]:08x}"
+    if k6 is not None and slen is not None:
+        tail += f" slen={slen:08x}"
     return (f"SAMPLE seq={seq:08x} cpu={cpu} pc={pc:08x} lr={lr:08x} fp={fp:08x} "
             f"sp={sp:08x} spsr={spsr:08x} tid={tid:08x} ts={ts:016x} "
             f"stack={stack.hex()}{tail} crc={crc:08x}\n")
@@ -66,6 +71,36 @@ class K6Tests(unittest.TestCase):
         good = sample_line(k6=("t", 3, 0, 0xffffffff))
         bad = good.replace("lat=00000003", "lat=00000004")
         self.assertEqual(parse_samples(self.write(bad)), [])
+
+    def test_slen_bounds_the_stack_window(self):
+        stack = bytes(range(16)) + bytes(112)
+        s = parse_samples(self.write(sample_line(stack=stack, k6=("p", 400, 0, 0xffffffff),
+                                                 slen=16)))
+        self.assertEqual(s[0]["slen"], 16)
+        from pi4_pc_histogram import make_read_memory
+        window = s[0]["stack"][:s[0]["slen"]]
+        read = make_read_memory(window, 0x1000)
+        self.assertEqual(read(0x1000 + 12, 4), int.from_bytes(bytes(range(12, 16)), "little"))
+        self.assertEqual(read(0x1000 + 16, 4), 0)   # past the copied bytes: clean stop
+
+    def test_slen_corruption_and_overrange_are_rejected(self):
+        good = sample_line(k6=("p", 400, 0, 0xffffffff), slen=16)
+        self.assertEqual(parse_samples(self.write(good.replace("slen=00000010",
+                                                                "slen=00000011"))), [])
+        self.assertEqual(parse_samples(self.write(sample_line(k6=("p", 400, 0, 0xffffffff),
+                                                              slen=200))), [])
+
+    def test_k6_record_without_slen_still_parses(self):
+        s = parse_samples(self.write(sample_line(k6=("t", 3, 0, 0xffffffff))))
+        self.assertIsNone(s[0]["slen"])
+
+    def test_exporter_accepts_slen_and_rejects_overrange(self):
+        ok = sample_line(k6=("p", 400, 0, 0xffffffff), slen=64) + "SAMPLE done\n"
+        samples, _ = read_capture(Path(self.write(ok)))
+        self.assertEqual(samples[0]["slen"], 64)
+        bad = sample_line(k6=("p", 400, 0, 0xffffffff), slen=200) + "SAMPLE done\n"
+        with self.assertRaises(ValueError):
+            read_capture(Path(self.write(bad)))
 
     def test_older_record_still_parses_without_k6_fields(self):
         s = parse_samples(self.write(sample_line()))

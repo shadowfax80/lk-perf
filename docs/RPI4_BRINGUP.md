@@ -3,6 +3,14 @@
 > Work queue, ownership and status updates: [HANDOFF.md](HANDOFF.md). This
 > file is the hardware evidence record.
 
+**Stack-copy bounds, K1 (2026-10-05, Claude):** the per-sample 128-byte
+stack copy read past the end of thread stacks whenever a thread ran near its
+stack top. That was the normal case: every four-core-workload sample had only
+20 bytes above SP, so it read 108 bytes beyond. The copy now stops at the
+stack top (thread stack, or the per-core boot stack for idle threads), and
+the unwinder stops there too, removing a fake duplicate root frame. Details:
+[results/k1_stack_bounds_20261005](results/k1_stack_bounds_20261005/README.md).
+
 **Pseudo-NMI sampling, K12 (2026-10-05, Claude):** with `profiler nmion`,
 LK masks thread code by GIC priority and the PMU interrupts outrank it. In the
 ground-truth test, 50.5% of PMU samples landed inside the masked code itself

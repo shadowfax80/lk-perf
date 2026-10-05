@@ -171,6 +171,21 @@ def main():
         print("\nPASS: matches hand-traced ground truth "
               "(leaf_func -> mid_func -> outer_func -> _start)")
 
+        # K1: a known stack top ends the walk at the frame whose CFA (its
+        # caller's SP) reaches it. Hand-traced CFAs: leaf_func 0xc140,
+        # mid_func 0xc150, outer_func 0xc160.
+        with DwarfCFIUnwinder(str(elf_path)) as unwinder:
+            at_mid = unwinder.unwind(pc, {SP_REG: sp, LR_REG: lr}, read_memory,
+                                     stack_top=0xC150)
+            at_outer = unwinder.unwind(pc, {SP_REG: sp, LR_REG: lr}, read_memory,
+                                       stack_top=0xC160)
+            beyond = unwinder.unwind(pc, {SP_REG: sp, LR_REG: lr}, read_memory,
+                                     stack_top=0xD000)
+        assert at_mid == [0x8038, 0x8078], [hex(p) for p in at_mid]
+        assert at_outer == [0x8038, 0x8078, 0x80AC], [hex(p) for p in at_outer]
+        assert beyond == expected, [hex(p) for p in beyond]
+        print("PASS: a known stack top stops the walk at the frame whose CFA reaches it")
+
         # The target platform's workload is ARM/Thumb interworking code: BL/BLX sets
         # LR with the ISA bit (bit 0) when the call target is Thumb, and
         # Thumb function symbols carry the same bit in the ELF. This
