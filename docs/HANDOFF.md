@@ -80,7 +80,7 @@ snapshot, not a live guarantee.
 
 | Holder | Since | Purpose |
 |---|---|---|
-| Claude | 2026-10-05 | K13 (image hash over segment gaps), K14 (BOLT-safe masking-site capture), for bolt-aarch32 B1 |
+| — (free) | 2026-10-05 | Released by Claude after K13-K15; shared checkout at the K15 commit, untracked `scripts/flamegraph.pl` (Codex) left in place |
 
 ## Pi state (last release, copied from bolt-aarch32)
 
@@ -105,6 +105,7 @@ current source. *Owner* is empty until someone claims it.
 
 | ID | Item | Owner | Evidence |
 |---|---|---|---|
+| K15 | `profiler stat` left the cycle counter disabled, so later cycle-counter users read 0 (bolt-aarch32 `bolt_bench` after a `stat`) | Claude | Pi: `PMCNTENSET` 0x80000000 / 0x80000001 (sampling armed) unchanged across `stat`; `profiler pmu` now prints it; [bolt-aarch32 B1](https://github.com/shadowfax80/bolt-aarch32/blob/main/docs/results/b1_sampling_vs_instrumentation_20261005/README.md) |
 | K14 | Masking-site capture read the PC as data (`mov rX, pc`) in every inlined `arch_disable_ints()`; now the return address of an out-of-line helper (overlay 0016) | Claude | BOLT refusals on the combined LK image: 44 kernel functions -> 2 (both hand-written assembly); no `mov rX, pc` left in the lk-perf image; site attribution unchanged in kind (an address inside the masking function); [bolt-aarch32 B1](https://github.com/shadowfax80/bolt-aarch32/blob/main/docs/results/b1_sampling_vs_instrumentation_20261005/README.md) |
 | K13 | Host image hash failed on ELFs with gaps between load segments (every dump of such an image looked like a mismatch); gaps now hash as the zero fill objcopy uploads | Claude | A 2-byte gap in an ARM-mode bolt-aarch32 build: host hash now equals the target's (`e4a8ead8`); gap test in `test_irqmask_report.py` (24); found in [bolt-aarch32 B1](https://github.com/shadowfax80/bolt-aarch32/blob/main/docs/results/b1_sampling_vs_instrumentation_20261005/README.md) |
 | K8 | Scheduling capture: overlay 0015 hooks, per-core event rings (switch, wakeup, name, ARM clock/throttling), `profiler sched/schedump/schedtest/freq`, `pi4_sched_report.py` with systrace export for Perfetto | Claude | Pi `schedtest`: event blocks, CPU times and sleeps match the design and independent CNTPCT timing; Perfetto trace_processor CPU times equal the report, waker links match; stress with pseudo-NMI and sampling clean; ~170 instructions/event; `test_sched_report.py` 5; [results/k8_sched_20261005](results/k8_sched_20261005/README.md) |
@@ -128,6 +129,20 @@ Earlier milestones (M1–M5, DWARF unwinder, review Phases 1–2) are recorded i
 [RPI4_BRINGUP.md](RPI4_BRINGUP.md).
 
 ## Handoff log
+
+### 2026-10-05 — Claude: K13, K14, K15 done (from bolt-aarch32 B1); lock released
+
+- Found while combining lk-perf's profiler with bolt-aarch32's LK for B1
+  (BOLT from lk-perf samples vs instrumentation, see bolt-aarch32
+  docs/results/b1_sampling_vs_instrumentation_20261005).
+- K13: host image hash failed on ELF segment gaps (ARM-mode build).
+- K14: overlay 0016, masking site from a return address; the inline
+  `mov rX, pc` made BOLT refuse 44 kernel functions (now 2).
+- K15: `stat` restores the counter-enable bits (it left the cycle counter
+  off, so bolt_bench read 0 cycles after a `stat`).
+- lk-perf's sampler, with K10 timer mode and K12 pseudo-NMI (bolt_bench
+  times with IRQs masked), produced BOLT profiles within 0.1-0.3% of
+  instrumentation where it had enough samples.
 
 ### 2026-10-05 — Claude: K9 and K8 done; lock and Pi released
 

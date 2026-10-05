@@ -3,6 +3,13 @@
 > Work queue, ownership and status updates: [HANDOFF.md](HANDOFF.md). This
 > file is the hardware evidence record.
 
+**BOLT interplay, K13-K15 (2026-10-05, Claude):** building lk-perf's
+profiler into bolt-aarch32's LK image (bolt-aarch32 B1) found three issues:
+the host image hash failed on segment gaps (K13), the masking-site PC read
+made 44 kernel functions un-relocatable by BOLT (K14, overlay 0016), and
+`stat` left the cycle counter disabled (K15). All fixed and checked on the
+Pi.
+
 **Scheduling capture, K8 (2026-10-05, Claude):** context switches, wakeups
 (with reason, wait queue and waker), thread names and the ARM clock are
 recorded per core (overlay 0015, `profiler sched on`), reported by

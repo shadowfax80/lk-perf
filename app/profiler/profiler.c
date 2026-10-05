@@ -207,6 +207,9 @@ static inline void pmu_write_pmselr(uint32_t v) {
 static inline uint32_t pmu_read_pmselr(void) {
     uint32_t v; __asm__ volatile("mrc p15, 0, %0, c9, c12, 5" : "=r"(v)); return v;
 }
+static inline uint32_t pmu_read_pmcntenset(void) {
+    uint32_t v; __asm__ volatile("mrc p15, 0, %0, c9, c12, 1" : "=r"(v)); return v;
+}
 static inline void pmu_write_pmcntenclr(uint32_t v) {
     __asm__ volatile("mcr p15, 0, %0, c9, c12, 2" :: "r"(v));
 }
@@ -512,6 +515,10 @@ static uint32_t profiler_stat_ovf[SMP_MAX_CPUS][PROFILER_STAT_MAX];
 static uint64_t profiler_stat_val[SMP_MAX_CPUS][PROFILER_STAT_MAX];
 static uint64_t profiler_stat_cyc[SMP_MAX_CPUS];
 static uint32_t profiler_stat_pmcr[SMP_MAX_CPUS];
+// K15: counters (and the cycle counter) that were enabled before `stat`;
+// other code -- bolt-aarch32's bolt_bench timing -- relies on the cycle
+// counter staying enabled, so `stat` gives back exactly this state.
+static uint32_t profiler_stat_cnten[SMP_MAX_CPUS];
 static volatile uint32_t profiler_stat_busy;
 
 // From the PMU interrupt, or with the counters frozen: count the overflows
@@ -533,6 +540,7 @@ static void profiler_stat_arm_this_cpu(void *context) {
     const struct profiler_stat_cfg *c = &profiler_stat_cfg;
     uint32_t mask = 0;
     uint32_t sel = pmu_read_pmselr();
+    profiler_stat_cnten[cpu] = pmu_read_pmcntenset();
     for (uint32_t i = 0; i < c->n; i++) {
         uint32_t ctr = c->first + i;
         pmu_write_pmcntenclr(1u << ctr);
@@ -573,6 +581,8 @@ static void profiler_stat_read_this_cpu(void *context) {
     pmu_write_pmintenclr(mask);
     profiler_stat_mask[cpu] = 0;
     pmu_write_pmcr(profiler_stat_pmcr[cpu]);
+    // K15: re-enable what was enabled before (the read above disabled it)
+    pmu_write_pmcntenset(profiler_stat_cnten[cpu] & (mask | PMU_CYCLE_BIT));
 }
 
 static void profiler_pmu_disarm_this_cpu(void *context) {
@@ -2562,8 +2572,9 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         // reports the PMU (K9: it used to say the interrupt path was
         // unverified).
         uint32_t pmcr = pmu_read_pmcr();
-        printf("pmu: PMCR=%08x, %u event counters + cycle counter; PMCEID0=%08x PMCEID1=%08x\n",
-               pmcr, (pmcr >> 11) & 0x1f, pmu_read_pmceid0(), pmu_read_pmceid1());
+        printf("pmu: PMCR=%08x, %u event counters + cycle counter; PMCEID0=%08x PMCEID1=%08x "
+               "PMCNTENSET=%08x (cpu%u)\n", pmcr, (pmcr >> 11) & 0x1f, pmu_read_pmceid0(),
+               pmu_read_pmceid1(), pmu_read_pmcntenset(), arch_curr_cpu_num());
         printf("pmu: counting: `profiler stat [-e ev,...] <command>`; sampling: "
                "`profiler pmustart <event> <count>` / `pmustop`\n");
     } else if (!strcmp(sub, "status")) {

@@ -8,6 +8,7 @@
 | exporter | Timestamped perf-script export ([EXPORT.md](EXPORT.md), [verification](results/PERF_EXPORT_VERIFICATION.md)) |
 | `0f7f5e3` (K6) | IRQ-masked time accounting, delayed-sample attribution, delay-compensated PMU reload, console printing without IRQ masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
 | `84c25a9` (K12) | Opt-in pseudo-NMI sampling by GIC priority masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
+| K15 | `stat` restores the counter-enable state it found ([§6.3](#63-profiler-stat)) |
 | K14 | Masking-site capture without reading the PC as data, so BOLT can relocate the kernel (overlay 0016, [§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
 | K13 | Image hash over gaps between load segments ([§7.3](#73-sample-text-format)) |
 | K8 | Scheduler events: context switches, wakeups (with reason and wait queue), thread names, ARM clock and throttling; report and Perfetto systrace export ([§4.8](#48-scheduler-events)) |
@@ -422,7 +423,7 @@ profiler stat [iters]          (built-in profiler_workload_a, 5,000,000 iteratio
 
 `stat` (K7) counts a console command on every core at once: an IPI arms the counters on all cores, the command runs through LK's `console_run_script_locked`, and a second IPI freezes and reads them. A command that migrates or starts threads elsewhere is therefore fully counted. The report has one row per core, a total row, and derived metrics in integer arithmetic: IPC, L1D miss %, branch mispredict %, and L2D refills per 1000 instructions.
 
-- **Counters.** Up to six event counters plus the cycle counter. While `pmustart` sampling is armed on any core, counter 0 stays with sampling, so five events are available and sampling keeps running; `pmustart` is refused while `stat` counts. On return, PMCR goes back to its previous value.
+- **Counters.** Up to six event counters plus the cycle counter. While `pmustart` sampling is armed on any core, counter 0 stays with sampling, so five events are available and sampling keeps running; `pmustart` is refused while `stat` counts. On return, PMCR goes back to its previous value, and since K15 so do the counter-enable bits (the cycle counter stays enabled for other code that times with it, such as bolt-aarch32's `bolt_bench`).
 - **Width.** The cycle counter runs in its 64-bit mode (PMCR.LC). Event counters are 32 bits; their overflow interrupt (the same per-core SPIs as PMU sampling) counts wraps per core. The read step also folds in a wrap whose interrupt is still pending. The PMU handler reads PMOVSR, so only counter 0's flag produces a sample.
 - **Events.** Default: INST_RETIRED, L1D_CACHE_REFILL, L1D_CACHE, BR_MIS_PRED, BR_PRED, L2D_CACHE_REFILL; the last is dropped when only five counters are free. Events 0x00–0x3f not marked in PMCEID get a warning; higher (implementation-defined) events are accepted. No filtering: EL0 and EL1 count; EL2 does not.
 - **Window.** Nothing prints between arm and read (K4) except the command itself, whose output is counted, as under `perf stat`. The arm and read IPIs add a few microseconds; idle cores show about 2,000 cycles, because the cycle counter stops in WFI.
