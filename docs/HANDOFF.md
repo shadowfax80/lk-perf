@@ -98,17 +98,17 @@ current source. *Owner* is empty until someone claims it.
 
 | Order | ID | Item | Priority | Owner | Status | Notes |
 |---|---|---|---|---|---|---|
-| 1 | K4 | `profiler stat` counts its own `printf` output (counters start before the status prints) | P2 | Claude | In progress | Finding #10; confirmed still present in `profiler.c` |
-| 2 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Blocked | Feasibility done (Claude, K11): A72 implements `EDPCSR` and the CPU reaches every core's debug block, but the SoC disables non-invasive debug (`DBGAUTHSTATUS` 0xaa), so `EDPCSR` reads `ffffffff`. Untested lever: `enable_jtag_gpio=1` in `config.txt` (SD-card change, needs user approval). On the target: `profiler dbginfo`; [results](results/k11_edpcsr_feasibility_20261005/README.md) |
-| 3 | K7 | Full `profiler stat`: any command, all 6 counters, derived IPC | P3 | Claude | In progress | Review Phase 3 item 3 |
-| 4 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
-| 5 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim | P3 | — | Open | Fold into the next commit touching the same file |
-| 6 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
+| 1 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Blocked | Feasibility done (Claude, K11): A72 implements `EDPCSR` and the CPU reaches every core's debug block, but the SoC disables non-invasive debug (`DBGAUTHSTATUS` 0xaa), so `EDPCSR` reads `ffffffff`. Untested lever: `enable_jtag_gpio=1` in `config.txt` (SD-card change, needs user approval). On the target: `profiler dbginfo`; [results](results/k11_edpcsr_feasibility_20261005/README.md) |
+| 2 | K7 | Full `profiler stat`: any command, all 6 counters, derived IPC | P3 | Claude | In progress | Review Phase 3 item 3 |
+| 3 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
+| 4 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim | P3 | — | Open | Fold into the next commit touching the same file |
+| 5 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
 
 ### Done (recent)
 
 | ID | Item | Owner | Evidence |
 |---|---|---|---|
+| K4 | `profiler stat` counted its own `printf` output | Claude | Pi: `stat 1000` 77,928 -> 2,009 cycles (about 76,000 cycles were console printing); `stat 5000000` 10,053,414 -> 10,001,332 = 2.000 cycles/iteration |
 | K5 | `setup.sh` re-run failed on files the overlay patches create (`gic.h`, `irqmask.c`) | Claude | Scratch copy of a set-up tree: old script fails (`gic.h: already exists`), new script runs twice clean, all 14 patches apply, also on upstream tip `fe5e5a00`, which builds with no FPU instructions |
 | K10 | Timer-mode sampling on the profiler's own per-core virtual timer: fixed grid, one sample at a random point of each period, lost periods counted, period selectable (`start [period_us]`), dump format 3; timer samples also reach masked code under pseudo-NMI | Claude | Pi `masktest` 50% masked, about 4000 samples per run: 49.0% (1 ms), 50.9% (10 ms, commensurate), 50.4% pseudo-NMI with 0 delayed; was 65% on LK's tick; `test_irqmask_report.py` 23; [results/k10_timer_sampling_20261005](results/k10_timer_sampling_20261005/README.md) |
 | K3 | No-CFI fallback: caller of assembly without CFI taken from a validated LR (follows a call, outside the leaf) | Claude | Pi `memtest`: all 460 `memcpy`/`memset` samples attributed to their true callers (previously no caller); earlier captures unchanged; `nocfi.S` unwinder fixture, exporter tests 27; [results/k3_nocfi_fallback_20261005](results/k3_nocfi_fallback_20261005/README.md) |

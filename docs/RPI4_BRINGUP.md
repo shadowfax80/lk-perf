@@ -949,7 +949,9 @@ capable/convenient. Only the first tier clears that bar.
   line in the file with no way to tell one run from another. Fix: a
   run-id (boot timestamp or counter) on each `SAMPLE` line;
   `pi4_pc_histogram.py` filters to the latest by default.
-- **`profiler stat` counts its own `printf` calls (finding #10).** The
+- **Fixed (K4, 2026-10-05): `profiler stat` counts its own `printf` calls (finding #10).**
+  Pi: `stat 1000` 77,928 -> 2,009 cycles; `stat 5000000` 10,053,414 ->
+  10,001,332 (exactly 2 cycles per iteration). Original note: The
   counters start before two UART prints and stop after reading them,
   so `stat`'s own console output is folded into the measured cycles.
   Fix: print all setup output, *then* start counting.

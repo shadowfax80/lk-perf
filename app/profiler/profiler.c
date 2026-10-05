@@ -1715,22 +1715,20 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         pmu_write_pmxevtyper(PROFILER_PMU_EVENT_L1D_CACHE_REFILL);
         pmu_write_pmxevcntr(0);
 
-        printf("stat: enabling cycle counter + event counter 1 ...\n");
+        // K4: nothing may print between start and stop. A console line is
+        // tens of microseconds of UART work at 6 Mbaud (more while the
+        // FIFO drains), which the counters used to include.
+        printf("stat: counting the cycle counter + event counter 1 over the workload "
+               "(%u iters) ...\n", iters);
         pmu_write_pmcntenset((1u << 31) | (1u << 1));
+        pmu_write_pmcr(pmcr | (1u << 0) | (1u << 2));   // start, cycle counter reset
 
-        printf("stat: resetting the cycle counter and starting (PMCR E|C) ...\n");
-        pmu_write_pmcr(pmcr | (1u << 0) | (1u << 2));
-
-        printf("stat: running workload (%u iters) ...\n", iters);
         profiler_workload_a(iters);
 
-        printf("stat: reading PMCCNTR/PMXEVCNTR ...\n");
         uint32_t cycles = pmu_read_pmccntr();
         pmu_write_pmselr(1);
         uint32_t l1d_refills = pmu_read_pmxevcntr();
-
         // Stop only counter 1; PMCR goes back to what it was (enabled if sampling is).
-        printf("stat: stopping (counter 1 off, PMCR restored) ...\n");
         pmu_write_pmcntenclr(1u << 1);
         pmu_write_pmcr(pmcr);
 
