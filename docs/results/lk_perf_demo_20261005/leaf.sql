@@ -1,0 +1,1 @@
+SELECT f.name,COUNT(*) AS samples FROM cpu_profile_stack_sample s JOIN stack_profile_callsite c ON c.id=s.callsite_id JOIN stack_profile_frame f ON f.id=c.frame_id GROUP BY f.name ORDER BY samples DESC;

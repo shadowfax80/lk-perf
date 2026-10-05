@@ -1,0 +1,1 @@
+WITH start AS (SELECT MIN(ts) AS t0 FROM cpu_profile_stack_sample) SELECT CAST((s.ts-start.t0)/100000000 AS INT) AS bin_100ms,t.tid,COUNT(*) AS samples FROM cpu_profile_stack_sample s JOIN thread t ON t.utid=s.utid CROSS JOIN start GROUP BY bin_100ms,t.tid ORDER BY bin_100ms,t.tid;

@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "format": "perf-script-text",
+  "export_id": "c535eae4-a088-409b-9126-3468195ef811",
+  "capture_run_id": "pi4-smp-demo-20261005",
+  "artifacts": {
+    "log": {
+      "path": "/home/user/lk-perf/build/demo-20261005/capture.log",
+      "sha256": "1b391f0b735fde59a9bcbebcc064b67f2a1540c05089fc9c18c81c9785681be9"
+    },
+    "elf": {
+      "path": "/home/user/lk-perf/build/lk/build-rpi4-test/lk.elf",
+      "sha256": "3755fe64508b39733aad9d6ff63c80bad2f9237ff67ba011e2f19a65553ee0d5"
+    },
+    "image": {
+      "path": "/home/user/lk-perf/build/lk/build-rpi4-test/lk.bin",
+      "sha256": "32ed81f2a0f9c4652848c473b7bfb91b88158e08aa508ea8b5369dc90a555ca7"
+    }
+  },
+  "capture": {
+    "mode": "pmu",
+    "event": "cpu-cycles",
+    "period": 1000000,
+    "metadata_source": "operator-supplied; not target-verified",
+    "clock": "target-generic-timer-microseconds",
+    "clock_offset_applied_us": 0,
+    "pid": 1,
+    "pid_tid_kind": "synthetic; pointer mapping below",
+    "header_period_kind": "operator-period",
+    "first_timestamp_us": 8269296,
+    "last_timestamp_us": 9601825
+  },
+  "quality": {
+    "checksum_rejections": 0,
+    "malformed_records": 4,
+    "sequence_gaps": 5,
+    "dump_done_observed": true,
+    "trailing_loss_count_known": false,
+    "overwrite_count_known": false,
+    "unwind_exception_samples": 0,
+    "unwind_depth_counts": {
+      "4": 3195
+    },
+    "unwind_completeness": "not_proven",
+    "threads": [
+      {
+        "pid": 1,
+        "tid": 1,
+        "thread_pointer": "0x80000128",
+        "comm": "lk-80000128"
+      },
+      {
+        "pid": 1,
+        "tid": 2,
+        "thread_pointer": "0x80000d58",
+        "comm": "lk-80000d58"
+      },
+      {
+        "pid": 1,
+        "tid": 3,
+        "thread_pointer": "0x80000e00",
+        "comm": "lk-80000e00"
+      },
+      {
+        "pid": 1,
+        "tid": 4,
+        "thread_pointer": "0x80000ea8",
+        "comm": "lk-80000ea8"
+      }
+    ],
+    "exported_samples": 3195,
+    "per_cpu_samples": {
+      "0": 797,
+      "1": 798,
+      "2": 800,
+      "3": 800
+    }
+  },
+  "known_limitations": [
+    "Missing stack frames cannot be recovered: the 128-byte snapshot, missing registers/CFI, unsupported CFI rules, and optimized-away frames limit unwinding.",
+    "Execution while IRQs are masked is invisible to both IRQ-driven sampling modes; a delayed sample cannot reconstruct that execution.",
+    "The target dump has no build/run/mode/event identity. ELF pairing and single-mode capture are operator responsibilities; artifact hashes do not prove that the ELF matches the running image.",
+    "The completion marker is required, but no target footer count proves absence of trailing loss or ring overwrite; captures must be stopped before dumping for a coherent snapshot.",
+    "Thread-object pointers may be reused. Synthetic IDs identify pointer values within this export, not operating-system PIDs or thread lifetimes.",
+    "Timestamps are target generic-timer microseconds, not a host/Linux clock. External importers may round timestamps or omit CPU/event/period fields.",
+    "Scheduling, wakeups, blocking reasons/durations, and CPU-frequency history are not captured. Stack samples cannot establish scheduler latency, off-CPU wait causes, or frequency changes; additional instrumentation and event export are required."
+  ],
+  "output": {
+    "path": "/home/user/lk-perf/build/demo-20261005/demo.perf",
+    "sha256": "8ab4579c27050b115084622d09a8d8bb51344fc85faa8b531a1b4e2a81f809a8"
+  }
+}

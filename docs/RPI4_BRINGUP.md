@@ -1,6 +1,22 @@
 # Raspberry Pi 4B bring-up plan
 
-**Hardware profile demo in progress (2026-10-05, Codex):** designated workload is profiler smp 400000000 (four nested-call workers), using PMU CPU cycles (0x11, period 1000000). Produce real capture, image identity, FlameGraph SVG, perf-script export and verified Perfetto analysis. Shared Pi reservation published in BOLT handoff. Inspect/reuse existing lk-perf image without rebuilding shared live LK source. No target code changes intended; release Pi/serial and record sampler state and results on completion.
+**Hardware profile demo complete (2026-10-05, Codex):**
+[`profiler smp 400000000` demo](results/lk_perf_demo_20261005/README.md)
+captured PMU CPU-cycle samples (event 0x11, period 1000000) on all four Pi
+cores. Target retained 3200 samples, 800/core. Initial serial dump lost five
+records; a lightweight redump of the same stopped buffers exported all 3200
+with zero malformed records, checksum rejections or sequence gaps. Published
+raw archives, exact image/debug ELF, interactive FlameGraph SVG, perf-script
+text/metadata, seven Perfetto SQL analyses with saved CSV, and offline replay.
+Perfetto v58.2 imported 3200 samples, four threads with 800 each, and identical
+stack paths; timestamps matched within 1 ns, importer error stats were zero.
+Sample span: 1.332529 seconds. Every leaf is `profiler_workload_inner`; an
+unresolved outer frame remains visible. Archive/ELF-image identity and full
+offline replay passed. Reused existing build; no source/overlay/build change.
+Pi left at lk-perf shell, 6000000 baud, both samplers stopped, 3200 samples
+retained, COM5 closed. Software reset replaced the old BOLT payload; no
+watchdog command issued by lk-perf. Shared Pi reservation released in BOLT
+handoff; recheck state before next use. Known capture limitations remain open.
 
 **Known-limitations update (2026-10-05, Codex):** scheduling, wakeups,
 blocking reasons/durations, and CPU-frequency history are not captured.

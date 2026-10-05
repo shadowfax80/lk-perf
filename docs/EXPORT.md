@@ -1,5 +1,8 @@
 # Standard-tool profile export
 
+For an end-to-end worked example using real Pi data, see the
+[FlameGraph and Perfetto demo](results/lk_perf_demo_20261005/README.md).
+
 [`scripts/pi4_perf_export.py`](../scripts/pi4_perf_export.py) exports one completed
 lk-perf dump as timestamped **`perf script`-compatible text**, plus a JSON metadata
 sidecar. The text is suitable for profile viewers that import this format.

@@ -1,0 +1,99 @@
+{
+  "workload": "profiler smp 400000000",
+  "mode": "PMU CPU cycles",
+  "event": "0x11",
+  "period": 1000000,
+  "tool_versions": {
+    "trace_processor": "Perfetto v58.2-add693d8b (add693d8b338ba9599dbcbc3e300b1ab8c000897)\nTrace Processor RPC API version: 14",
+    "flamegraph_source": "https://raw.githubusercontent.com/brendangregg/FlameGraph/master/flamegraph.pl",
+    "flamegraph_sha256": "088f82e6848a4f12a56e1e8e8170ee6761fccf12e5615cd64630f6b087c99ea7"
+  },
+  "verified": {
+    "elf_objcopy_matches_uploaded_bin": true,
+    "export_and_perfetto_counts_equal": true,
+    "perfetto_stacks_equal_folded": true,
+    "timestamps_match_within_1ns": true,
+    "import_error_stats": 0
+  },
+  "summary": [
+    {
+      "samples": "3200",
+      "first_ns": "8269296000",
+      "last_ns": "9601825000",
+      "sample_span_s": "1.332529",
+      "threads": "4"
+    }
+  ],
+  "threads": [
+    {
+      "tid": "1",
+      "name": "lk-80000128",
+      "samples": "800",
+      "first_ns": "8269296000",
+      "last_ns": "9601583000"
+    },
+    {
+      "tid": "2",
+      "name": "lk-80000d58",
+      "samples": "800",
+      "first_ns": "8269514999",
+      "last_ns": "9601776000"
+    },
+    {
+      "tid": "3",
+      "name": "lk-80000e00",
+      "samples": "800",
+      "first_ns": "8269539999",
+      "last_ns": "9601825000"
+    },
+    {
+      "tid": "4",
+      "name": "lk-80000ea8",
+      "samples": "800",
+      "first_ns": "8269517000",
+      "last_ns": "9601777000"
+    }
+  ],
+  "frames": [
+    {
+      "stack": "[unknown];initial_thread_func;profiler_smp_worker;profiler_workload_inner",
+      "samples": "3200"
+    }
+  ],
+  "accepted_per_cpu": {
+    "0": 800,
+    "1": 800,
+    "2": 800,
+    "3": 800
+  },
+  "notes": [
+    "First dump lost five records; lightweight redump recovered all 3200 from same stopped buffers.",
+    "All samples have one unresolved outer frame; do not interpret it as a proven root.",
+    "CPU fields preserved in text; this Perfetto importer has no CPU column in cpu_profile_stack_sample."
+  ],
+  "files": {
+    "absent_events.csv": "1042333ff31d955a0843c2b0facb99c7433357046b19f01ab84f6699df5c3c1f",
+    "absent_events.sql": "09ea257e97ee7d7a6a838181fe9a3a0bd797295b4cc3fd176234d23f2e06f0f1",
+    "boot-session.log.gz": "49c7c26d01d8df1c498a4f661dc7fbd9a564cd8870dcae50787d76efa1baec9a",
+    "capture.log.gz": "53ee5974b87706118f5b35144edb810e53648a71283732ca9db0e28222b0de5d",
+    "demo.folded": "74aa769522aed40e0bacc6407d197130d14d3d0abbaf2e3f67860f0e15d502ce",
+    "demo.perf": "7ef66af6a7ef13fe9e006591987698ee14cc11e741b0f38e961b48bc3cd1b23a",
+    "demo.perf.metadata.json": "e78fb5661867c5a6f2a7edabe102cb356c241cb448980dfe632dc626f4f47104",
+    "errors.csv": "f6831b2f0582983864253f938c4c07dc1742c45b979b532ea95b071fbbcfafd6",
+    "errors.sql": "9b30df1d63db8cc51390ddc8c1c04cf53723992edcf88626ffca7895ab6ee7f3",
+    "first-dump.metadata.json": "564c18a017a96bc6500af309b8b0ab5374681edf26bfeb43ad65a0937364a974",
+    "flamegraph.svg": "cd98144825ac2812ea5a44f6d79c6c1d1031caf865c29516c1f3c132959a0f38",
+    "leaf.csv": "ab76579bb5570e7e087afd5f7297eb6a407590d08699900b3c4f1fb3a4cde886",
+    "leaf.sql": "59b34680f1cb95aa27623fa7bb1bd636376cfc9f4c7720f14b134d0e21d59986",
+    "lk.bin.gz": "ad2a7f058cd20dd6efea845ab3b3a75ead4c169a2676d7169ac5a16bd442a1a2",
+    "lk.elf.gz": "13000aeee10f882a504918ca14ec267558c8e9332e63b2cce3e6c9686f0fd901",
+    "stacks.csv": "8d16d53ee1da9a607fac0358159c49c102b2d29755ad4c7f4c334fb7c244de60",
+    "stacks.sql": "f617228518efa13e789ea9357385b50b69f2178aa5388096b3f8a2caeeca5eb8",
+    "summary.csv": "34a658ade28bad9447c10fc4acc7252e4196bb7e1086378fae677c6072e399e0",
+    "summary.sql": "1ca45c51c19cc7f856f7b86c5cd688a5c3b8d4bc530b63a5b4d0398149979de8",
+    "threads.csv": "688ae2dc0d2fda9aeb169223f83b23b5530e2434c214b838e79868f5b05e853a",
+    "threads.sql": "dc8672e90d85cbe6e5818bde14ad1469d495bed998e14234971b6da1693c3ca0",
+    "time_bins.csv": "0b09d2d3dc4ac74fe75d557f5d9983646b9d588b694a5beded3e30c9e157a9fd",
+    "time_bins.sql": "d73e94867c1956799524407be258bf99db1497aa1b214feca03585cd77f53d65"
+  }
+}

@@ -28,6 +28,10 @@ thread identities. A JSON sidecar records hashes, supplied capture metadata,
 quality counts, and limitations. See [docs/EXPORT.md](docs/EXPORT.md) for PMU
 usage and the verified importer contract. This does not generate `perf.data`.
 
+See the [real Pi FlameGraph and Perfetto demo](docs/results/lk_perf_demo_20261005/README.md)
+for a four-core workload capture, interactive SVG, importable profile, saved
+SQL analysis, and an offline replay with the matching image/ELF.
+
 **Known limitations:** missing stack frames cannot be reconstructed from
 incomplete captured context, and execution while IRQs are masked is invisible
 to both sampling modes. Exporting or changing viewers cannot recover either.
