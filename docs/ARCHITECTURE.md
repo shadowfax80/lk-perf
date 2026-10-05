@@ -2,6 +2,12 @@
 
 **Implementation baseline:** lk-perf commit `5919f4006057cd8f20f5696d95ab749f171f3aa6`, inspected on 2026-10-05. This document describes the code at that revision; it does not claim a new hardware-validation run. Historical hardware observations are attributed to [RPI4_BRINGUP.md](RPI4_BRINGUP.md).
 
+**Exporter addition (2026-10-05):** the host-side timestamped perf-script
+exporter described below was added after this capture baseline. Its real
+Perfetto importer verification and current usage are documented in
+[EXPORT.md](EXPORT.md) and [the verification record](results/PERF_EXPORT_VERIFICATION.md).
+The target capture implementation is unchanged.
+
 lk-perf is a statistical sampling profiler for Little Kernel (LK) workloads executing in AArch32 on multiple cores. The target captures interrupted execution state and a bounded stack snapshot; Python tools recover call chains from the matching debug ELF and produce function histograms, disassembly annotations, and FlameGraph input. It is a standalone performance tool. It has no dependency on BOLT and does not validate BOLT transformations.
 
 This is the current implementation reference. [DESIGN.md](DESIGN.md) retains the original staged design and QEMU development history. [RPI4_BRINGUP.md](RPI4_BRINGUP.md) retains hardware evidence, decisions, and the work backlog. Its dated entries sometimes describe intermediate implementations; the actual source and later corrections govern the behavior described here. This document is not a second TODO queue.
@@ -98,6 +104,9 @@ flowchart LR
     CFI --> Report
     CFI --> Folded
     Folded --> SVG
+    Log --> Export[pi4_perf_export.py]
+    Elf --> Export
+    Export --> Viewers[perf-script text viewers and metadata sidecar]
 ```
 
 | Layer | Responsibility | Boundary |
@@ -111,6 +120,11 @@ flowchart LR
 | FlameGraph renderer | Convert collapsed stack counts into SVG | Downloaded external script; not profiler runtime code |
 
 The control plane is the LK shell plus the serial driver. The data plane is IRQ capture, per-core arrays, text dump, and offline analysis. Sampling does not depend on continuous host attachment: export occurs later, but only retained samples survive.
+
+The standalone perf-script exporter adds a stricter host conversion path
+beside the histogram tool. It reuses checksum/unwind helpers, requires one
+completed dump, sorts individual samples by timestamp, and exports a separate
+JSON provenance/quality sidecar. It does not modify the target data plane.
 
 ## 3. Build, boot, and platform integration
 
@@ -428,6 +442,15 @@ FDE lookup and symbol lookup are linear scans. Symbol-table caching avoids rebui
 
 Folded output reverses the unwinder's leaf-to-root chain and joins names with semicolons. Lines end in LF for renderer compatibility. `flamegraph.pl` is an external presentation step; SVG generation does not improve unwind accuracy. Annotation calls `arm-none-eabi-objdump -d` over each selected function range, relying on ELF mapping symbols for ARM/Thumb decoding. Failure to invoke objdump produces a diagnostic in the annotation output while the statistical report remains available.
 
+The newer [`pi4_perf_export.py`](../scripts/pi4_perf_export.py) exports each
+sample as perf-script text instead of aggregating identical chains. It retains
+timestamps and CPU fields, maps thread pointers to synthetic IDs, validates
+function extents and return-address symbol boundaries, and records supplied
+event/period/run metadata plus artifact hashes in a sidecar. Perfetto CLI
+import is verified; this is not native `perf.data`, and viewer import does
+not guarantee preservation of every CPU/event field. Missing frames and
+IRQ-masked execution remain known limitations in every sidecar.
+
 Timer samples approximate where execution is observed at scheduler timer interrupts, conditional on IRQ delivery. PMU samples reflect the chosen overflow period and interrupt latency; the PC need not identify the instruction that caused a cache miss or misprediction. The handler itself perturbs execution, and fixed-period sampling may correlate with workload periodicity. No sample-rate adaptation, multiplexing, counter scaling, event-weight field, or uncertainty estimate is implemented. Timestamps are captured during handler execution after the stack copy, not at the instant the hardware event occurred.
 
 ## 10. Operational workflow
@@ -591,6 +614,8 @@ Avoid turning a raw LR guess, a checksum-valid dump, or a plausible FlameGraph i
 | [pi4_serial_boot.py](../scripts/pi4_serial_boot.py) | Loader transport, baud switch, reboot helper, terminal/logging |
 | [pi4_run.py](../scripts/pi4_run.py) | Prompt-driven ordered shell commands |
 | [pi4_pc_histogram.py](../scripts/pi4_pc_histogram.py) | Text parser/integrity checks, snapshot reader, reporting, folded output, annotation |
+| [pi4_perf_export.py](../scripts/pi4_perf_export.py), [EXPORT.md](EXPORT.md) | Strict single-dump timestamped perf-script export and metadata/quality sidecar |
+| [test_perf_export.py](../scripts/test_perf_export.py), [perf_export.S](../scripts/testdata/perf_export.S) | Offline capture/export regressions and optional real Perfetto consumer test |
 | [dwarf_unwind.py](../scripts/dwarf_unwind.py) | CFI evaluator and ELF function/source resolution |
 | [test_dwarf_unwind.py](../scripts/test_dwarf_unwind.py), [testdata](../scripts/testdata) | Offline compiler/assembly fixtures and unwind regressions |
 | [pi4_doctor.py](../scripts/pi4_doctor.py), [pi4_baud_calibrate.py](../scripts/pi4_baud_calibrate.py) | Serial readiness and calibration tooling |

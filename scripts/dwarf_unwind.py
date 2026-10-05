@@ -48,19 +48,25 @@ class DwarfCFIUnwinder:
 
     def __init__(self, elf_path: str):
         self._f = open(elf_path, "rb")
-        self._elf = ELFFile(self._f)
-        if not self._elf.has_dwarf_info():
-            raise ValueError(f"{elf_path}: no DWARF info (build with -g)")
-        dwarf = self._elf.get_dwarf_info()
-        if not dwarf.has_CFI():
-            raise ValueError(
-                f"{elf_path}: no .debug_frame section (build with -g; "
-                f"do not strip debug sections)"
-            )
-        self._fdes: list[FDE] = []
-        for entry in dwarf.CFI_entries():
-            if isinstance(entry, FDE):
-                self._fdes.append(entry)
+        try:
+            self._elf = ELFFile(self._f)
+            if not self._elf.has_dwarf_info():
+                raise ValueError(f"{elf_path}: no DWARF info (build with -g)")
+            dwarf = self._elf.get_dwarf_info()
+            if not dwarf.has_CFI():
+                raise ValueError(
+                    f"{elf_path}: no .debug_frame section (build with -g; "
+                    f"do not strip debug sections)"
+                )
+            self._fdes: list[FDE] = []
+            for entry in dwarf.CFI_entries():
+                if isinstance(entry, FDE):
+                    self._fdes.append(entry)
+        except Exception:
+            # __exit__ cannot run if construction fails (e.g. a stale/stripped
+            # or malformed ELF supplied to an exporter). Do not leak the file.
+            self._f.close()
+            raise
 
     def close(self) -> None:
         self._f.close()

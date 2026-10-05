@@ -14,6 +14,24 @@ text below retain earlier milestones; the architecture document explicitly
 identifies current behavior, including the payload's 6,000,000-baud console
 and the host tools' required baud override.
 
+## Standard-tool export and known limitations
+
+Export a single completed dump as timestamped `perf script` text for Perfetto:
+
+```bash
+python3 scripts/pi4_perf_export.py capture.log build/lk/build-rpi4-test/lk.elf \
+  --output capture.perf --mode timer
+```
+
+This preserves individual samples, target timestamps, CPU fields, and mapped
+thread identities. A JSON sidecar records hashes, supplied capture metadata,
+quality counts, and limitations. See [docs/EXPORT.md](docs/EXPORT.md) for PMU
+usage and the verified importer contract. This does not generate `perf.data`.
+
+**Known limitations:** missing stack frames cannot be reconstructed from
+incomplete captured context, and execution while IRQs are masked is invisible
+to both sampling modes. Exporting or changing viewers cannot recover either.
+
 **Scope: a PoC for a real target platform's actual perf use case.**
 Stack unwinding uses DWARF CFI (`.debug_frame`), not ARM's own EXIDX --
 the target platform's shipped firmware carries no EXIDX (dropped from the production

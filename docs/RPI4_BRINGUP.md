@@ -1,5 +1,20 @@
 # Raspberry Pi 4B bring-up plan
 
+**Standard-tool exporter milestone (2026-10-05, Codex):**
+`scripts/pi4_perf_export.py` now exports one completed dump as timestamped
+perf-script text with a metadata sidecar. It preserves sample/CPU/time fields,
+maps thread pointers to synthetic PID/TIDs, checks dump boundaries/integrity,
+and records artifact hashes and operator-supplied event/run metadata.
+All 26 exporter tests passed, including real Perfetto Trace Processor v58.2
+import and SQL checks of sample counts, timestamps, identities, and call-chain
+order; existing DWARF regressions passed. See [EXPORT.md](EXPORT.md) and
+[verification evidence](results/PERF_EXPORT_VERIFICATION.md).
+Missing stack frames and execution while IRQs are masked remain explicit
+known limitations in docs and every export sidecar. No target code/overlay
+or Pi state changed, and no new hardware capture was claimed. The target's
+self-describing dump/build-ID/footer and capture-synchronization gaps remain
+open; host-side export metadata does not close those items.
+
 **Architecture documentation (2026-10-05, Codex):**
 [ARCHITECTURE.md](ARCHITECTURE.md) describes the implementation at `5919f40`,
 with diagrams, source references, capture/dump contracts, and correctness
@@ -264,10 +279,11 @@ Revised scope, closest analogue to `perf` noted per item:
      systematically wrong but internally-consistent line-number offset
      -- looked plausible, wasn't. Always re-fetch `lk.elf` alongside
      `lk.bin` after any rebuild, not just the binary needed to flash.
-   - Not done: a `perf script`-compatible text emitter. Lower priority
-     than source lines/annotate turned out to be -- FlameGraph
-     consumption already works via the existing folded-stack output;
-     revisit only if Firefox Profiler/hotspot import is actually needed.
+   - **Done (2026-10-05):** a timestamped `perf script`-compatible
+     text emitter, `scripts/pi4_perf_export.py`, verified with the real
+     Perfetto importer. See [EXPORT.md](EXPORT.md). This is not native
+     `perf.data` or Hotspot compatibility; target-side run/build/event
+     identity and counted dump footers remain separate open work.
 5. **PMU-event sampling. Done and confirmed working on real hardware
    (2026-09-28, commits `e9ed753`/`6aebf9c`).** `profiler pmustart
    <event> <count>` / `pmustop`: a real second sampling mode alongside
