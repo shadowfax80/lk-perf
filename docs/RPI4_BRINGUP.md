@@ -1,5 +1,7 @@
 # Raspberry Pi 4B bring-up plan
 
+**Hardware profile demo in progress (2026-10-05, Codex):** designated workload is profiler smp 400000000 (four nested-call workers), using PMU CPU cycles (0x11, period 1000000). Produce real capture, image identity, FlameGraph SVG, perf-script export and verified Perfetto analysis. Shared Pi reservation published in BOLT handoff. Inspect/reuse existing lk-perf image without rebuilding shared live LK source. No target code changes intended; release Pi/serial and record sampler state and results on completion.
+
 **Known-limitations update (2026-10-05, Codex):** scheduling, wakeups,
 blocking reasons/durations, and CPU-frequency history are not captured.
 Stack samples and gaps cannot establish scheduler latency, off-CPU wait
