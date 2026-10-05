@@ -109,6 +109,7 @@
 #include <lk/reg.h>
 #include <platform/interrupts.h>
 #include <platform/time.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -230,6 +231,23 @@ static inline void pmu_write_pmintenclr(uint32_t v) {
 static inline void pmu_write_pmovsr(uint32_t v) {
     __asm__ volatile("mcr p15, 0, %0, c9, c12, 3" :: "r"(v));
 }
+static inline uint32_t pmu_read_pmovsr(void) {
+    uint32_t v; __asm__ volatile("mrc p15, 0, %0, c9, c12, 3" : "=r"(v)); return v;
+}
+// K7: ARMv8 AArch32 gives PMCCNTR a 64-bit view (MRRC/MCRR), which with
+// PMCR.LC set also overflows at 64 bits.
+static inline uint64_t pmu_read_pmccntr64(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("mrrc p15, 0, %0, %1, c9" : "=r"(lo), "=r"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+static inline void pmu_write_pmccntr64(uint64_t v) {
+    __asm__ volatile("mcrr p15, 0, %0, %1, c9" :: "r"((uint32_t)v), "r"((uint32_t)(v >> 32)));
+}
+#define PMU_PMCR_E (1u << 0)
+#define PMU_PMCR_D (1u << 3)
+#define PMU_PMCR_LC (1u << 6)
+#define PMU_CYCLE_BIT (1u << 31)
 
 // Reload event counter 0 (the PMU-sampling counter) from interrupt context. PMSELR is
 // a single selector shared by every PMXEVCNTR/PMXEVTYPER access: writing it here without
@@ -474,6 +492,87 @@ static bool profiler_nmi_enable(void) {
     return true;
 }
 
+// K7: `profiler stat` counting state. Up to six event counters (five when
+// `pmustart` owns counter 0) plus the cycle counter, on every core at once,
+// so a command that migrates or runs threads on several cores is counted in
+// full. Event counters are 32 bits; their overflow interrupt (the same
+// per-core SPIs as PMU sampling) extends them to 64. The cycle counter uses
+// its native 64-bit mode.
+#define PROFILER_STAT_MAX 6
+struct profiler_stat_cfg {
+    uint32_t n;          // event counters in use
+    uint32_t first;      // first event counter index (1 if sampling owns 0)
+    uint32_t event[PROFILER_STAT_MAX];
+};
+static struct profiler_stat_cfg profiler_stat_cfg;
+volatile uint32_t profiler_stat_mask[SMP_MAX_CPUS];   // counters `stat` owns now
+static uint32_t profiler_stat_ovf[SMP_MAX_CPUS][PROFILER_STAT_MAX];
+static uint64_t profiler_stat_val[SMP_MAX_CPUS][PROFILER_STAT_MAX];
+static uint64_t profiler_stat_cyc[SMP_MAX_CPUS];
+static uint32_t profiler_stat_pmcr[SMP_MAX_CPUS];
+static volatile uint32_t profiler_stat_busy;
+
+// From the PMU interrupt, or with the counters frozen: count the overflows
+// of `stat`'s counters among `ovs` and clear exactly those flags.
+static void profiler_stat_overflow(uint cpu, uint32_t ovs) {
+    uint32_t mine = ovs & profiler_stat_mask[cpu];
+    if (!mine)
+        return;
+    for (uint32_t i = 0; i < profiler_stat_cfg.n; i++)
+        if (mine & (1u << (profiler_stat_cfg.first + i)))
+            profiler_stat_ovf[cpu][i]++;
+    pmu_write_pmovsr(mine);
+}
+
+// Runs in an IPI on every core. The counters start last, after all setup.
+static void profiler_stat_arm_this_cpu(void *context) {
+    (void)context;
+    uint cpu = arch_curr_cpu_num();
+    const struct profiler_stat_cfg *c = &profiler_stat_cfg;
+    uint32_t mask = 0;
+    uint32_t sel = pmu_read_pmselr();
+    for (uint32_t i = 0; i < c->n; i++) {
+        uint32_t ctr = c->first + i;
+        pmu_write_pmcntenclr(1u << ctr);
+        pmu_write_pmselr(ctr);
+        pmu_write_pmxevtyper(c->event[i]);   // no filtering: EL0 and EL1, both states
+        pmu_write_pmxevcntr(0);
+        mask |= 1u << ctr;
+        profiler_stat_ovf[cpu][i] = 0;
+    }
+    pmu_write_pmselr(sel);
+    pmu_write_pmovsr(mask | PMU_CYCLE_BIT);
+    profiler_stat_mask[cpu] = mask;
+    pmu_write_pmintenset(mask);
+    uint32_t pmcr = pmu_read_pmcr();
+    profiler_stat_pmcr[cpu] = pmcr;
+    pmu_write_pmcntenclr(PMU_CYCLE_BIT);
+    pmu_write_pmccntr64(0);
+    pmu_write_pmcr((pmcr | PMU_PMCR_E | PMU_PMCR_LC) & ~PMU_PMCR_D);
+    pmu_write_pmcntenset(mask | PMU_CYCLE_BIT);
+}
+
+// Runs in an IPI on every core: freeze first, then read, then give the
+// counters back (PMCR as it was, so PMU sampling keeps running if armed).
+static void profiler_stat_read_this_cpu(void *context) {
+    (void)context;
+    uint cpu = arch_curr_cpu_num();
+    const struct profiler_stat_cfg *c = &profiler_stat_cfg;
+    uint32_t mask = profiler_stat_mask[cpu];
+    pmu_write_pmcntenclr(mask | PMU_CYCLE_BIT);
+    profiler_stat_cyc[cpu] = pmu_read_pmccntr64();
+    profiler_stat_overflow(cpu, pmu_read_pmovsr());   // overflow not yet taken as an IRQ
+    uint32_t sel = pmu_read_pmselr();
+    for (uint32_t i = 0; i < c->n; i++) {
+        pmu_write_pmselr(c->first + i);
+        profiler_stat_val[cpu][i] = ((uint64_t)profiler_stat_ovf[cpu][i] << 32) | pmu_read_pmxevcntr();
+    }
+    pmu_write_pmselr(sel);
+    pmu_write_pmintenclr(mask);
+    profiler_stat_mask[cpu] = 0;
+    pmu_write_pmcr(profiler_stat_pmcr[cpu]);
+}
+
 static void profiler_pmu_disarm_this_cpu(void *context) {
     (void)context;
     uint cpu = arch_curr_cpu_num();
@@ -700,7 +799,12 @@ void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
     // below to unconditionally acknowledge the interrupt even when this
     // core isn't currently "enabled" -- see the early-return branch.
     bool is_pmu_vector = vector >= PROFILER_PMU_SPI_BASE && vector < PROFILER_PMU_SPI_BASE + 4;
-    bool is_pmu_overflow = is_pmu_vector && profiler_pmu_enabled[cpu];
+    // K7: the same interrupt also signals `stat`'s counter overflows, so
+    // only counter 0's flag means a sample is due.
+    uint32_t ovs = is_pmu_vector ? pmu_read_pmovsr() : 0;
+    if (is_pmu_vector)
+        profiler_stat_overflow(cpu, ovs);
+    bool is_pmu_overflow = is_pmu_vector && profiler_pmu_enabled[cpu] && (ovs & 1u);
 #else
     bool is_pmu_vector = false;
     bool is_pmu_overflow = false;
@@ -720,7 +824,7 @@ void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
         // profiler_pmu_arm_this_cpu/profiler_pmu_disarm_this_cpu's own
         // comment for the exact scenario this fixes, confirmed on real
         // hardware.
-        if (is_pmu_vector) {
+        if (is_pmu_vector && (ovs & 1u) && !(profiler_stat_mask[cpu] & 1u)) {
             pmu_write_pmovsr(1u << 0);
             profiler_pmu_reload_counter0(profiler_pmu_reload);
         }
@@ -1318,9 +1422,238 @@ static uint32_t profiler_image_hash(void) {
     return h;
 }
 
+#if BCM2711
+// K7: names for the common ARMv8 common events (others print as hex).
+static const char *profiler_event_name(uint32_t ev) {
+    switch (ev) {
+    case 0x01: return "L1I_CACHE_REFILL";
+    case 0x02: return "L1I_TLB_REFILL";
+    case 0x03: return "L1D_CACHE_REFILL";
+    case 0x04: return "L1D_CACHE";
+    case 0x05: return "L1D_TLB_REFILL";
+    case 0x08: return "INST_RETIRED";
+    case 0x09: return "EXC_TAKEN";
+    case 0x0a: return "EXC_RETURN";
+    case 0x10: return "BR_MIS_PRED";
+    case 0x11: return "CPU_CYCLES";
+    case 0x12: return "BR_PRED";
+    case 0x13: return "MEM_ACCESS";
+    case 0x14: return "L1I_CACHE";
+    case 0x15: return "L1D_CACHE_WB";
+    case 0x16: return "L2D_CACHE";
+    case 0x17: return "L2D_CACHE_REFILL";
+    case 0x18: return "L2D_CACHE_WB";
+    case 0x19: return "BUS_ACCESS";
+    case 0x1b: return "INST_SPEC";
+    case 0x1d: return "BUS_CYCLES";
+    default: return NULL;
+    }
+}
+
+// Default event set, most useful first: with sampling armed only the
+// first five fit.
+static const uint32_t profiler_stat_default[PROFILER_STAT_MAX] = {
+    0x08, 0x03, 0x04, 0x10, 0x12, 0x17,
+};
+
+static int profiler_stat_find(uint32_t ev) {
+    for (uint32_t i = 0; i < profiler_stat_cfg.n; i++)
+        if (profiler_stat_cfg.event[i] == ev)
+            return (int)i;
+    return -1;
+}
+
+// Output lines are assembled first and printed with one printf each: the
+// USB-serial link on the host side loses far more data when a line reaches
+// it as many small fragments (seen on `stat` and `mask` output) than as
+// one write.
+struct profiler_line {
+    char buf[200];
+    size_t len;
+};
+
+static void profiler_line_add(struct profiler_line *l, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(l->buf + l->len, sizeof(l->buf) - l->len, fmt, ap);
+    va_end(ap);
+    if (n > 0)
+        l->len = l->len + (size_t)n < sizeof(l->buf) ? l->len + (size_t)n : sizeof(l->buf) - 1;
+}
+
+// num/den with three decimals, integer only (no FPU on the target).
+static void profiler_line_ratio(struct profiler_line *l, const char *label, uint64_t num,
+                                uint64_t den, uint32_t scale) {
+    if (!den)
+        return;
+    uint64_t milli = (num * scale * 1000u) / den;
+    profiler_line_add(l, " %s %llu.%03llu", label, (unsigned long long)(milli / 1000),
+                      (unsigned long long)(milli % 1000));
+}
+
+static void profiler_stat_derived(const char *who, uint64_t cyc, const uint64_t *v) {
+    int inst = profiler_stat_find(0x08), l1 = profiler_stat_find(0x04),
+        l1r = profiler_stat_find(0x03), br = profiler_stat_find(0x12),
+        brm = profiler_stat_find(0x10), l2r = profiler_stat_find(0x17);
+    struct profiler_line l = { .len = 0 };
+    profiler_line_add(&l, "stat: %-4s", who);
+    if (inst >= 0)
+        profiler_line_ratio(&l, "IPC", v[inst], cyc, 1);
+    if (l1 >= 0 && l1r >= 0)
+        profiler_line_ratio(&l, "L1D-miss%", v[l1r], v[l1], 100);
+    if (br >= 0 && brm >= 0)
+        profiler_line_ratio(&l, "br-mispred%", v[brm], v[br], 100);
+    if (inst >= 0 && l2r >= 0)
+        profiler_line_ratio(&l, "L2D-refill/kinst", v[l2r], v[inst], 1000);
+    printf("%s\n", l.buf);
+}
+
+// `profiler stat [-e ev,...] [command ...]` / `profiler stat [iters]`.
+static int profiler_stat(int argc, const console_cmd_args *argv) {
+    int a = 2;
+    uint32_t events[PROFILER_STAT_MAX];
+    uint32_t nev = 0;
+    bool user_events = false;
+    if (argc > a && !strcmp(argv[a].str, "-e")) {
+        if (argc <= a + 1) {
+            printf("usage: profiler stat [-e ev,ev,...] [command ...] | profiler stat [iters]\n");
+            return -1;
+        }
+        const char *p = argv[a + 1].str;
+        while (*p) {
+            char *end;
+            uint32_t ev = (uint32_t)strtoul(p, &end, 0);
+            if (end == p || nev == PROFILER_STAT_MAX || ev > 0x3ff) {
+                printf("stat: bad event list '%s' (at most %d events, 0x0..0x3ff, comma separated)\n",
+                       argv[a + 1].str, PROFILER_STAT_MAX);
+                return -1;
+            }
+            events[nev++] = ev;
+            p = *end == ',' ? end + 1 : end;
+            if (*end && *end != ',') {
+                printf("stat: bad event list '%s'\n", argv[a + 1].str);
+                return -1;
+            }
+        }
+        user_events = true;
+        a += 2;
+    }
+    if (!user_events) {
+        for (nev = 0; nev < PROFILER_STAT_MAX; nev++)
+            events[nev] = profiler_stat_default[nev];
+    }
+
+    // Counter 0 belongs to PMU sampling while it is armed on any core.
+    bool sampling = false;
+    for (int c = 0; c < SMP_MAX_CPUS; c++)
+        sampling = sampling || profiler_pmu_enabled[c];
+    uint32_t avail = ((pmu_read_pmcr() >> 11) & 0x1f) - (sampling ? 1 : 0);
+    if (avail > PROFILER_STAT_MAX)
+        avail = PROFILER_STAT_MAX;
+    if (nev > avail) {
+        if (user_events) {
+            printf("stat: %u events requested, %u counters free%s\n", nev, avail,
+                   sampling ? " (counter 0 is PMU sampling's)" : "");
+            return -1;
+        }
+        nev = avail;
+    }
+    uint32_t ceid[2] = { pmu_read_pmceid0(), pmu_read_pmceid1() };
+    for (uint32_t i = 0; i < nev; i++)
+        if (events[i] < 64 && !(ceid[events[i] / 32] & (1u << (events[i] % 32))))
+            printf("stat: warning: event 0x%x is not marked implemented (PMCEID) -- counting anyway\n",
+                   events[i]);
+
+    // The command line to run, or the built-in workload.
+    bool builtin = argc <= a || (argv[a].str[0] >= '0' && argv[a].str[0] <= '9');
+    uint32_t iters = builtin && argc > a ? (uint32_t)argv[a].u : 5000000;
+    char cmd[256];
+    size_t len = 0;
+    cmd[0] = 0;
+    for (int i = a; !builtin && i < argc; i++) {
+        size_t l = strlen(argv[i].str);
+        if (len + l + 2 > sizeof(cmd)) {
+            printf("stat: command line too long\n");
+            return -1;
+        }
+        if (len)
+            cmd[len++] = ' ';
+        memcpy(cmd + len, argv[i].str, l + 1);
+        len += l;
+    }
+    if (!builtin && !strncmp(cmd, "profiler stat", 13)) {
+        printf("stat: cannot count itself\n");
+        return -1;
+    }
+
+    profiler_stat_busy = 1;
+    profiler_stat_cfg.n = nev;
+    profiler_stat_cfg.first = sampling ? 1 : 0;
+    for (uint32_t i = 0; i < nev; i++)
+        profiler_stat_cfg.event[i] = events[i];
+    profiler_pmu_route_and_unmask();
+    printf("stat: counting %s on all %d cores ...\n", builtin ? "the built-in workload" : cmd,
+           SMP_MAX_CPUS);
+
+    // Nothing prints between arm and read except the command itself (K4).
+    uint64_t t0 = profiler_cntpct();
+    mp_sync_exec(MP_IPI_TARGET_ALL, 0, profiler_stat_arm_this_cpu, NULL);
+    int rc = 0;
+    if (builtin)
+        profiler_workload_a(iters);
+    else
+        rc = console_run_script_locked(NULL, cmd);
+    mp_sync_exec(MP_IPI_TARGET_ALL, 0, profiler_stat_read_this_cpu, NULL);
+    uint64_t t1 = profiler_cntpct();
+    profiler_stat_busy = 0;
+
+    uint64_t us = ((t1 - t0) * 1000000u) / profiler_cntfrq();
+    if (builtin)
+        printf("stat: built-in workload, %u iters, %llu.%03llu ms\n", iters,
+               (unsigned long long)(us / 1000), (unsigned long long)(us % 1000));
+    else
+        printf("stat: '%s' returned %d, %llu.%03llu ms\n", cmd, rc,
+               (unsigned long long)(us / 1000), (unsigned long long)(us % 1000));
+    struct profiler_line l = { .len = 0 };
+    profiler_line_add(&l, "stat: %-4s %16s", "cpu", "cycles");
+    for (uint32_t i = 0; i < nev; i++) {
+        const char *name = profiler_event_name(events[i]);
+        if (name)
+            profiler_line_add(&l, " %16s", name);
+        else
+            profiler_line_add(&l, "        event%#05x", events[i]);
+    }
+    printf("%s\n", l.buf);
+    uint64_t sum_cyc = 0, sum[PROFILER_STAT_MAX] = { 0 };
+    for (int c = 0; c < SMP_MAX_CPUS; c++) {
+        l.len = 0;
+        profiler_line_add(&l, "stat: cpu%d %16llu", c, (unsigned long long)profiler_stat_cyc[c]);
+        sum_cyc += profiler_stat_cyc[c];
+        for (uint32_t i = 0; i < nev; i++) {
+            profiler_line_add(&l, " %16llu", (unsigned long long)profiler_stat_val[c][i]);
+            sum[i] += profiler_stat_val[c][i];
+        }
+        printf("%s\n", l.buf);
+    }
+    l.len = 0;
+    profiler_line_add(&l, "stat: %-4s %16llu", "all", (unsigned long long)sum_cyc);
+    for (uint32_t i = 0; i < nev; i++)
+        profiler_line_add(&l, " %16llu", (unsigned long long)sum[i]);
+    printf("%s\n", l.buf);
+    for (int c = 0; c < SMP_MAX_CPUS; c++) {
+        char who[8];
+        snprintf(who, sizeof(who), "cpu%d", c);
+        profiler_stat_derived(who, profiler_stat_cyc[c], profiler_stat_val[c]);
+    }
+    profiler_stat_derived("all", sum_cyc, sum);
+    printf("stat: done\n");
+    return rc;
+}
+#endif
+
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
-        printf("usage: profiler <start [period_us]|stop|status|clear|dump|bench|nest|smp|edgetest|stat|pmustart|pmustop|pmu|maskon|maskoff|mask|masktest|memtest|nmion|nmioff|buildid|dbginfo|dbgrom|dbgpcsr>\n");
+        printf("usage: profiler <start [period_us]|stop|stat [-e ev,...] [cmd...]|status|clear|dump|bench|nest|smp|edgetest|pmustart|pmustop|pmu|maskon|maskoff|mask|masktest|memtest|nmion|nmioff|buildid|dbginfo|dbgrom|dbgpcsr>\n");
         return -1;
     }
 
@@ -1680,71 +2013,13 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         printf("profiler: edgetest done (sink=%u, ignore -- just prevents dead-code elim)\n",
                profiler_sink);
     } else if (!strcmp(sub, "stat")) {
-        // M5 `perf stat`-equivalent: PMU counting mode, real hardware
-        // only (see the "pmu" branch below for why this was never
-        // attempted on the QEMU target). Printing before each new
-        // coprocessor access on purpose -- if this crashes, the UART
-        // log shows exactly which register access was the first to
-        // fault, the same bisection discipline this project's own
-        // M1-M4 hardware bring-up already used (see
-        // docs/RPI4_BRINGUP.md).
-        uint32_t iters = argc >= 3 ? (uint32_t)argv[2].u : 5000000;
-
-        printf("stat: reading PMCEID0/PMCEID1 ...\n");
-        uint32_t pmceid0 = pmu_read_pmceid0();
-        uint32_t pmceid1 = pmu_read_pmceid1();
-        printf("stat: PMCEID0=0x%08x PMCEID1=0x%08x\n", pmceid0, pmceid1);
-
-        // Event 0x03 = L1D_CACHE_REFILL (L1 data cache miss), an
-        // architectural ARMv7 PMUv2 event -- PMCEID0 bit N marks
-        // whether event N (0-31) is implemented on this core.
-        #define PROFILER_PMU_EVENT_L1D_CACHE_REFILL 0x03
-        bool have_l1d_refill = (pmceid0 & (1u << PROFILER_PMU_EVENT_L1D_CACHE_REFILL)) != 0;
-        printf("stat: L1D_CACHE_REFILL (event 0x03) %s\n",
-               have_l1d_refill ? "implemented" : "NOT implemented -- counting it anyway, expect garbage");
-
-        printf("stat: reading PMCR ...\n");
-        uint32_t pmcr = pmu_read_pmcr();
-        printf("stat: PMCR=0x%08x (N=%u counters)\n", pmcr, (pmcr >> 11) & 0x1f);
-
-        // Event counter 1, not 0: counter 0 belongs to `pmustart` sampling, which
-        // may be armed right now. Likewise no PMCR.P (it would reset counter 0 too):
-        // zero counter 1 directly.
-        printf("stat: selecting event counter 1 for L1D_CACHE_REFILL ...\n");
-        pmu_write_pmselr(1);
-        pmu_write_pmxevtyper(PROFILER_PMU_EVENT_L1D_CACHE_REFILL);
-        pmu_write_pmxevcntr(0);
-
-        // K4: nothing may print between start and stop. A console line is
-        // tens of microseconds of UART work at 6 Mbaud (more while the
-        // FIFO drains), which the counters used to include.
-        printf("stat: counting the cycle counter + event counter 1 over the workload "
-               "(%u iters) ...\n", iters);
-        pmu_write_pmcntenset((1u << 31) | (1u << 1));
-        pmu_write_pmcr(pmcr | (1u << 0) | (1u << 2));   // start, cycle counter reset
-
-        profiler_workload_a(iters);
-
-        uint32_t cycles = pmu_read_pmccntr();
-        pmu_write_pmselr(1);
-        uint32_t l1d_refills = pmu_read_pmxevcntr();
-        // Stop only counter 1; PMCR goes back to what it was (enabled if sampling is).
-        pmu_write_pmcntenclr(1u << 1);
-        pmu_write_pmcr(pmcr);
-
-        printf("stat: %u iters, %u cycles, %u L1D_CACHE_REFILL\n", iters, cycles, l1d_refills);
-        if (cycles > 0 && iters > 0) {
-            // uint64_t throughout: iters*1000 alone can already exceed
-            // uint32_t range at the default 5,000,000 iters.
-            uint64_t iters_per_cycle_milli = (uint64_t)iters * 1000 / cycles;
-            uint64_t refills_per_iter_tenthousandth = (uint64_t)l1d_refills * 10000 / iters;
-            printf("stat: %u.%03u iters/cycle, %u.%04u L1D_CACHE_REFILL/iter\n",
-                   (uint32_t)(iters_per_cycle_milli / 1000),
-                   (uint32_t)(iters_per_cycle_milli % 1000),
-                   (uint32_t)(refills_per_iter_tenthousandth / 10000),
-                   (uint32_t)(refills_per_iter_tenthousandth % 10000));
-        }
-        printf("stat: done\n");
+        // K7: perf-stat-like counting of any console command (or the
+        // built-in workload), on every core, up to six events plus cycles.
+#if BCM2711
+        return profiler_stat(argc, argv);
+#else
+        printf("stat: needs real hardware (BCM2711)\n");
+#endif
     } else if (!strcmp(sub, "pmustart")) {
 #if BCM2711
         // M5 PMU-event-driven sampling, real second sampling mode
@@ -1767,6 +2042,10 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         // of the intended CPU_CYCLES (0x11), with no warning since the
         // A72 implements both. strtoul's base-0 auto-detects a leading
         // "0x" and falls back to decimal otherwise.
+        if (profiler_stat_busy) {
+            printf("pmustart: refused while `profiler stat` is counting\n");
+            return -1;
+        }
         uint32_t event = (uint32_t)strtoul(argv[2].str, NULL, 0);
         uint32_t count = (uint32_t)strtoul(argv[3].str, NULL, 0);
         if (count < PROFILER_PMU_MIN_COUNT) {

@@ -80,13 +80,13 @@ snapshot, not a live guarantee.
 
 | Holder | Since | Purpose |
 |---|---|---|
-| Claude | 2026-10-05 | K4 (stat self-count), K5 (setup.sh re-run), K7 (full stat) |
+| — (free) | 2026-10-05 | Released by Claude after K4/K5/K7; shared checkout at the K7 commit, untracked `scripts/flamegraph.pl` (Codex) left in place |
 
 ## Pi state (last release, copied from bolt-aarch32)
 
 | Released by | When | Board state |
 |---|---|---|
-| Claude | 2026-10-05 | lk-perf K10/K11 image (lk.bin `866ffee1…`) at the shell, 6000000 baud, pseudo-NMI off, samplers stopped, OS lock cleared on all cores by `dbgpcsr` (harmless; reset restores it), COM5 closed. Recheck before use; `--reboot` at 6 Mbaud returns it to the loader |
+| Claude | 2026-10-05 | lk-perf K7 image (lk.bin `5a9b62ed…`) at the shell, 6000000 baud, pseudo-NMI off, samplers stopped, COM5 closed. Recheck before use; `--reboot` at 6 Mbaud returns it to the loader |
 
 ## Claims (consolidated TODO)
 
@@ -99,15 +99,15 @@ current source. *Owner* is empty until someone claims it.
 | Order | ID | Item | Priority | Owner | Status | Notes |
 |---|---|---|---|---|---|---|
 | 1 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Blocked | Feasibility done (Claude, K11): A72 implements `EDPCSR` and the CPU reaches every core's debug block, but the SoC disables non-invasive debug (`DBGAUTHSTATUS` 0xaa), so `EDPCSR` reads `ffffffff`. Untested lever: `enable_jtag_gpio=1` in `config.txt` (SD-card change, needs user approval). On the target: `profiler dbginfo`; [results](results/k11_edpcsr_feasibility_20261005/README.md) |
-| 2 | K7 | Full `profiler stat`: any command, all 6 counters, derived IPC | P3 | Claude | In progress | Review Phase 3 item 3 |
-| 3 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
-| 4 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim | P3 | — | Open | Fold into the next commit touching the same file |
-| 5 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
+| 2 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
+| 3 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim; `profiler mask` prints lines in fragments, which the USB-serial link loses (build whole lines as `stat` does) | P3 | — | Open | Fold into the next commit touching the same file |
+| 4 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
 
 ### Done (recent)
 
 | ID | Item | Owner | Evidence |
 |---|---|---|---|
+| K7 | Full `profiler stat`: any console command, all cores, up to six events plus 64-bit cycles, 32-bit event wraps extended, derived IPC/miss/mispredict ratios; coexists with PMU sampling | Claude | Pi: 4.000 inst / 2.000 cycles per iteration on the built-in workload; CPU_CYCLES = cycle counter; 12.0e9 instructions across wraps; `smp` counted on 4 cores; sampling unaffected; bad input refused; [results/k7_stat_20261005](results/k7_stat_20261005/README.md) |
 | K4 | `profiler stat` counted its own `printf` output | Claude | Pi: `stat 1000` 77,928 -> 2,009 cycles (about 76,000 cycles were console printing); `stat 5000000` 10,053,414 -> 10,001,332 = 2.000 cycles/iteration |
 | K5 | `setup.sh` re-run failed on files the overlay patches create (`gic.h`, `irqmask.c`) | Claude | Scratch copy of a set-up tree: old script fails (`gic.h: already exists`), new script runs twice clean, all 14 patches apply, also on upstream tip `fe5e5a00`, which builds with no FPU instructions |
 | K10 | Timer-mode sampling on the profiler's own per-core virtual timer: fixed grid, one sample at a random point of each period, lost periods counted, period selectable (`start [period_us]`), dump format 3; timer samples also reach masked code under pseudo-NMI | Claude | Pi `masktest` 50% masked, about 4000 samples per run: 49.0% (1 ms), 50.9% (10 ms, commensurate), 50.4% pseudo-NMI with 0 delayed; was 65% on LK's tick; `test_irqmask_report.py` 23; [results/k10_timer_sampling_20261005](results/k10_timer_sampling_20261005/README.md) |
@@ -126,6 +126,26 @@ Earlier milestones (M1–M5, DWARF unwinder, review Phases 1–2) are recorded i
 [RPI4_BRINGUP.md](RPI4_BRINGUP.md).
 
 ## Handoff log
+
+### 2026-10-05 — Claude: K4, K5, K7 done; lock and Pi released
+
+- K5 (bb69119): `setup.sh` now removes the files overlay patches create
+  (`gic.h`, `irqmask.c`) after its reset, so a re-run succeeds. Verified on a
+  scratch copy: the old script fails, the new one runs twice. All 14 patches
+  also apply to upstream tip `fe5e5a00`, which builds with no FPU.
+- K4 (60e8680): no printing inside `stat`'s window. `stat 1000` went from
+  77,928 to 2,009 cycles.
+- K7: `profiler stat [-e ev,...] <command>` counts on every core: up to six
+  events plus cycles, 64-bit (PMCR.LC for cycles, overflow IRQ for event
+  counters), per-core rows, total and derived ratios. Leaves counter 0 to
+  `pmustart` sampling; `pmustart` is refused during `stat`. The PMU handler
+  now reads PMOVSR, so only counter 0 samples. Pi checks all pass (see
+  results). The A72 runs at 600 MHz under LK.
+- Host note: fragmented console lines (many small printfs) lose much more
+  data on the 6 Mbaud USB-serial link than whole lines. `stat` now writes
+  whole lines; `profiler mask` still prints fragments (candidate for K9).
+- Lock free, Pi released. Open: K8 (scheduling/frequency capture), K9 (small
+  fixes), K11 blocked, T4 (user).
 
 ### 2026-10-05 — Claude: K10 done, K11 feasibility done (blocked on the Pi); lock and Pi released
 

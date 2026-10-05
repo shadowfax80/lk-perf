@@ -8,6 +8,7 @@
 | exporter | Timestamped perf-script export ([EXPORT.md](EXPORT.md), [verification](results/PERF_EXPORT_VERIFICATION.md)) |
 | `0f7f5e3` (K6) | IRQ-masked time accounting, delayed-sample attribution, delay-compensated PMU reload, console printing without IRQ masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
 | `84c25a9` (K12) | Opt-in pseudo-NMI sampling by GIC priority masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
+| K7 | `profiler stat` counts any console command on every core: up to six events plus cycles, 64-bit, derived IPC and ratios ([§6.3](#63-profiler-stat)); K4 (no printing inside the window) and K5 (`setup.sh` re-runnable) before it |
 | K10 | Timer mode on the profiler's own per-core virtual timer: fixed grid, one sample at a random point of each period, lost periods counted; dump format 3 ([§4.2](#42-timer-mode)) |
 | K11 | Cross-core PC sampling (`EDPCSR`) feasibility: implemented and reachable on the A72, prohibited by the SoC's debug authentication ([§4.7](#47-cross-core-pc-sampling-edpcsr-feasibility)) |
 | K3 | Caller recovery for code without CFI from a validated LR ([§8.2](#82-per-sample-algorithm)) |
@@ -394,9 +395,21 @@ This is partial sharing discipline, not general PMU virtualization. `stat` reset
 
 ### 6.3 `profiler stat`
 
-`stat [iters]` runs the built-in `profiler_workload_a` on the shell's current core. It reads PMCEID0/1 and PMCR, programs counter 1 for event `0x03` (L1D_CACHE_REFILL), enables the cycle counter and counter 1, resets the cycle counter, runs the workload, reads both results, disables counter 1, and restores the previous PMCR value. It reports raw cycles/refills and integer-derived iterations per cycle/refills per iteration.
+```text
+profiler stat [-e ev,ev,...] <console command ...>
+profiler stat [iters]          (built-in profiler_workload_a, 5,000,000 iterations)
+```
 
-It is not an arbitrary-command or all-core `perf stat` equivalent. Since K4 nothing prints inside the counting window (it used to include four console lines: about 76,000 cycles, so `stat 1000` read 77,928 cycles instead of 2,009). It still includes possible interrupts/scheduling; the two counters are not sampled simultaneously. Counter accesses are per-core, while the command does not explicitly pin the shell thread for the full transaction. Correct continuity therefore also depends on scheduler behavior. Counts are 32-bit with no wrap extension; cycle-divider/filter state is not fully normalized. Unsupported refill events are warned about but still programmed. These results should be interpreted as diagnostic PoC counts, not precise isolated workload metrics.
+`stat` (K7) counts a console command on every core at once: an IPI arms the counters on all cores, the command runs through LK's `console_run_script_locked`, and a second IPI freezes and reads them. A command that migrates or starts threads elsewhere is therefore fully counted. The report has one row per core, a total row, and derived metrics in integer arithmetic: IPC, L1D miss %, branch mispredict %, and L2D refills per 1000 instructions.
+
+- **Counters.** Up to six event counters plus the cycle counter. While `pmustart` sampling is armed on any core, counter 0 stays with sampling, so five events are available and sampling keeps running; `pmustart` is refused while `stat` counts. On return, PMCR goes back to its previous value.
+- **Width.** The cycle counter runs in its 64-bit mode (PMCR.LC). Event counters are 32 bits; their overflow interrupt (the same per-core SPIs as PMU sampling) counts wraps per core. The read step also folds in a wrap whose interrupt is still pending. The PMU handler reads PMOVSR, so only counter 0's flag produces a sample.
+- **Events.** Default: INST_RETIRED, L1D_CACHE_REFILL, L1D_CACHE, BR_MIS_PRED, BR_PRED, L2D_CACHE_REFILL; the last is dropped when only five counters are free. Events 0x00–0x3f not marked in PMCEID get a warning; higher (implementation-defined) events are accepted. No filtering: EL0 and EL1 count; EL2 does not.
+- **Window.** Nothing prints between arm and read (K4) except the command itself, whose output is counted, as under `perf stat`. The arm and read IPIs add a few microseconds; idle cores show about 2,000 cycles, because the cycle counter stops in WFI.
+
+On the Pi: the built-in workload measures exactly 4.000 instructions and 2.000 cycles per iteration; the CPU_CYCLES event equals the 64-bit cycle counter on every core; and a 10 s run counted 12.0e9 instructions (2.8 × 2^32), consistent per iteration. The cycle counts also show that the A72 runs at **600 MHz** under LK, the firmware's boot clock ([results](results/k7_stat_20261005/README.md)).
+
+Each output line is assembled first and written with one `printf`: the USB-serial path on the host side loses far more data when a line arrives as many small fragments.
 
 ## 7. Transport and dump-format contract
 
@@ -603,7 +616,7 @@ Timer samples are one per period at a uniformly random point of it, taken at the
 | Command | Default / arguments | Behavior |
 |---|---|---|
 | `profiler start [period_us]` / `stop` | 10000 (50 to 1000000) | Arm/disarm timer sampling on every core: one sample at a random point of each period, on the per-core virtual timer; `start` while running re-arms with the new period; no implicit clear and no PMU stop |
-| `profiler pmustart` | Required event and count, base-0 parsing | Arm counter-0 overflow sampling on all cores; count must be at least 10000 |
+| `profiler pmustart` | Required event and count, base-0 parsing | Arm counter-0 overflow sampling on all cores; count must be at least 10000; refused while `stat` counts |
 | `profiler pmustop` | None | Synchronously disarm PMU sampling across cores; no timer stop |
 | `profiler clear` | None | Zero sample arrays and ring counters and start a new capture session (new run id); no automatic producer stop |
 | `profiler status` | None | Show per-core lifetime totals, heads, wrap indication, PMU overflows lost inside masked spans longer than a period (`pmu_missed`), timer periods without a sample for the same reason (`timer_missed`), and timer-enable flag; no complete PMU-mode status |
@@ -619,7 +632,7 @@ Timer samples are one per period at a uniformly random point of it, taken at the
 | `profiler nest [iters]` | 20000000 | Nested workload; optimization can eliminate wrapper frames via tail calls |
 | `profiler smp [iters]` | 20000000 per worker | Create one 4096-byte-stack worker per configured core and join all; workers are scheduler-distributed, not explicitly pinned |
 | `profiler edgetest [iters]` | 2000000 per workload | Non-tail eight-level chain, 20-level recursion, forced FP, and mixed ARM/Thumb workload |
-| `profiler stat [iters]` | 5000000 | Single-core built-in workload counting with cycle counter and refill counter 1 |
+| `profiler stat [-e ev,...] <command ...>` / `stat [iters]` | Six default events; built-in workload 5000000 | Count a console command (or the built-in workload) on every core: cycles plus up to six events, 64-bit, per-core rows, total and derived IPC/miss/mispredict ratios (§6.3) |
 | `profiler pmu` | None | Prints a diagnostic description; its claim that the overflow path remains unverified is stale relative to later hardware evidence |
 
 `bench`, `nest`, `smp`, and `edgetest` are synthetic validation workloads,
@@ -730,6 +743,7 @@ The following summarizes the repository's prior observations; it is not a claim 
 | UART integrity | 6-Mbaud console operation; sequence/checksum validation reported losses in real captures |
 | IRQ-masked time (K6) | Ground truth 50% masked: accounting 49.6%, PMU samples 48.2% on the masked side, all delayed samples attributed; console masking (up to 350 µs per line) removed |
 | Pseudo-NMI (K12) | Ground truth: 50.5% of PMU samples inside masked code, 0 delayed; stress with mode switching and a 6-minute soak (944,589 samples) clean |
+| Counting (K4, K7) | `stat 1000` 77,928 -> 2,009 cycles without printing in the window; built-in workload 4.000 instructions and 2.000 cycles per iteration; CPU_CYCLES = 64-bit cycle counter on every core; 12.0e9 instructions counted across 32-bit wraps; `smp` counted on all four cores; sampling unaffected |
 | Timer grid (K10) | `masktest` 50% masked, about 4000 samples per run: 49.0% (1 ms), 50.9% (10 ms, commensurate with the workload), 50.4% under pseudo-NMI with 0 of 15999 delayed; was 65% on LK's tick |
 | Cross-core PC sampling (K11) | A72 implements `EDPCSR` and its debug blocks are reachable at `0xff{c,d,e,f}10000`, but `EDPCSR` reads `ffffffff` everywhere: non-invasive debug disabled (`DBGAUTHSTATUS` `0xaa`) |
 | No-CFI callers (K3) | `memtest`: all 460 samples in `memcpy`/`memset` attributed to their true callers (299/161), none to the wrong one; earlier captures unchanged |
@@ -750,7 +764,7 @@ These are architectural directions, **not additional claimed work items or a rep
 | Self-describing session | Done (K2): versioned header/footer, run/build identity, modes/event/period, per-core counts, exact record count, latest-dump selection | Done on the Pi: wrong ELF refused, two-dump log split, exact transfer loss and overwrite counts |
 | Reporting integrity | Function range validation, consistent return-address attribution, explicit unwind stop reasons | Assembly gaps, function-boundary calls, missing CFI, and corrupted context regressions |
 | Bias/overhead accounting | IRQ-masked duration (K6) and unbiased timer grid (K10): done. Remaining: measured sampler cost; cross-core PC sampling for handlers needs a platform with non-invasive debug enabled (K11) | Controlled masked-region workload (`masktest`) and sampling-rate sweeps |
-| Accurate counting | Define PMU ownership, preserve state, pin execution or collect per-core, bracket counts outside prints, extend overflow handling | Stat-only and stat-with-sampling comparisons, migration/wrap cases |
+| Accurate counting | Done (K4, K7): counter 0 left to sampling, PMCR restored, all-core collection, no prints in the window, 64-bit counts | Done on the Pi: stat alone and with sampling, multi-core command, 2.8 × 2^32 wrap case, CPU_CYCLES cross-check |
 | Alternative export | Document a binary schema separate from compiler layout; implement memory-dump reader | Same capture yields equivalent serial and memory-export reports |
 | A55 deployment | Target-specific interrupt, timer, PMU, exception ABI, and stack integration | Real intended-target images and workloads, with build/config provenance |
 | On-target unwind alternative | Host-generated compact CFI tables plus bounded IRQ-safe evaluator | Equivalence to the host reference, footprint and worst-case interrupt cost measurements |

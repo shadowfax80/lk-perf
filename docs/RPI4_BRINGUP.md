@@ -3,6 +3,14 @@
 > Work queue, ownership and status updates: [HANDOFF.md](HANDOFF.md). This
 > file is the hardware evidence record.
 
+**Full stat, K7 (2026-10-05, Claude):** `profiler stat [-e ev,...]
+<command>` counts any console command on every core: up to six events plus
+64-bit cycles, with 32-bit event wraps extended through the overflow
+interrupt. The built-in workload measures exactly 4.000 instructions and
+2.000 cycles per iteration, and the CPU_CYCLES event equals the cycle
+counter. The counts also show the A72 runs at 600 MHz under LK. Details:
+[results/k7_stat_20261005](results/k7_stat_20261005/README.md).
+
 **Timer grid, K10 (2026-10-05, Claude):** timer mode now runs on the
 profiler's own per-core virtual timer (PPI 27). It keeps a fixed grid with
 one sample at a random point of each period, instead of riding LK's tick,
