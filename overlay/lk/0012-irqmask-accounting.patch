@@ -1,0 +1,275 @@
+--- a/arch/arm/include/arch/arch_interrupts.h
++++ b/arch/arm/include/arch/arch_interrupts.h
+@@ -14,6 +14,7 @@
+ #include <lk/compiler.h>
+ #include <lk/reg.h>
+ #include <arch/arm.h>
++#include <stdint.h>
+ 
+ #if ARM_ISA_ARMV7M || ARM_ISA_ARMV8M || ARM_ISA_ARMV6M
+ #include <arch/arm/cm.h>
+@@ -23,14 +24,71 @@
+ 
+ #if ARM_ISA_ARMV7 || ARM_ISA_ARMV8 || (ARM_ISA_ARMV6 && !__thumb__)
+ 
++/* lk-perf IRQ-masked time accounting (arch/arm/arm/irqmask.c). */
++#define ARM_IRQMASK_SITE_BITS 6
++#define ARM_IRQMASK_SITES (1u << ARM_IRQMASK_SITE_BITS)
++#define ARM_IRQMASK_PROBE 8
++#define ARM_IRQMASK_IRQ_SITE 0xffff0000u /* site of an IRQ region: | vector */
++
++struct arm_irqmask_site {
++    uint32_t site;
++    uint32_t count;
++    uint32_t max_ticks;
++    uint32_t reserved;
++    uint64_t ticks;
++};
++
++struct arm_irqmask_cpu {
++    uint64_t start;
++    uint64_t masked_ticks;
++    uint64_t irq_ticks;
++    uint64_t dropped_ticks;
++    uint64_t window_start;
++    uint64_t last_end;
++    uint32_t site;
++    uint32_t active;
++    uint32_t regions;
++    uint32_t irq_regions;
++    uint32_t dropped_regions;
++    uint32_t max_ticks;
++    uint32_t max_site;
++    uint32_t last_site;
++    /* the region that held back the work now running: an IRQ taken right
++     * at an unmask inherits the region that delayed it (see irqmask.c) */
++    uint32_t cause_site;
++    uint32_t chain_gap;
++    uint64_t cause_end;
++    struct arm_irqmask_site sites[ARM_IRQMASK_SITES];
++} __ALIGNED(64);
++
++extern volatile uint32_t arm_irqmask_on;
++extern struct arm_irqmask_cpu arm_irqmask_cpu[];
++void arm_irqmask_begin(uint32_t site);
++void arm_irqmask_end(void);
++void arm_irqmask_irq_enter(unsigned int vector);
++void arm_irqmask_irq_exit(void);
++void arm_irqmask_reset_this_cpu(uint64_t window_start);
++uint64_t arm_irqmask_now(void);
++
+ static inline void arch_enable_ints(void) {
+     CF;
++    /* close the masked region while still masked */
++    if (arm_irqmask_on)
++        arm_irqmask_end();
+     __asm__ volatile("cpsie i");
+ }
+ 
+ static inline void arch_disable_ints(void) {
++    unsigned int prev;
++    __asm__ volatile("mrs %0, cpsr" : "=r"(prev));
+     __asm__ volatile("cpsid i");
+     CF;
++    /* open a region only on a real unmasked -> masked transition */
++    if (arm_irqmask_on && !(prev & (1u << 7))) {
++        uint32_t site;
++        __asm__ volatile("mov %0, pc" : "=r"(site));
++        arm_irqmask_begin(site);
++    }
+ }
+ 
+ static inline bool arch_ints_disabled(void) {
+--- /dev/null
++++ b/arch/arm/arm/irqmask.c
+@@ -0,0 +1,141 @@
++/*
++ * lk-perf: IRQ-masked time accounting (K6).
++ *
++ * Sampling profilers driven by IRQs (timer tick or PMU overflow) cannot
++ * see code that runs with CPSR.I set: the interrupt is held pending and
++ * taken right after the unmask, so the masked span is invisible and its
++ * samples land on whatever runs next. This module measures that blind
++ * spot instead of leaving it as an unknown bias.
++ *
++ * Every masked span on a core is one "region":
++ *   - thread regions open when arch_disable_ints() actually changes the
++ *     core from unmasked to masked (site = the PC of that call), and
++ *   - IRQ regions open at the GIC entry (site = 0xffff0000 | vector).
++ * Either kind closes at the next arch_enable_ints() or at IRQ exit,
++ * whichever comes first on that core (after a context switch inside an
++ * IRQ, the resumed thread's unlock is what ends the span). Regions are
++ * mutually exclusive per core because a new one can only open while the
++ * core is unmasked, so one active slot per core is enough.
++ *
++ * Time base is CNTPCT (the architected system counter): the same rate
++ * and phase on every core, independent of the PMU that `profiler stat`
++ * and `pmustart` reprogram. Differences of two quantized readings are
++ * unbiased on average, so totals of short regions stay meaningful.
++ *
++ * All updates run with IRQs masked on the owning core and touch only
++ * that core's slot, so no locking is needed. Off by default: when
++ * arm_irqmask_on is 0, the inline hooks cost one load and a branch.
++ */
++
++#include <arch/arch_interrupts.h>
++#include <arch/ops.h>
++#include <lk/compiler.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++
++volatile uint32_t arm_irqmask_on;
++struct arm_irqmask_cpu arm_irqmask_cpu[SMP_MAX_CPUS];
++
++static inline uint64_t irqmask_cntpct(void) {
++    uint32_t lo, hi;
++    __asm__ volatile("mrrc p15, 0, %0, %1, c14" : "=r"(lo), "=r"(hi));
++    return ((uint64_t)hi << 32) | lo;
++}
++
++uint64_t arm_irqmask_now(void) {
++    return irqmask_cntpct();
++}
++
++static void irqmask_account(struct arm_irqmask_cpu *c, uint32_t site, uint64_t now) {
++    uint64_t d = now - c->start;
++    uint32_t d32 = d > 0xffffffffu ? 0xffffffffu : (uint32_t)d;
++
++    c->masked_ticks += d;
++    c->regions++;
++    if (d32 > c->max_ticks) {
++        c->max_ticks = d32;
++        c->max_site = site;
++    }
++    if (site >= ARM_IRQMASK_IRQ_SITE) {
++        c->irq_ticks += d;
++        c->irq_regions++;
++    }
++
++    // Open-addressed table keyed by site; a full probe window is counted,
++    // never silently merged into another site.
++    uint32_t h = ((site >> 1) * 2654435761u) >> (32 - ARM_IRQMASK_SITE_BITS);
++    for (uint32_t i = 0; i < ARM_IRQMASK_PROBE; i++) {
++        struct arm_irqmask_site *e =
++            &c->sites[(h + i) & (ARM_IRQMASK_SITES - 1)];
++        if (e->count == 0)
++            e->site = site;
++        if (e->site == site) {
++            e->count++;
++            e->ticks += d;
++            if (d32 > e->max_ticks)
++                e->max_ticks = d32;
++            return;
++        }
++    }
++    c->dropped_regions++;
++    c->dropped_ticks += d;
++}
++
++static void irqmask_close(struct arm_irqmask_cpu *c) {
++    uint64_t now = irqmask_cntpct();
++    irqmask_account(c, c->site, now);
++    // Cause tracking for delayed samples: interrupts held pending by a
++    // masked region are taken back to back as soon as it ends (GIC
++    // priority order), so a sample often follows another IRQ's handler.
++    // An IRQ region that began within chain_gap of the previous cause's
++    // end was itself waiting on that cause, so it extends the cause
++    // instead of replacing it.
++    bool chained = c->site >= ARM_IRQMASK_IRQ_SITE && c->cause_end != 0 &&
++                   c->start - c->cause_end <= c->chain_gap;
++    if (!chained)
++        c->cause_site = c->site;
++    c->cause_end = now;
++    c->last_site = c->site;
++    c->last_end = now;
++    c->active = 0;
++}
++
++void arm_irqmask_begin(uint32_t site) {
++    struct arm_irqmask_cpu *c = &arm_irqmask_cpu[arch_curr_cpu_num()];
++    if (c->active)
++        return;
++    c->site = site;
++    c->start = irqmask_cntpct();
++    c->active = 1;
++}
++
++void arm_irqmask_end(void) {
++    struct arm_irqmask_cpu *c = &arm_irqmask_cpu[arch_curr_cpu_num()];
++    if (c->active)
++        irqmask_close(c);
++}
++
++void arm_irqmask_irq_enter(unsigned int vector) {
++    if (!arm_irqmask_on)
++        return;
++    arm_irqmask_begin(ARM_IRQMASK_IRQ_SITE | (vector & 0xffffu));
++}
++
++// Called from the IRQ exception path after any preemption, just before
++// the exception return unmasks the core (overlay 0012, exceptions.S).
++void arm_irqmask_irq_exit(void) {
++    if (!arm_irqmask_on)
++        return;
++    arm_irqmask_end();
++}
++
++// Run on each core (for example via mp_sync_exec) with IRQs masked.
++void arm_irqmask_reset_this_cpu(uint64_t window_start) {
++    struct arm_irqmask_cpu *c = &arm_irqmask_cpu[arch_curr_cpu_num()];
++    uint32_t freq;
++    __asm__ volatile("mrc p15, 0, %0, c14, c0, 0" : "=r"(freq));
++    memset(c, 0, sizeof(*c));
++    c->window_start = window_start;
++    c->chain_gap = freq / 500000u; /* 2 us */
++}
+--- a/arch/arm/rules.mk
++++ b/arch/arm/rules.mk
+@@ -299,7 +299,8 @@
+ 	$(LOCAL_DIR)/arm/ops.S \
+ 	$(LOCAL_DIR)/arm/faults.c \
+ 	$(LOCAL_DIR)/arm/mmu.c \
+-	$(LOCAL_DIR)/arm/thread.c
++	$(LOCAL_DIR)/arm/thread.c \
++	$(LOCAL_DIR)/arm/irqmask.c
+ 
+ MODULE_FLOAT_SRCS += \
+ 	$(LOCAL_DIR)/arm/exceptions.S \
+--- a/dev/interrupt/arm_gic/gic_v2.c
++++ b/dev/interrupt/arm_gic/gic_v2.c
+@@ -142,6 +142,10 @@
+ // so no other IRQ's dispatch is affected.
+ __WEAK void profiler_on_tick(struct iframe *frame, unsigned int vector) {}
+ 
++#if ARCH_arm
++#include <arch/arch_interrupts.h>
++#endif
++
+ enum handler_return arm_gicv2_platform_irq(struct iframe *frame) {
+     // get the current vector
+     uint32_t iar = GICCREG_READ(0, GICC_PRIMARY_IAR);
+@@ -152,6 +156,10 @@
+         return INT_NO_RESCHEDULE;
+     }
+ 
++#ifdef ARM_IRQMASK_IRQ_SITE
++    /* lk-perf: the handler runs masked; account it as an IRQ region */
++    arm_irqmask_irq_enter(vector);
++#endif
+     profiler_on_tick(frame, vector);
+ 
+     THREAD_STATS_INC(interrupts);
+--- a/arch/arm/arm/exceptions.S
++++ b/arch/arm/arm/exceptions.S
+@@ -259,6 +259,10 @@
+     cmp     r0, #0
+     blne    thread_preempt
+ 
++    /* lk-perf: close the IRQ's masked region just before the exception
++     * return unmasks this core (restore reloads r0-r3/r12/lr itself) */
++    bl      arm_irqmask_irq_exit
++
+     restore
+ 
+ FUNCTION(arm_fiq)

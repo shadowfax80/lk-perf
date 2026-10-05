@@ -1,0 +1,3 @@
+cmd_profiler;profiler_spin_ticks 130
+cmd_profiler;profiler_masked_spin 1
+cmd_profiler;profiler_masked_spin;[irq-masked: profiler_masked_spin] 69

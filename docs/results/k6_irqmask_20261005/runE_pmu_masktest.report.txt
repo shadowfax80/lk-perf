@@ -1,0 +1,33 @@
+warning: 0 sample(s) failed their checksum, 1 sample(s) missing entirely (seq gap) -- both dropped, not trusted
+1200 samples across 1 cpu(s): {0: 1200}
+1 distinct thread(s) sampled (by thread_t* -- see profiler.c)
+unwind depth histogram (frames per sample): {2: 1200}
+
+   count       %  leaf function (source line)
+     621   51.8%  profiler_spin_ticks  (profiler.c:431)
+     579   48.2%  profiler_masked_spin  (profiler.c:620)
+
+IRQ-masked time (invisible to IRQ sampling), accounting on at dump time:
+  cpu0: 49.60% masked (0.05% in IRQ handlers), 3441 regions, longest 500.1 us at profiler_masked_spin
+  cpu1:  0.00% masked (0.00% in IRQ handlers), 64 regions, longest 3.8 us at [irq handler, GIC ID 15]
+  cpu2:  0.01% masked (0.00% in IRQ handlers), 170 regions, longest 4.4 us at [irq handler, GIC ID 15]
+  cpu3:  0.00% masked (0.00% in IRQ handlers), 76 regions, longest 3.8 us at [irq handler, GIC ID 15]
+
+  % of time   regions     longest  masking site
+    12.387%      2000     500.1us  profiler_masked_spin
+     0.007%      1201       1.4us  [irq handler, GIC ID 48]
+     0.004%       200       1.9us  [irq handler, GIC ID 30]
+     0.002%        30      15.7us  [irq handler, GIC ID 153]
+     0.001%        36       4.4us  [irq handler, GIC ID 15]
+     0.001%       119       1.9us  cbuf_read_char
+     0.001%       119       1.7us  event_wait_timeout
+     0.000%         6       3.2us  [irq handler, GIC ID 14]
+     0.000%        19       0.4us  mutex_acquire_timeout
+     0.000%        19       0.3us  mutex_release
+     0.000%         2       0.6us  mp_sync_exec_etc
+
+Samples delayed by IRQ masking (taken late, so the PC is the unmask point):
+  PMU, events: 574/1200 delayed (threshold 1708), 574 attributed to the region that held them
+       574  profiler_masked_spin
+
+wrote runE_pmu_masktest.folded -- render with: perl scripts/flamegraph.pl runE_pmu_masktest.folded > flame.svg

@@ -80,13 +80,13 @@ snapshot, not a live guarantee.
 
 | Holder | Since | Purpose |
 |---|---|---|
-| Claude | 2026-10-05 | K6 (IRQ-masked accounting): edits, LK build and setup.sh in the shared checkout |
+| — (free) | 2026-10-05 | Released by Claude after K6; shared checkout at the K6 commit, untracked `scripts/flamegraph.pl` (Codex) left in place |
 
 ## Pi state (last release, copied from bolt-aarch32)
 
 | Released by | When | Board state |
 |---|---|---|
-| Codex | 2026-10-05 | lk-perf shell at 6000000 baud, both samplers stopped, 3200 samples retained, COM5 closed; no watchdog command issued. Recheck before use; reboot at 6 Mbaud to recover the loader |
+| Claude | 2026-10-05 | lk-perf K6 final image (lk.bin `b85c9df8…`) at the shell, 6000000 baud, timer and PMU samplers stopped, masked-time accounting off (the dump ends it), samples retained, COM5 closed; no watchdog command issued. Recheck before use; `--reboot` at 6 Mbaud returns it to the loader |
 
 ## Claims (consolidated TODO)
 
@@ -103,16 +103,19 @@ current source. *Owner* is empty until someone claims it.
 | 3 | K3 | No-CFI fallback: use the raw LR as the caller when hand-written assembly has no `.debug_frame` | P1 | — | Open | Finding #13; callers of memcpy/memset/spinlocks are undercounted |
 | 4 | K4 | `profiler stat` counts its own `printf` output (counters start before the status prints) | P2 | — | Open | Finding #10; confirmed still present in `profiler.c` |
 | 5 | K5 | `setup.sh` re-run fails on a file left by overlay patch 0004 (`gic.h`) | P2 | — | Open | Finding #14; scoped clean of that one path before the reset |
-| 6 | K6 | IRQ-masked blind spot, route 1: per-core masked-cycle accounting with masking sites; tag samples delayed by masking and attribute them to the masked region; shorten lk-perf's own masked console printing | P1 | Claude | In progress | User request 2026-10-05 (raised to P1). Routes 2 (cross-core PC sampling via debug registers) and 3 (priority-mask pseudo-NMI) not started |
-| 7 | K7 | Full `profiler stat`: any command, all 6 counters, derived IPC | P3 | — | Open | Review Phase 3 item 3 |
-| 8 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
-| 9 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim | P3 | — | Open | Fold into the next commit touching the same file |
-| 10 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses |
+| 6 | K10 | Timer-mode sampling phase-locks to IRQ masking: LK re-arms its scheduler tick from the handling time, so delayed ticks shift every later one (65% vs 50% in the K6 ground-truth test) | P2 | — | Open | Re-arm from the missed deadline (LK timer, an overlay) or a dedicated sampling timer; PMU mode is already fixed |
+| 7 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Open | Feasibility first on the Pi: `EDDEVID.PCSample`, debug APB address, non-invasive debug enabled in Non-secure state; leaf PC only |
+| 8 | K12 | IRQ-masked blind spot, route 3: mask by GIC priority (pseudo-NMI) instead of CPSR.I so the PMU interrupt still fires in masked code | P3 | — | Open | Needs the target GIC version (GICv3 `ICC_PMR`); larger LK change; prototype on the Pi's GICv2 `GICC_PMR` |
+| 9 | K7 | Full `profiler stat`: any command, all 6 counters, derived IPC | P3 | — | Open | Review Phase 3 item 3 |
+| 10 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
+| 11 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim | P3 | — | Open | Fold into the next commit touching the same file |
+| 12 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses |
 
 ### Done (recent)
 
 | ID | Item | Owner | Evidence |
 |---|---|---|---|
+| K6 | IRQ-masked blind spot, route 1: masked-time accounting, delayed-sample attribution, unbiased PMU reload, console printing without IRQ masking | Claude | Overlays `0012`/`0013`, `profiler maskon|maskoff|mask|masktest`, extended dump; `scripts/test_irqmask_report.py` (9) + existing suites; Pi ground truth: accounting 49.6% vs 50%, samples 48.2% vs 50%, 574/574 delayed samples attributed; [results/k6_irqmask_20261005](results/k6_irqmask_20261005/README.md) |
 | — | Real four-core FlameGraph and Perfetto demo | Codex | [results/lk_perf_demo_20261005](results/lk_perf_demo_20261005/README.md): 3200 samples, 800/core, zero integrity rejections |
 | — | perf-script export with metadata sidecar | Codex | `scripts/pi4_perf_export.py`, [EXPORT.md](EXPORT.md), 26 exporter tests |
 | — | Architecture documentation | Codex | [ARCHITECTURE.md](ARCHITECTURE.md) |
@@ -123,6 +126,33 @@ Earlier milestones (M1–M5, DWARF unwinder, review Phases 1–2) are recorded i
 [RPI4_BRINGUP.md](RPI4_BRINGUP.md).
 
 ## Handoff log
+
+### 2026-10-05 — Claude: K6 done (IRQ-masked blind spot, route 1); lock and Pi released
+
+- **Accounting** (overlay `0012`, `arch/arm/arm/irqmask.c`): per-core masked
+  and IRQ-handler time, region counts, longest region and site, 64-site table,
+  hooked in `arch_disable_ints`/`arch_enable_ints`, the GIC entry and the IRQ
+  exception exit. `profiler maskon|maskoff|mask`; `start`/`pmustart` enable it;
+  `dump` freezes it and prints checksummed MASKINFO/MASKCPU/MASKSITE lines.
+- **Attribution:** samples carry `src/lat/msite/mgap` (checksummed; older dumps
+  still parse). IRQs taken at the same unmask chain to the masking region.
+  The report flags delayed samples (4x the 5th-percentile latency) and adds
+  `[irq-masked: <site>]` folded frames.
+- **Fixed on the way:** PMU reload now credits events counted while pending
+  (`pmu_missed` counts whole lost periods). Without it the grid phase-locked to
+  masking (999/1000 samples at the unmask point in the ground-truth test).
+- **Console** (overlay `0013`): thread-context printing uses a mutex instead
+  of an IRQ-masking spinlock. Masked spans of up to 350 us per printed line
+  are gone.
+- **Verified on the Pi** (`masktest` = 50% masked by construction):
+  accounting 49.6%, PMU samples 48.2% masked-side, all 574 delayed samples
+  attributed to `profiler_masked_spin`; four-core workload unchanged.
+  Overlays 0001–0013 replay on a fresh LK `88a8efae` clone byte for byte. Host
+  tests: dwarf unwind, exporter 26, new K6 9 — all pass. No FPU instructions.
+- **Not fixed:** timer mode still phase-locks (LK re-arms the tick from the
+  handling time) -> K10. Routes 2 and 3 queued as K11/K12.
+- Lock free; Pi released in bolt-aarch32 (state above). Next: K1 (stack bounds)
+  or K10/K11.
 
 ### 2026-10-05 — Codex: synchronized and adopted the shared handoff
 

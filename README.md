@@ -34,7 +34,10 @@ SQL analysis, and an offline replay with the matching image/ELF.
 
 **Known limitations:** missing stack frames cannot be reconstructed from
 incomplete captured context, and execution while IRQs are masked is invisible
-to both sampling modes. Exporting or changing viewers cannot recover either.
+to both sampling modes. `profiler maskon` / `profiler mask` measure that
+masked time per core and per masking site, and the report attributes delayed
+samples to the region that held them (see ARCHITECTURE.md §11.1); the masked
+execution itself is still not sampled.
 Scheduling, wakeups, blocking reasons/durations, and CPU-frequency history
 are also absent from capture; analyzing them requires additional event
 instrumentation rather than stack samples alone.

@@ -336,8 +336,12 @@ This **CRC-32** checks the image transfer. It is a different algorithm from the 
 The current target emits one line per retained sample:
 
 ```text
-SAMPLE seq=<hex> cpu=<decimal> pc=<hex> lr=<hex> fp=<hex> sp=<hex> spsr=<hex> tid=<hex> ts=<hex> stack=<hex bytes> crc=<hex>
+SAMPLE seq=<hex> cpu=<decimal> pc=<hex> lr=<hex> fp=<hex> sp=<hex> spsr=<hex> tid=<hex> ts=<hex> stack=<hex bytes> src=<t|p> lat=<hex> msite=<hex> mgap=<hex> crc=<hex>
 ```
+
+`src`, `lat`, `msite` and `mgap` were added by K6 (2026-10-05); dumps from
+older images omit them, and the host tools accept both forms (the checksum
+covers the extra fields only when they are present).
 
 | Field | Target text width | Contract |
 |---|---:|---|
@@ -346,7 +350,18 @@ SAMPLE seq=<hex> cpu=<decimal> pc=<hex> lr=<hex> fp=<hex> sp=<hex> spsr=<hex> ti
 | `pc`, `lr`, `fp`, `sp`, `spsr`, `tid` | 8 hex digits each | Unsigned 32-bit raw values |
 | `ts` | 16 hex digits | Unsigned 64-bit timestamp |
 | `stack` | 256 hex digits | Exactly 128 bytes on the current target, in memory order |
+| `src` | 1 character | Trigger: `t` scheduler-tick timer, `p` PMU overflow |
+| `lat` | 8 hex digits | How late the interrupt was taken: CNTPCT ticks past the timer deadline (`t`) or PMU events counted past the overflow (`p`) |
+| `msite` | 8 hex digits | The masked region that most recently ended on this core, chained through IRQ handlers taken at the same unmask: the masking PC, or `0xffff0000 | GIC ID` for an IRQ handler; 0 when accounting is off |
+| `mgap` | 8 hex digits | CNTPCT ticks between that region's end and this sample; `ffffffff` when accounting is off |
 | `crc` | 8 hex digits | FNV-1a-style 32-bit field checksum |
+
+Before `SAMPLE done`, images with K6 also print the masked-time accounting
+(§11.1), frozen at the start of the dump, each line with its own checksum:
+`MASKINFO cntfrq=<hex> on=<0|1> now=<hex> crc=<hex>`, one
+`MASKCPU cpu=<n> start=… masked=… regions=… irq=… irqregions=… max=… maxsite=… dropped=… droppedticks=… crc=…`
+per core, and one `MASKSITE cpu=<n> site=… count=… ticks=… max=… crc=…` per
+recorded masking site. All durations are CNTPCT ticks at `cntfrq`.
 
 The final target marker is `SAMPLE done`. There is no build ID, format version, run ID, mode/event ID, declared expected sample count, or structured footer. The parser accepts the field order above but its regex accepts variable hex widths and it does not explicitly require the target's stack length. Older samples without `seq`/`crc` do not match this parser. Console echoes and unrelated text are ignored.
 
@@ -360,6 +375,9 @@ for v in [cpu, seq, pc, lr, fp, sp, spsr, tid, ts_low32, ts_high32]:
     c = ((c XOR v) * 16777619) modulo 2^32
 for byte in stack[0:128]:
     c = ((c XOR byte) * 16777619) modulo 2^32
+if K6 fields present:
+    for v in [ord(src), lat, msite, mgap]:
+        c = ((c XOR v) * 16777619) modulo 2^32
 ```
 
 The metadata loop folds whole 32-bit values, not their individual bytes; only the stack is folded byte by byte. Consequently the implementation is FNV-1a-style, not a conventional CRC or standard byte-stream FNV serialization. It detects accidental text corruption after parsing but cannot prove sample provenance, recover damaged bytes, or certify a coherent target snapshot.
@@ -463,8 +481,11 @@ Timer samples approximate where execution is observed at scheduler timer interru
 | `profiler pmustart` | Required event and count, base-0 parsing | Arm counter-0 overflow sampling on all cores; count must be at least 10000 |
 | `profiler pmustop` | None | Synchronously disarm PMU sampling across cores; no timer stop |
 | `profiler clear` | None | Zero sample arrays and ring counters; no automatic producer stop |
-| `profiler status` | None | Show per-core lifetime totals, heads, wrap indication, and timer-enable flag; no complete PMU-mode status |
-| `profiler dump` | None | Export retained records in CPU/slot order and print `SAMPLE done`; no automatic freeze |
+| `profiler status` | None | Show per-core lifetime totals, heads, wrap indication, PMU overflows lost inside masked spans longer than a period (`pmu_missed`), and timer-enable flag; no complete PMU-mode status |
+| `profiler dump` | None | Export retained records in CPU/slot order, then the masked-time accounting, and print `SAMPLE done`; ends the accounting window (turns it off) so the dump's own output is not counted; no automatic sampler freeze |
+| `profiler maskon` / `maskoff` | None | Start a fresh IRQ-masked time accounting window on every core / stop it, keeping totals. `start` and `pmustart` turn it on if it is off; `clear` restarts the window |
+| `profiler mask` | None | Per-core masked share, IRQ-handler share, region count, longest region and its site, and the top five masking sites |
+| `profiler masktest [loops] [us]` | 2000, 500 | Ground-truth workload: alternate `us` microseconds with IRQs masked and `us` unmasked, so half the time is masked by construction |
 | `profiler bench [iters]` | 20000000 iterations per function | Alternate two arithmetic leaf workloads four times; does not start sampling |
 | `profiler nest [iters]` | 20000000 | Nested workload; optimization can eliminate wrapper frames via tail calls |
 | `profiler smp [iters]` | 20000000 per worker | Create one 4096-byte-stack worker per configured core and join all; workers are scheduler-distributed, not explicitly pinned |
@@ -527,9 +548,14 @@ Confirm that the log contains the completed dump marker and command completion, 
 
 ### 11.1 IRQ-masked execution is a systematic blind spot
 
-Both sampling sources are ordinary IRQs. While CPSR.I is set, they cannot interrupt the core. A delayed interrupt after unmasking can sample unrelated subsequent code; it does not reconstruct time spent inside the masked region. The console patch holds an IRQ-saving spin lock over a full formatted-print call, making printing a concrete source of bias and perturbation.
+Both sampling sources are ordinary IRQs. While CPSR.I is set, they cannot interrupt the core: the trigger stays pending and is taken right after the unmask, so the sample's PC is the unmask point, not where the time went. The intended platform is **Non-secure SVC**, where FIQ routing is unavailable; no FIQ or pseudo-NMI bypass exists in the tool. K6 (2026-10-05) does not remove the blind spot; it measures it and attributes it:
 
-The intended platform is **Non-secure SVC**, as corrected in the latest hardware notes. The older Secure-target/FIQ proposal is superseded. No FIQ or pseudo-NMI bypass exists in the implemented tool, and this document does not promise one on the target. A masked-time/cycles accounting mechanism is proposed in the hardware notes but not implemented, and current reports do not automatically state or quantify this bias.
+- **Masked-time accounting** (overlay `0012`, `arch/arm/arm/irqmask.c`). Every real unmasked-to-masked transition in `arch_disable_ints()` opens a region at that call's PC; every GIC entry opens an IRQ-handler region; the next `arch_enable_ints()` or IRQ exit closes it. Per core: masked and IRQ-handler CNTPCT ticks over the window, region count, longest region and its site, and a 64-entry site table (overflow counted, never merged). Off unless enabled; when off, the inline hooks cost one load and a branch.
+- **Delayed-sample attribution.** Each sample records `lat` (how late the interrupt was taken) and the region that held it back (`msite`, `mgap`). An IRQ taken right at an unmask inherits that unmask's region, so a sample queued behind the timer handler still names the code that masked. The host flags a sample as delayed when `lat` exceeds four times the 5th-percentile latency for its source, and adds an `[irq-masked: <site>]` leaf frame in `--folded` output.
+- **Unbiased PMU sampling.** The overflow handler now credits the events counted while the interrupt was pending towards the next period, so delayed samples no longer shift the sampling grid; whole periods inside one masked span are counted as `pmu_missed`. Before this, the grid phase-locked to masking: a 50% masked ground-truth test put 999 of 1000 samples at the unmask point; now 48.2%.
+- **Console printing no longer masks IRQs** (overlay `0013`). Thread-context prints serialise on a mutex; only prints from IRQ handlers, from already-masked code or from idle threads keep the IRQ-masking spinlock. On the Pi this removed masked spans of up to 350 us per printed line.
+
+Hardware results are in [results/k6_irqmask_20261005](results/k6_irqmask_20261005/README.md). Remaining limits: timer-mode sampling still phase-locks to masking, because LK re-arms its scheduler tick from the time the tick is handled (65% vs 50% in the ground-truth test); use PMU mode for unbiased shares, and the accounting totals for the masked share itself. Attribution names the masking region, not the instruction inside it; per-site detail is limited to 64 sites per core; the hooks add a few CNTPCT reads to every masked region.
 
 ### 11.2 Limitations by failure class
 
@@ -544,7 +570,7 @@ The intended platform is **Non-secure SVC**, as corrected in the latest hardware
 | Stack-copy bounds | Fixed-size snapshot | No thread-stack bounds check before target `memcpy`; copy can read beyond a shallow thread's stack allocation |
 | Concurrent clear/dump | Operational stop-before-export sequence | No enforced freeze, synchronized timer stop, or record-generation validation |
 | Buffer overflow | Preserve most recent per-core slots; status marks wrap | Older samples lost; no exported overwrite counter/session totals |
-| Mixed sampling modes/runs | Operator chooses one mode and fresh log | Records lack mode, event, run, build, and format identity |
+| Mixed sampling modes/runs | Operator chooses one mode and fresh log; each record now carries its trigger (`src`) | Records lack event, run, build, and format identity |
 | Context sufficiency | Capture SP/LR and one FP candidate; carry recoverable registers through CFI | Other live registers and the other FP candidate are missing |
 | Missing assembly CFI | Stop the walk | No validated LR fallback; caller contributions underrepresented |
 | Bad symbol attribution | Matching ELF supplied by operator | Nearest-start mapping lacks function-extent validation; return-address boundaries remain |

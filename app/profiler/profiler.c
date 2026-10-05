@@ -92,6 +92,7 @@
  * QEMU-era design was limited to.
  */
 
+#include <arch/arch_interrupts.h>
 #include <arch/arch_ops.h>
 #include <arch/arm.h>
 #include <kernel/mp.h>
@@ -298,6 +299,9 @@ static void profiler_pmu_route_and_unmask(void) {
 // helpers right below need them already visible.
 volatile uint32_t profiler_pmu_enabled[SMP_MAX_CPUS];
 volatile uint32_t profiler_pmu_reload;
+// K6: overflows that never produced a sample because one IRQ-masked span
+// covered more than a whole period (see the compensated reload below).
+volatile uint32_t profiler_pmu_missed[SMP_MAX_CPUS];
 
 // Review finding #3: pmustart only rejected count == 0, so a small reload
 // (e.g. "pmustart 0x11 100") could make the counter overflow again before
@@ -398,12 +402,51 @@ uint32_t profiler_tid_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
 // separate, worse problem than this capture.
 uint8_t profiler_stack_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE][PROFILER_STACK_CAPTURE_BYTES];
 uint64_t profiler_ts_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
+// K6: why a sample may sit at an unmask point instead of where the time
+// went. The trigger is held pending while the core runs with CPSR.I set
+// and is taken right after the unmask, so the sample PC is the unmask
+// point. `lat` measures how late the interrupt was taken: CNTPCT ticks
+// past the timer deadline (src 't') or PMU events counted past the
+// overflow (src 'p'). `msite`/`mgap` name the masked region that closed
+// most recently on this core (arch/arm/arm/irqmask.c, chained through
+// IRQ handlers taken at the same unmask) and how many CNTPCT ticks
+// before this sample it ended; a large `lat` with a small `mgap` means
+// the sample was delayed by that region.
+uint8_t profiler_src_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
+uint32_t profiler_lat_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
+uint32_t profiler_msite_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
+uint32_t profiler_mgap_buf[SMP_MAX_CPUS][PROFILER_BUF_SIZE];
 volatile uint32_t profiler_head[SMP_MAX_CPUS];
 volatile uint32_t profiler_total[SMP_MAX_CPUS];
 volatile uint32_t profiler_enabled;
 // profiler_pmu_enabled[]/profiler_pmu_reload declared earlier in this
 // file (ahead of the arm/disarm helpers that need them) -- see that
 // declaration's own comment.
+
+// K6: architected generic-timer registers (AArch32 CP15). CNTPCT is the
+// system count; CNTP_CVAL is the physical timer's compare value, i.e. the
+// deadline the tick fired for (LK's tick uses the CNTP timer on this board).
+static inline uint64_t profiler_cntpct(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("mrrc p15, 0, %0, %1, c14" : "=r"(lo), "=r"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static inline uint64_t profiler_cntp_cval(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("mrrc p15, 2, %0, %1, c14" : "=r"(lo), "=r"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static inline uint32_t profiler_cntfrq(void) {
+    uint32_t v;
+    __asm__ volatile("mrc p15, 0, %0, c14, c0, 0" : "=r"(v));
+    return v;
+}
+
+static inline uint32_t profiler_sat32(uint64_t v) {
+    return v > 0xffffffffu ? 0xffffffffu : (uint32_t)v;
+}
 
 // Called from dev/interrupt/arm_gic/gic_v2.c on every IRQ (weak default is
 // a no-op when this file isn't linked in). Keep this minimal and
@@ -462,13 +505,58 @@ void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
     memcpy(profiler_stack_buf[cpu][idx], (const void *)(frame + 1),
            PROFILER_STACK_CAPTURE_BYTES);
     profiler_ts_buf[cpu][idx] = current_time_hires();
+
+    // K6: interrupt delay and the most recent masked region on this core.
+    uint64_t now_count = profiler_cntpct();
+    uint32_t lat;
+    uint8_t src;
+#if BCM2711
+    if (is_pmu_overflow) {
+        // The counter wrapped to 0 at overflow and kept counting, so its
+        // value now is the number of events since the overflow.
+        uint32_t sel = pmu_read_pmselr();
+        pmu_write_pmselr(0);
+        lat = pmu_read_pmxevcntr();
+        pmu_write_pmselr(sel);
+        src = 'p';
+    } else
+#endif
+    {
+        uint64_t deadline = profiler_cntp_cval();
+        lat = now_count >= deadline ? profiler_sat32(now_count - deadline) : 0;
+        src = 't';
+    }
+    const struct arm_irqmask_cpu *mc = &arm_irqmask_cpu[cpu];
+    // The cause chains through IRQ handlers taken back to back at the
+    // same unmask (arch/arm/arm/irqmask.c), so `msite` names the masked
+    // region that held this sample back, not the handler that ran just
+    // before it.
+    bool attributed = arm_irqmask_on && mc->cause_end != 0 && now_count >= mc->cause_end;
+    profiler_src_buf[cpu][idx] = src;
+    profiler_lat_buf[cpu][idx] = lat;
+    profiler_msite_buf[cpu][idx] = attributed ? mc->cause_site : 0;
+    profiler_mgap_buf[cpu][idx] = attributed ? profiler_sat32(now_count - mc->cause_end)
+                                             : 0xffffffffu;
     profiler_head[cpu] = (idx + 1) % PROFILER_BUF_SIZE;
     profiler_total[cpu]++;
 
 #if BCM2711
     if (is_pmu_overflow) {
         pmu_write_pmovsr(1u << 0);           // write-1-to-clear counter0's overflow flag
-        profiler_pmu_reload_counter0(profiler_pmu_reload);  // next window
+        // K6: keep the sampling grid fixed in event time. Reloading the full
+        // period here would restart it from whenever this (possibly delayed)
+        // interrupt was taken, so after an IRQ-masked span every later
+        // overflow shifts with it and the samples phase-lock onto the
+        // masking pattern. Credit the `lat` events already counted towards
+        // the next period instead; whole periods inside one masked span
+        // are lost overflows, counted rather than silently dropped.
+        uint32_t period = 0u - profiler_pmu_reload;
+        uint32_t into_next = lat;
+        if (period && lat >= period) {
+            profiler_pmu_missed[cpu] += lat / period;
+            into_next = lat % period;
+        }
+        profiler_pmu_reload_counter0(profiler_pmu_reload + into_next);  // next window
     }
 #endif
 }
@@ -512,6 +600,35 @@ __NO_INLINE static void profiler_workload_mid(uint32_t iters) {
 
 __NO_INLINE static void profiler_workload_outer(uint32_t iters) {
     profiler_workload_mid(iters);
+}
+
+// K6 ground-truth workload: alternate equal spins with IRQs masked and
+// unmasked, so half of the time is masked by construction. Masked-time
+// accounting should report about 50% on the core running it, at
+// profiler_masked_spin's site, and samples triggered during the masked
+// half should be taken late and attributed to that site.
+__NO_INLINE static void profiler_spin_ticks(uint64_t span) {
+    uint64_t t0 = profiler_cntpct();
+    while (profiler_cntpct() - t0 < span) {
+    }
+}
+
+__NO_INLINE static void profiler_masked_spin(uint64_t span) {
+    arch_disable_ints();
+    profiler_spin_ticks(span);
+    arch_enable_ints();
+}
+
+__NO_INLINE static void profiler_unmasked_spin(uint64_t span) {
+    profiler_spin_ticks(span);
+}
+
+static void profiler_masktest(uint32_t loops, uint32_t us) {
+    uint64_t span = ((uint64_t)us * profiler_cntfrq()) / 1000000u;
+    for (uint32_t i = 0; i < loops; i++) {
+        profiler_masked_spin(span);
+        profiler_unmasked_spin(span);
+    }
 }
 
 // Stage 4: run the same nested workload concurrently on SMP_MAX_CPUS
@@ -654,9 +771,16 @@ static void profiler_workload_armmode(uint32_t iters) {
 // Python. Deliberately over the sample's real binary values, not the
 // printed hex text, so it catches corruption of the printed text
 // itself without caring how that text was formatted.
+static inline uint32_t profiler_fnv(uint32_t c, uint32_t v) {
+    return (c ^ v) * 16777619u;
+}
+
+// K6 records append src/lat/msite/mgap after the stack bytes, so the
+// pre-K6 prefix of the checksum is unchanged and old logs still verify.
 static uint32_t profiler_sample_checksum(uint32_t cpu, uint32_t seq, uint32_t pc, uint32_t lr,
                                           uint32_t fp, uint32_t sp, uint32_t spsr, uint32_t tid,
-                                          uint64_t ts, const uint8_t *stack) {
+                                          uint64_t ts, const uint8_t *stack, uint32_t src,
+                                          uint32_t lat, uint32_t msite, uint32_t mgap) {
     uint32_t c = 0x811c9dc5u;
     c ^= cpu; c *= 16777619u;
     c ^= seq; c *= 16777619u;
@@ -671,18 +795,100 @@ static uint32_t profiler_sample_checksum(uint32_t cpu, uint32_t seq, uint32_t pc
     for (int i = 0; i < PROFILER_STACK_CAPTURE_BYTES; i++) {
         c ^= stack[i]; c *= 16777619u;
     }
+    c = profiler_fnv(c, src);
+    c = profiler_fnv(c, lat);
+    c = profiler_fnv(c, msite);
+    c = profiler_fnv(c, mgap);
     return c;
+}
+
+// K6: start a fresh accounting window on every core, then enable it.
+static void profiler_mask_reset_this_cpu(void *context) {
+    arm_irqmask_reset_this_cpu(*(const uint64_t *)context);
+}
+
+static void profiler_mask_sync_this_cpu(void *context) {
+    (void)context;
+}
+
+static void profiler_mask_on(void) {
+    arm_irqmask_on = 0;
+    uint64_t start = profiler_cntpct();
+    mp_sync_exec(MP_IPI_TARGET_ALL, 0, profiler_mask_reset_this_cpu, &start);
+    arm_irqmask_on = 1;
+}
+
+static uint32_t profiler_permille(uint64_t part, uint64_t whole) {
+    return whole ? (uint32_t)((part * 1000u) / whole) : 0;
+}
+
+static uint32_t profiler_ticks_to_ns(uint64_t ticks) {
+    uint32_t f = profiler_cntfrq();
+    return f ? profiler_sat32((ticks * 1000000000ull) / f) : 0;
+}
+
+// Human-readable summary; the dump carries the same data for the host.
+static void profiler_mask_print(void) {
+    uint64_t now = profiler_cntpct();
+    printf("mask: accounting %s, CNTFRQ=%u Hz\n", arm_irqmask_on ? "on" : "off",
+           profiler_cntfrq());
+    for (int c = 0; c < SMP_MAX_CPUS; c++) {
+        const struct arm_irqmask_cpu *m = &arm_irqmask_cpu[c];
+        uint64_t window = m->window_start && now > m->window_start ? now - m->window_start : 0;
+        uint32_t pm = profiler_permille(m->masked_ticks, window);
+        uint32_t ipm = profiler_permille(m->irq_ticks, window);
+        printf("mask: cpu%d masked %u.%u%% (irq handlers %u.%u%%) in %u regions, "
+               "longest %u ns at %08x, unrecorded sites %u\n",
+               c, pm / 10, pm % 10, ipm / 10, ipm % 10, m->regions,
+               profiler_ticks_to_ns(m->max_ticks), m->max_site, m->dropped_regions);
+        bool shown[ARM_IRQMASK_SITES] = { false };
+        for (int rank = 0; rank < 5; rank++) {
+            int best = -1;
+            for (int i = 0; i < (int)ARM_IRQMASK_SITES; i++) {
+                if (!shown[i] && m->sites[i].count &&
+                    (best < 0 || m->sites[i].ticks > m->sites[best].ticks))
+                    best = i;
+            }
+            if (best < 0)
+                break;
+            shown[best] = true;
+            const struct arm_irqmask_site *e = &m->sites[best];
+            uint32_t spm = profiler_permille(e->ticks, window);
+            printf("mask:   site %08x  %u.%u%%  %u regions  longest %u ns\n", e->site,
+                   spm / 10, spm % 10, e->count, profiler_ticks_to_ns(e->max_ticks));
+        }
+    }
 }
 
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
-        printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|edgetest|stat|pmustart|pmustop|pmu>\n");
+        printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|edgetest|stat|pmustart|pmustop|pmu|maskon|maskoff|mask|masktest>\n");
         return -1;
     }
 
     const char *sub = argv[1].str;
 
-    if (!strcmp(sub, "start")) {
+    if (!strcmp(sub, "maskon")) {
+        profiler_mask_on();
+        printf("mask: IRQ-masked time accounting on (new window on all %d cores)\n",
+               SMP_MAX_CPUS);
+    } else if (!strcmp(sub, "maskoff")) {
+        arm_irqmask_on = 0;
+        printf("mask: IRQ-masked time accounting off (totals kept)\n");
+    } else if (!strcmp(sub, "mask")) {
+        profiler_mask_print();
+    } else if (!strcmp(sub, "masktest")) {
+        uint32_t loops = argc >= 3 ? (uint32_t)argv[2].u : 2000;
+        uint32_t us = argc >= 4 ? (uint32_t)argv[3].u : 500;
+        printf("masktest: %u x (%u us masked + %u us unmasked) on cpu%u ...\n", loops, us, us,
+               arch_curr_cpu_num());
+        profiler_masktest(loops, us);
+        printf("masktest: done\n");
+    } else if (!strcmp(sub, "start")) {
+        if (!arm_irqmask_on) {
+            profiler_mask_on();
+            printf("mask: IRQ-masked time accounting started with sampling\n");
+        }
         profiler_enabled = 1;
         printf("profiler: sampling started (irq %d, %d cores, buffer %d entries/core)\n",
                PROFILER_TIMER_IRQ, SMP_MAX_CPUS, PROFILER_BUF_SIZE);
@@ -703,7 +909,16 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         memset(profiler_tid_buf, 0, sizeof(profiler_tid_buf));
         memset(profiler_stack_buf, 0, sizeof(profiler_stack_buf));
         memset(profiler_ts_buf, 0, sizeof(profiler_ts_buf));
-        printf("profiler: buffer cleared\n");
+        memset(profiler_src_buf, 0, sizeof(profiler_src_buf));
+        memset(profiler_lat_buf, 0, sizeof(profiler_lat_buf));
+        memset(profiler_msite_buf, 0, sizeof(profiler_msite_buf));
+        memset(profiler_mgap_buf, 0, sizeof(profiler_mgap_buf));
+        for (int c = 0; c < SMP_MAX_CPUS; c++)
+            profiler_pmu_missed[c] = 0;
+        if (arm_irqmask_on)
+            profiler_mask_on();
+        printf("profiler: buffer cleared%s\n",
+               arm_irqmask_on ? " (masked-time window restarted)" : "");
     } else if (!strcmp(sub, "dump")) {
         // M5: text dump, one tagged line per sample, oldest-to-newest
         // per core -- simple and robust over the console's existing
@@ -737,6 +952,17 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         // sample where they disagree, the same "count it, don't trust
         // it, don't abort the whole report" resilience already used
         // for a failed unwind (review finding #12).
+        // K6: end the masked-time window before printing, so the dump's
+        // own console output is not counted. Once accounting is off, an
+        // IPI to every core completes only after each core's in-flight
+        // (masked) update has finished, so the snapshot is consistent.
+        uint64_t now = profiler_cntpct();
+        uint32_t mask_was_on = arm_irqmask_on;
+        arm_irqmask_on = 0;
+        mp_sync_exec(MP_IPI_TARGET_ALL, 0, profiler_mask_sync_this_cpu, NULL);
+        static struct arm_irqmask_cpu mask_snap[SMP_MAX_CPUS];
+        memcpy(mask_snap, arm_irqmask_cpu, sizeof(mask_snap));
+
         uint32_t seq = 0;
         for (int c = 0; c < SMP_MAX_CPUS; c++) {
             uint32_t count = profiler_total[c] < PROFILER_BUF_SIZE ?
@@ -753,16 +979,68 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
                 uint32_t tid = profiler_tid_buf[c][idx];
                 uint64_t ts = profiler_ts_buf[c][idx];
                 const uint8_t *stack = profiler_stack_buf[c][idx];
+                uint32_t src = profiler_src_buf[c][idx];
+                uint32_t lat = profiler_lat_buf[c][idx];
+                uint32_t msite = profiler_msite_buf[c][idx];
+                uint32_t mgap = profiler_mgap_buf[c][idx];
                 uint32_t crc = profiler_sample_checksum((uint32_t)c, seq, pc, lr, fp, sp,
-                                                         spsr, tid, ts, stack);
+                                                         spsr, tid, ts, stack, src, lat,
+                                                         msite, mgap);
                 printf("SAMPLE seq=%08x cpu=%d pc=%08x lr=%08x fp=%08x sp=%08x "
                        "spsr=%08x tid=%08x ts=%016llx stack=",
                        seq, c, pc, lr, fp, sp, spsr, tid, (unsigned long long)ts);
                 for (int b = 0; b < PROFILER_STACK_CAPTURE_BYTES; b++) {
                     printf("%02x", stack[b]);
                 }
-                printf(" crc=%08x\n", crc);
+                printf(" src=%c lat=%08x msite=%08x mgap=%08x crc=%08x\n",
+                       src ? (char)src : '?', lat, msite, mgap, crc);
                 seq++;
+            }
+        }
+        // K6: masked-time accounting as frozen at the start of the dump
+        // (the dump ends the window), checksummed like the samples. All
+        // counts are CNTPCT ticks; MASKINFO gives the tick rate.
+        uint32_t freq = profiler_cntfrq();
+        uint32_t ic = profiler_fnv(profiler_fnv(profiler_fnv(profiler_fnv(
+            0x811c9dc5u, freq), mask_was_on), (uint32_t)now), (uint32_t)(now >> 32));
+        printf("MASKINFO cntfrq=%08x on=%u now=%016llx crc=%08x\n", freq, mask_was_on,
+               (unsigned long long)now, ic);
+        for (int c = 0; c < SMP_MAX_CPUS; c++) {
+            const struct arm_irqmask_cpu *m = &mask_snap[c];
+            uint32_t k = 0x811c9dc5u;
+            k = profiler_fnv(k, (uint32_t)c);
+            k = profiler_fnv(k, (uint32_t)m->window_start);
+            k = profiler_fnv(k, (uint32_t)(m->window_start >> 32));
+            k = profiler_fnv(k, (uint32_t)m->masked_ticks);
+            k = profiler_fnv(k, (uint32_t)(m->masked_ticks >> 32));
+            k = profiler_fnv(k, m->regions);
+            k = profiler_fnv(k, (uint32_t)m->irq_ticks);
+            k = profiler_fnv(k, (uint32_t)(m->irq_ticks >> 32));
+            k = profiler_fnv(k, m->irq_regions);
+            k = profiler_fnv(k, m->max_ticks);
+            k = profiler_fnv(k, m->max_site);
+            k = profiler_fnv(k, m->dropped_regions);
+            k = profiler_fnv(k, (uint32_t)m->dropped_ticks);
+            k = profiler_fnv(k, (uint32_t)(m->dropped_ticks >> 32));
+            printf("MASKCPU cpu=%d start=%016llx masked=%016llx regions=%08x irq=%016llx "
+                   "irqregions=%08x max=%08x maxsite=%08x dropped=%08x droppedticks=%016llx "
+                   "crc=%08x\n", c, (unsigned long long)m->window_start,
+                   (unsigned long long)m->masked_ticks, m->regions,
+                   (unsigned long long)m->irq_ticks, m->irq_regions, m->max_ticks, m->max_site,
+                   m->dropped_regions, (unsigned long long)m->dropped_ticks, k);
+            for (int i = 0; i < (int)ARM_IRQMASK_SITES; i++) {
+                const struct arm_irqmask_site *e = &m->sites[i];
+                if (!e->count)
+                    continue;
+                uint32_t sk = 0x811c9dc5u;
+                sk = profiler_fnv(sk, (uint32_t)c);
+                sk = profiler_fnv(sk, e->site);
+                sk = profiler_fnv(sk, e->count);
+                sk = profiler_fnv(sk, (uint32_t)e->ticks);
+                sk = profiler_fnv(sk, (uint32_t)(e->ticks >> 32));
+                sk = profiler_fnv(sk, e->max_ticks);
+                printf("MASKSITE cpu=%d site=%08x count=%08x ticks=%016llx max=%08x crc=%08x\n",
+                       c, e->site, e->count, (unsigned long long)e->ticks, e->max_ticks, sk);
             }
         }
         printf("SAMPLE done\n");
@@ -926,6 +1204,10 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         printf("pmustart: arming event counter 0 on all %d cores for event "
                "0x%x, reload every %u ...\n", SMP_MAX_CPUS, event, count);
         struct profiler_pmu_arm_ctx ctx = { .event = event };
+        if (!arm_irqmask_on) {
+            profiler_mask_on();
+            printf("mask: IRQ-masked time accounting started with sampling\n");
+        }
         mp_sync_exec(MP_IPI_TARGET_ALL, 0, profiler_pmu_arm_this_cpu, &ctx);
 
         printf("profiler: PMU-event sampling started on all %d cores "
@@ -979,8 +1261,10 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         uint32_t total = 0;
         for (int c = 0; c < SMP_MAX_CPUS; c++) {
             total += profiler_total[c];
-            printf("profiler: cpu%d total_samples=%u head=%u%s\n", c, profiler_total[c],
-                   profiler_head[c], profiler_total[c] >= PROFILER_BUF_SIZE ? " (WRAPPED)" : "");
+            printf("profiler: cpu%d total_samples=%u head=%u%s pmu_missed=%u\n", c,
+                   profiler_total[c], profiler_head[c],
+                   profiler_total[c] >= PROFILER_BUF_SIZE ? " (WRAPPED)" : "",
+                   profiler_pmu_missed[c]);
         }
         printf("profiler: enabled=%u total_samples(all cpus)=%u capacity=%d/core\n",
                profiler_enabled, total, PROFILER_BUF_SIZE);
@@ -992,5 +1276,5 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
 }
 
 STATIC_COMMAND_START
-STATIC_COMMAND("profiler", "bare-metal sampling profiler (start|stop|status|clear)", &cmd_profiler)
+STATIC_COMMAND("profiler", "bare-metal sampling profiler (start|stop|status|clear|mask)", &cmd_profiler)
 STATIC_COMMAND_END(profiler);

@@ -1,0 +1,113 @@
+--- a/lib/io/console.c
++++ b/lib/io/console.c
+@@ -18,6 +18,7 @@
+ #include <platform.h>
+ #include <platform/debug.h>
+ #include <kernel/thread.h>
++#include <kernel/mutex.h>
+ #include <lk/init.h>
+ 
+ /* routines for dealing with main console io */
+@@ -32,12 +33,39 @@
+  * lets two cores' calls interleave mid-string, producing garbled
+  * console output. Confirmed on real rpi4 hardware the first time SMP
+  * was enabled for that target. */
+-arch_interrupt_saved_state_t console_print_lock(void) {
+-    return spin_lock_irqsave(&print_spin_lock);
++/* lk-perf K6: a print holds this lock while the UART sends the whole
++ * line (about 170 us per 100 characters at 6 Mbaud), so masking IRQs
++ * for it hid that time from IRQ sampling and delayed every interrupt
++ * behind it. Ordinary thread-context prints now serialise on a mutex
++ * instead, with IRQs left enabled. Prints that cannot block -- from an
++ * IRQ handler, with IRQs already masked, or from an idle thread -- keep
++ * the IRQ-masking spinlock; such a print can interleave with a
++ * thread-context line, which is rare and only cosmetic. */
++static mutex_t print_mutex = MUTEX_INITIAL_VALUE(print_mutex);
++
++static bool console_print_can_block(void) {
++    if (arch_ints_disabled() || arch_in_int_handler())
++        return false;
++    thread_t *t = get_current_thread();
++    return t && !(t->flags & THREAD_FLAG_IDLE);
+ }
+ 
+-void console_print_unlock(arch_interrupt_saved_state_t state) {
+-    spin_unlock_irqrestore(&print_spin_lock, state);
++console_print_state_t console_print_lock(void) {
++    console_print_state_t state = { .mutex = false };
++    if (console_print_can_block()) {
++        mutex_acquire(&print_mutex);
++        state.mutex = true;
++    } else {
++        state.irq = spin_lock_irqsave(&print_spin_lock);
++    }
++    return state;
++}
++
++void console_print_unlock(console_print_state_t state) {
++    if (state.mutex)
++        mutex_release(&print_mutex);
++    else
++        spin_unlock_irqrestore(&print_spin_lock, state.irq);
+ }
+ 
+ #if CONSOLE_HAS_INPUT_BUFFER
+@@ -81,19 +109,29 @@
+ }
+ 
+ void register_print_callback(print_callback_t *cb) {
++    bool m = console_print_can_block();
++    if (m)
++        mutex_acquire(&print_mutex);
+     arch_interrupt_saved_state_t state = spin_lock_irqsave(&print_spin_lock);
+ 
+     list_add_head(&print_callbacks, &cb->entry);
+ 
+     spin_unlock_irqrestore(&print_spin_lock, state);
++    if (m)
++        mutex_release(&print_mutex);
+ }
+ 
+ void unregister_print_callback(print_callback_t *cb) {
++    bool m = console_print_can_block();
++    if (m)
++        mutex_acquire(&print_mutex);
+     arch_interrupt_saved_state_t state = spin_lock_irqsave(&print_spin_lock);
+ 
+     list_delete(&cb->entry);
+ 
+     spin_unlock_irqrestore(&print_spin_lock, state);
++    if (m)
++        mutex_release(&print_mutex);
+ }
+ 
+ static ssize_t __debug_stdio_write(io_handle_t *io, const char *s, size_t len) {
+--- a/lib/io/include/lib/io.h
++++ b/lib/io/include/lib/io.h
+@@ -30,8 +30,13 @@
+ /* Hold across an entire formatted-print call (see printf.c.inc's
+  * vfprintf) to keep concurrent callers' output from interleaving on
+  * SMP. */
+-arch_interrupt_saved_state_t console_print_lock(void);
+-void console_print_unlock(arch_interrupt_saved_state_t state);
++typedef struct {
++    arch_interrupt_saved_state_t irq;
++    bool mutex;
++} console_print_state_t;
++
++console_print_state_t console_print_lock(void);
++void console_print_unlock(console_print_state_t state);
+ 
+ /* the underlying handle to talk to io devices */
+ struct io_handle;
+--- a/lib/libc/printf.c.inc
++++ b/lib/libc/printf.c.inc
+@@ -102,7 +102,7 @@
+ }
+ 
+ int FUNC(vfprintf)(FILE *fp, const char *fmt, va_list ap) {
+-    arch_interrupt_saved_state_t state = console_print_lock();
++    console_print_state_t state = console_print_lock();
+     int ret = FUNC(_printf_engine)(&_fprintf_output_func, (void *)fp, fmt, ap);
+     console_print_unlock(state);
+     return ret;

@@ -3,6 +3,16 @@
 > Work queue, ownership and status updates: [HANDOFF.md](HANDOFF.md). This
 > file is the hardware evidence record.
 
+**IRQ-masked time accounting, K6 (2026-10-05, Claude):** the profiler now
+measures the blind spot it cannot sample. On the Pi, the K6 ground-truth test
+(`profiler masktest`, 50% masked by construction) reported 49.6% masked time
+at `profiler_masked_spin`, put 48.2% of PMU samples on the masked side and
+attributed all 574 delayed samples to that function. Console printing had
+been masking IRQs for up to 350 us per line; overlay 0013 removed that.
+PMU reload is now delay-compensated; before that, the sampling grid
+phase-locked to masking. Timer-mode sampling still phase-locks (HANDOFF K10).
+Details and logs: [results/k6_irqmask_20261005](results/k6_irqmask_20261005/README.md).
+
 **Hardware profile demo complete (2026-10-05, Codex):**
 [`profiler smp 400000000` demo](results/lk_perf_demo_20261005/README.md)
 captured PMU CPU-cycle samples (event 0x11, period 1000000) on all four Pi

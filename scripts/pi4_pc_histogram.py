@@ -6,7 +6,7 @@ capture app/profiler.c's `dump` command now includes.
 
 Usage:
     python scripts/pi4_pc_histogram.py pi4.log build/lk/build-rpi4-test/lk.elf \
-        [--folded out.folded] [--annotate N]
+        [--folded out.folded] [--annotate N] [--no-mask-frames]
 
 `pi4.log` just needs to contain the "SAMPLE ..." lines `profiler dump`
 prints -- everything else in the log (shell echoes, other output) is
@@ -24,6 +24,15 @@ landed exactly there -- a `perf annotate`-style, per-instruction
 hotspot view, not just "which function". objdump itself already
 handles ARM/Thumb-correct disassembly from the ELF's own `$t`/`$a`
 mapping symbols, so this doesn't need to track instruction sets itself.
+
+IRQ-masked time (K6): dumps from images with masked-time accounting add
+`src/lat/msite/mgap` to each sample and MASKINFO/MASKCPU/MASKSITE lines.
+The report then states how much of each core's time ran with IRQs masked
+(invisible to sampling), which code did the masking, and which samples
+were delayed by a masked region. In `--folded` output a delayed sample
+gets an extra leaf frame `[irq-masked: <site>]` naming the region that
+held it back (`--no-mask-frames` turns this off). Older dumps without
+these fields still parse and report as before.
 """
 from __future__ import annotations
 
@@ -45,14 +54,51 @@ SAMPLE_RE = re.compile(
     r"SAMPLE seq=(?P<seq>[0-9a-fA-F]+) cpu=(?P<cpu>\d+) pc=(?P<pc>[0-9a-fA-F]+) "
     r"lr=(?P<lr>[0-9a-fA-F]+) fp=(?P<fp>[0-9a-fA-F]+) sp=(?P<sp>[0-9a-fA-F]+) "
     r"spsr=(?P<spsr>[0-9a-fA-F]+) tid=(?P<tid>[0-9a-fA-F]+) ts=(?P<ts>[0-9a-fA-F]+) "
-    r"stack=(?P<stack>[0-9a-fA-F]+) crc=(?P<crc>[0-9a-fA-F]+)"
+    r"stack=(?P<stack>[0-9a-fA-F]+)"
+    # K6 fields, absent in older dumps (their checksum then omits them too)
+    r"(?: src=(?P<src>[tp?]) lat=(?P<lat>[0-9a-fA-F]+) msite=(?P<msite>[0-9a-fA-F]+) "
+    r"mgap=(?P<mgap>[0-9a-fA-F]+))?"
+    r" crc=(?P<crc>[0-9a-fA-F]+)"
 )
+
+MASKINFO_RE = re.compile(
+    r"MASKINFO cntfrq=(?P<freq>[0-9a-fA-F]{8}) on=(?P<on>\d+) now=(?P<now>[0-9a-fA-F]{16}) "
+    r"crc=(?P<crc>[0-9a-fA-F]{8})\s*$"
+)
+MASKCPU_RE = re.compile(
+    r"MASKCPU cpu=(?P<cpu>\d+) start=(?P<start>[0-9a-fA-F]{16}) masked=(?P<masked>[0-9a-fA-F]{16}) "
+    r"regions=(?P<regions>[0-9a-fA-F]{8}) irq=(?P<irq>[0-9a-fA-F]{16}) "
+    r"irqregions=(?P<irqregions>[0-9a-fA-F]{8}) max=(?P<max>[0-9a-fA-F]{8}) "
+    r"maxsite=(?P<maxsite>[0-9a-fA-F]{8}) dropped=(?P<dropped>[0-9a-fA-F]{8}) "
+    r"droppedticks=(?P<droppedticks>[0-9a-fA-F]{16}) crc=(?P<crc>[0-9a-fA-F]{8})\s*$"
+)
+MASKSITE_RE = re.compile(
+    r"MASKSITE cpu=(?P<cpu>\d+) site=(?P<site>[0-9a-fA-F]{8}) count=(?P<count>[0-9a-fA-F]{8}) "
+    r"ticks=(?P<ticks>[0-9a-fA-F]{16}) max=(?P<max>[0-9a-fA-F]{8}) crc=(?P<crc>[0-9a-fA-F]{8})\s*$"
+)
+IRQ_SITE = 0xffff0000  # app/profiler + arch/arm irqmask.c: IRQ regions are IRQ_SITE | vector
 
 SPSR_T_BIT = 1 << 5  # Thumb state -- same bit app/profiler.c reads
 
 
+def _fnv(values) -> int:
+    """FNV-1a-style fold of 32-bit words, as profiler.c's profiler_fnv()."""
+    c = 0x811c9dc5
+    for v in values:
+        c = ((c ^ (v & 0xffffffff)) * 16777619) & 0xffffffff
+    return c
+
+
+def sample_extra(m: re.Match) -> tuple[int, int, int, int] | None:
+    """The K6 fields of a SAMPLE match as checksum inputs, or None."""
+    if m["src"] is None:
+        return None
+    return (ord(m["src"]), int(m["lat"], 16), int(m["msite"], 16), int(m["mgap"], 16))
+
+
 def _sample_checksum(cpu: int, seq: int, pc: int, lr: int, fp: int, sp: int,
-                      spsr: int, tid: int, ts: int, stack: bytes) -> int:
+                      spsr: int, tid: int, ts: int, stack: bytes,
+                      extra: tuple[int, int, int, int] | None = None) -> int:
     """Exact mirror of profiler.c's profiler_sample_checksum() -- FNV-1a-style,
     folding each binary field into a running multiply-xor state. See that
     function's own comment for the algorithm and why it's over binary
@@ -67,6 +113,8 @@ def _sample_checksum(cpu: int, seq: int, pc: int, lr: int, fp: int, sp: int,
     mix(ts & 0xffffffff); mix((ts >> 32) & 0xffffffff)
     for b in stack:
         mix(b)
+    for v in extra or ():
+        mix(v)
     return c
 
 
@@ -111,21 +159,163 @@ def parse_samples(log_path: str) -> list[dict]:
             cpu, pc, lr = int(m["cpu"]), int(m["pc"], 16), int(m["lr"], 16)
             fp, sp = int(m["fp"], 16), int(m["sp"], 16)
             spsr, tid, ts = int(m["spsr"], 16), int(m["tid"], 16), int(m["ts"], 16)
-            expected_crc = _sample_checksum(cpu, seq, pc, lr, fp, sp, spsr, tid, ts, stack)
+            extra = sample_extra(m)
+            expected_crc = _sample_checksum(cpu, seq, pc, lr, fp, sp, spsr, tid, ts, stack,
+                                             extra)
             if int(m["crc"], 16) != expected_crc:
                 crc_mismatches += 1
                 continue
 
-            samples.append({
+            sample = {
                 "cpu": cpu, "pc": pc, "lr": lr, "fp": fp, "sp": sp,
                 "spsr": spsr, "tid": tid, "ts": ts, "stack": stack,
-            })
+                "src": None, "lat": None, "msite": None, "mgap": None,
+            }
+            if extra:
+                sample.update(src=m["src"], lat=extra[1], msite=extra[2], mgap=extra[3])
+            samples.append(sample)
 
     if crc_mismatches or seq_gaps:
         print(f"warning: {crc_mismatches} sample(s) failed their checksum, "
               f"{seq_gaps} sample(s) missing entirely (seq gap) -- both "
               f"dropped, not trusted", file=sys.stderr)
     return samples
+
+
+def parse_mask(log_path: str) -> dict | None:
+    """Parses K6 MASKINFO/MASKCPU/MASKSITE lines (checksum-verified, the
+    same drop-and-count policy as samples). Returns None when the log has
+    no masked-time accounting at all (older images)."""
+    info, cpus, sites, rejected = None, {}, {}, 0
+    with open(log_path, "r", errors="replace") as f:
+        for line in f:
+            if "MASK" not in line:
+                continue
+            line = line.strip()
+            if m := MASKINFO_RE.search(line):
+                freq, on, now = int(m["freq"], 16), int(m["on"]), int(m["now"], 16)
+                if _fnv([freq, on, now, now >> 32]) != int(m["crc"], 16):
+                    rejected += 1
+                    continue
+                info = {"cntfrq": freq, "on": bool(on), "now": now}
+            elif m := MASKCPU_RE.search(line):
+                v = {k: int(m[k], 16) for k in ("start", "masked", "regions", "irq",
+                                                 "irqregions", "max", "maxsite", "dropped",
+                                                 "droppedticks")}
+                cpu = int(m["cpu"])
+                words = [cpu, v["start"], v["start"] >> 32, v["masked"], v["masked"] >> 32,
+                         v["regions"], v["irq"], v["irq"] >> 32, v["irqregions"], v["max"],
+                         v["maxsite"], v["dropped"], v["droppedticks"], v["droppedticks"] >> 32]
+                if _fnv(words) != int(m["crc"], 16):
+                    rejected += 1
+                    continue
+                cpus[cpu] = v
+            elif m := MASKSITE_RE.search(line):
+                cpu = int(m["cpu"])
+                site, count = int(m["site"], 16), int(m["count"], 16)
+                ticks, mx = int(m["ticks"], 16), int(m["max"], 16)
+                if _fnv([cpu, site, count, ticks, ticks >> 32, mx]) != int(m["crc"], 16):
+                    rejected += 1
+                    continue
+                sites.setdefault(cpu, []).append({"site": site, "count": count,
+                                                   "ticks": ticks, "max": mx})
+            elif line.startswith("MASK"):
+                rejected += 1
+    if info is None and not cpus:
+        return None
+    if rejected:
+        print(f"warning: {rejected} masked-time line(s) failed their checksum or format "
+              f"-- dropped, so masked totals may be incomplete", file=sys.stderr)
+    return {"info": info, "cpus": cpus, "sites": sites, "rejected": rejected}
+
+
+def classify_delays(samples: list[dict], cntfrq: int | None,
+                    thresholds: dict[str, int] | None = None,
+                    gap_limit: int | None = None) -> dict:
+    """Marks samples whose interrupt was taken late enough to have been
+    held back by IRQ masking, and attributes each one to the masked
+    region that closed just before it (`msite`, ended `mgap` ticks earlier).
+
+    `lat` is in CNTPCT ticks for timer samples ('t') and in PMU events for
+    PMU samples ('p'). Undelayed samples carry only the interrupt-entry
+    latency, so by default a sample counts as delayed when `lat` exceeds
+    four times the 5th-percentile latency for its source (a floor of 1 us
+    of ticks, or 1000 events). A low percentile, not the median: when
+    masking dominates, most samples are delayed and the median is itself
+    a delay. A delayed sample is attributed when the last masked region
+    ended within `gap_limit` ticks (default 2 us) of the sample.
+    """
+    thresholds = dict(thresholds or {})
+    freq = cntfrq or 54000000
+    floor = {"t": max(1, freq // 1000000), "p": 1000}
+    for src in ("t", "p"):
+        lats = sorted(s["lat"] for s in samples if s["src"] == src)
+        if lats and src not in thresholds:
+            thresholds[src] = max(4 * lats[len(lats) // 20], floor[src])
+    gap = gap_limit if gap_limit is not None else max(1, 2 * freq // 1000000)
+    for s in samples:
+        s["delayed"] = s["src"] in thresholds and s["lat"] > thresholds[s["src"]]
+        s["mask_site"] = (s["msite"] if s["delayed"] and s["msite"] and s["mgap"] <= gap
+                          else None)
+    return {"thresholds": thresholds, "gap_limit": gap}
+
+
+def site_name(elf_path: str, site: int) -> str:
+    """A masking site as a readable name: the function that masked IRQs,
+    or the IRQ handler (by GIC interrupt ID) for exception-entry regions."""
+    if site >= IRQ_SITE:
+        return f"[irq handler, GIC ID {site & 0xffff}]"
+    return symbolize(elf_path, [site])[0]
+
+
+def print_mask_report(elf_path: str, samples: list[dict], mask: dict | None,
+                      delay: dict | None) -> None:
+    if mask and mask["info"]:
+        info = mask["info"]
+        freq = info["cntfrq"] or 1
+        us = lambda ticks: 1e6 * ticks / freq
+        print("\nIRQ-masked time (invisible to IRQ sampling), accounting "
+              f"{'on' if info['on'] else 'off'} at dump time:")
+        total_window = total_masked = 0
+        for cpu in sorted(mask["cpus"]):
+            v = mask["cpus"][cpu]
+            window = info["now"] - v["start"] if v["start"] and info["now"] > v["start"] else 0
+            total_window += window
+            total_masked += v["masked"]
+            pct = 100 * v["masked"] / window if window else 0.0
+            ipct = 100 * v["irq"] / window if window else 0.0
+            extra = (f", {v['dropped']} region(s) at unrecorded sites"
+                     if v["dropped"] else "")
+            print(f"  cpu{cpu}: {pct:5.2f}% masked ({ipct:.2f}% in IRQ handlers), "
+                  f"{v['regions']} regions, longest {us(v['max']):.1f} us at "
+                  f"{site_name(elf_path, v['maxsite'])}{extra}")
+        merged: dict[int, dict] = {}
+        for cpu_sites in mask["sites"].values():
+            for e in cpu_sites:
+                m = merged.setdefault(e["site"], {"count": 0, "ticks": 0, "max": 0})
+                m["count"] += e["count"]
+                m["ticks"] += e["ticks"]
+                m["max"] = max(m["max"], e["max"])
+        if merged and total_window:
+            print(f"\n  {'% of time':>9}  {'regions':>8}  {'longest':>10}  masking site")
+            for site, m in sorted(merged.items(), key=lambda kv: -kv[1]["ticks"])[:15]:
+                print(f"  {100 * m['ticks'] / total_window:8.3f}%  {m['count']:>8}  "
+                      f"{us(m['max']):8.1f}us  {site_name(elf_path, site)}")
+    if delay:
+        print("\nSamples delayed by IRQ masking (taken late, so the PC is the unmask point):")
+        for src, label in (("t", "timer, CNTPCT ticks"), ("p", "PMU, events")):
+            group = [s for s in samples if s["src"] == src]
+            if not group:
+                continue
+            late = [s for s in group if s["delayed"]]
+            named = [s for s in late if s["mask_site"]]
+            print(f"  {label}: {len(late)}/{len(group)} delayed "
+                  f"(threshold {delay['thresholds'][src]}), {len(named)} attributed "
+                  f"to the region that held them")
+        by_site = Counter(site_name(elf_path, s["mask_site"])
+                          for s in samples if s.get("mask_site"))
+        for name, count in by_site.most_common(10):
+            print(f"  {count:>8}  {name}")
 
 
 def make_read_memory(stack_bytes: bytes, sp: int) -> Callable[[int, int], int]:
@@ -204,6 +394,9 @@ def main() -> None:
     ap.add_argument("--annotate", type=int, metavar="N",
                     help="disassemble the N hottest functions with per-instruction "
                          "sample counts (needs arm-none-eabi-objdump on PATH)")
+    ap.add_argument("--no-mask-frames", action="store_true",
+                    help="do not add [irq-masked: ...] leaf frames to delayed samples "
+                         "in --folded output")
     args = ap.parse_args()
 
     samples = parse_samples(args.log)
@@ -258,6 +451,13 @@ def main() -> None:
         suffix = f"  ({line})" if line else ""
         print(f"{count:>8}  {100 * count / total:5.1f}%  {name}{suffix}")
 
+    mask = parse_mask(args.log)
+    delay = None
+    if any(s["src"] for s in samples):
+        delay = classify_delays(samples, mask["info"]["cntfrq"]
+                                if mask and mask["info"] else None)
+    print_mask_report(args.elf, samples, mask, delay)
+
     if args.annotate:
         func_pcs: dict[tuple, Counter] = {}
         for pc in leaf_pcs:
@@ -274,10 +474,14 @@ def main() -> None:
 
     if args.folded:
         folded_counts: Counter[str] = Counter()
-        for chain in chains:
+        for s, chain in zip(samples, chains):
             names = symbolize(args.elf, chain)
             # root-to-leaf for FlameGraph, chain itself is leaf-to-root
-            folded_counts[";".join(reversed(names))] += 1
+            stack = list(reversed(names))
+            if delay and not args.no_mask_frames and s.get("delayed"):
+                stack.append(f"[irq-masked: {site_name(args.elf, s['mask_site'])}]"
+                             if s["mask_site"] else "[irq-delayed]")
+            folded_counts[";".join(stack)] += 1
         # flamegraph.pl rejects every line ending in "\r\n"; text mode on Windows writes that
         with open(args.folded, "w", newline="\n") as f:
             for stack, count in folded_counts.items():

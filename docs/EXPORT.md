@@ -21,7 +21,9 @@ Hotspot's native `perf.data` input remain separate interfaces.
 2. **Execution while IRQs are masked is invisible to sampling.** Both timer
    and PMU modes use ordinary IRQ delivery on the Non-secure SVC Pi and intended
    target. A sample delivered after unmasking cannot reconstruct the masked
-   execution. The exporter cannot correct or quantify this bias.
+   execution. The exporter cannot correct it; it accepts dumps carrying the
+   K6 `src/lat/msite/mgap` fields, and `pi4_pc_histogram.py` reports the
+   masked time and the delayed samples (ARCHITECTURE.md §11.1).
 3. **Scheduling, wakeups, blocking, and CPU-frequency history are not
    captured.** There are no context-switch/wakeup events, blocking
    reasons/durations, or frequency-change records. Sample gaps cannot tell

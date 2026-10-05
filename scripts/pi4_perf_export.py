@@ -24,7 +24,7 @@ import uuid
 from elftools.common.exceptions import ELFError
 
 from dwarf_unwind import DwarfCFIUnwinder, find_function, strip_isa_bit
-from pi4_pc_histogram import SAMPLE_RE, _sample_checksum, unwind_sample
+from pi4_pc_histogram import SAMPLE_RE, _sample_checksum, sample_extra, unwind_sample
 
 
 KNOWN_LIMITATIONS = [
@@ -86,7 +86,9 @@ def read_capture(log: Path) -> tuple[list[dict], dict]:
                     or len(match["cpu"]) > 10
                     or any(len(match[field]) != 8 for field in
                            ("seq", "pc", "lr", "fp", "sp", "spsr", "tid", "crc"))
-                    or len(match["ts"]) != 16 or len(match["stack"]) != 256):
+                    or len(match["ts"]) != 16 or len(match["stack"]) != 256
+                    or (match["src"] is not None
+                        and any(len(match[field]) != 8 for field in ("lat", "msite", "mgap")))):
                 quality["malformed_records"] += 1
                 continue
             sample = {field: int(match[field], 16) for field in
@@ -99,7 +101,7 @@ def read_capture(log: Path) -> tuple[list[dict], dict]:
             checksum = _sample_checksum(
                 sample["cpu"], sample["seq"], sample["pc"], sample["lr"],
                 sample["fp"], sample["sp"], sample["spsr"], sample["tid"],
-                sample["ts"], sample["stack"])
+                sample["ts"], sample["stack"], sample_extra(match))
             if checksum != int(match["crc"], 16):
                 quality["checksum_rejections"] += 1
                 continue
