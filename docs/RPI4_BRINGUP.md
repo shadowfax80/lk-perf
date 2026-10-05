@@ -3,6 +3,15 @@
 > Work queue, ownership and status updates: [HANDOFF.md](HANDOFF.md). This
 > file is the hardware evidence record.
 
+**Scheduling capture, K8 (2026-10-05, Claude):** context switches, wakeups
+(with reason, wait queue and waker), thread names and the ARM clock are
+recorded per core (overlay 0015, `profiler sched on`), reported by
+`scripts/pi4_sched_report.py` and exported as a Perfetto systrace. The
+`schedtest` ground truth matches the design and independent CNTPCT timing,
+and Perfetto's own importer agrees with the report. Idle on the Pi is
+`wfi` only, at a constant 600 MHz. Details:
+[results/k8_sched_20261005](results/k8_sched_20261005/README.md).
+
 **Small fixes, K9 (2026-10-05, Claude):** see the "Lower priority" list
 below. Two measurements came out of it. Writing each dump record in one
 `printf` instead of 130 does not change the link loss (0.17% vs 0.18%), so

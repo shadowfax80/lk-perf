@@ -1,6 +1,6 @@
 # lk-perf architecture and design
 
-**Implementation baseline:** lk-perf commit `84c25a9` (2026-10-05), LK `88a8efae` plus overlays 0001–0014. Hardware observations are attributed to [RPI4_BRINGUP.md](RPI4_BRINGUP.md) and the `docs/results/` records.
+**Implementation baseline:** lk-perf commit `84c25a9` (2026-10-05), LK `88a8efae` plus overlays 0001–0015 (they also apply to upstream `fe5e5a00`). Hardware observations are attributed to [RPI4_BRINGUP.md](RPI4_BRINGUP.md) and the `docs/results/` records.
 
 | Revision | Change described in this document |
 |---|---|
@@ -8,6 +8,7 @@
 | exporter | Timestamped perf-script export ([EXPORT.md](EXPORT.md), [verification](results/PERF_EXPORT_VERIFICATION.md)) |
 | `0f7f5e3` (K6) | IRQ-masked time accounting, delayed-sample attribution, delay-compensated PMU reload, console printing without IRQ masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
 | `84c25a9` (K12) | Opt-in pseudo-NMI sampling by GIC priority masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
+| K8 | Scheduler events: context switches, wakeups (with reason and wait queue), thread names, ARM clock and throttling; report and Perfetto systrace export ([§4.8](#48-scheduler-events)) |
 | K9 | Small fixes: one write per dump record, `pmu` message, function-start line lookup, design-doc and README corrections ([§8.4](#84-symbol-and-source-mapping)) |
 | K7 | `profiler stat` counts any console command on every core: up to six events plus cycles, 64-bit, derived IPC and ratios ([§6.3](#63-profiler-stat)); K4 (no printing inside the window) and K5 (`setup.sh` re-runnable) before it |
 | K10 | Timer mode on the profiler's own per-core virtual timer: fixed grid, one sample at a random point of each period, lost periods counted; dump format 3 ([§4.2](#42-timer-mode)) |
@@ -128,6 +129,7 @@ flowchart LR
 | LK exception-entry overlay | Preserve interrupted r7/r11 before C code changes them | Depends on LK's AArch32 exception ABI and CPU-index formula |
 | GIC dispatch overlay | Call `profiler_on_tick(frame, vector)` while the iframe is available | Called before normal registered-vector dispatch |
 | IRQ-masking overlays (0012, 0014) | Account masked regions in `arch_disable_ints`/`arch_enable_ints`, the GIC entry and the IRQ exit; optionally mask by GIC priority (pseudo-NMI) | Changes LK's core masking primitives; pseudo-NMI is off unless `profiler nmion` |
+| Scheduler overlay (0015) | Call `lkperf_sched_switch`/`lkperf_sched_wakeup` (weak no-ops) at every context switch and every return to ready | Called with `thread_lock` held and interrupts disabled |
 | Console overlay (0013) | Serialise thread-context printing on a mutex instead of an IRQ-masking spinlock | IRQ-context and already-masked prints keep the spinlock |
 | `app/profiler` | Select sampling vectors, capture state, retain samples, expose shell commands, control PMU | No DWARF interpretation or symbolization on target |
 | BCM2711 platform overlay | Boot transition configuration, mappings, GIC, SMP, timer, RAM discovery, UART speed, watchdog reset | Board-specific implementation, not a generic A55 port |
@@ -322,6 +324,21 @@ On the Pi's A72:
 
 `EDPCSR` reads `0xffffffff` (sampling prohibited) on every core, because the SoC holds the non-invasive debug authentication signal low (`DBGAUTHSTATUS` = `0xaa`: disabled in both security states). Software at Non-secure PL1 cannot change that. The route needs a platform that enables Non-secure non-invasive debug. On the Pi that is possibly the firmware's `enable_jtag_gpio=1` (untested; an SD-card change). On the real target, `profiler dbginfo` answers the same question.
 
+### 4.8 Scheduler events
+
+Samples say where the CPU was; they cannot say why a thread was not running. K8 records that ([results](results/k8_sched_20261005/README.md)). Overlay 0015 calls `lkperf_sched_switch(old, new)` right before every context switch, and `lkperf_sched_wakeup(t, from, wq, err)` at the six places a thread becomes ready again (resume, unblock, sleep timer, wait-queue wake one/all, wait-queue timeout or kill). Both run with `thread_lock` held and interrupts disabled. The profiler appends to lock-free per-core rings of 8192 events, CNTPCT-stamped:
+
+| Event | Content |
+|---|---|
+| SWITCH | Old and new thread, the state the old one leaves in (preempted/yielded, blocked, sleeping, suspended, exited), the wait queue it blocks on |
+| WAKE | Woken thread, the thread running when it was woken, the state it leaves, the wait queue, the wait result (a timeout shows as one) |
+| NAME | Thread, priority, flags, name, the first time a thread is seen. `thread_t` addresses are reused after an exit, so names travel in the stream and the host starts a new identity after each exit |
+| FREQ | Measured and set ARM clock and the firmware's throttling flags, from the VideoCore mailbox, sampled by a low-priority thread |
+
+`profiler sched on [freq_ms]` clears the rings and starts recording; `schedump` stops it and prints a checksummed dump (run id, image hash, per-core counts, the thread table before and after the events). `scripts/pi4_sched_report.py` merges the cores by timestamp and reports, per thread, CPU time, wakeup-to-running latency and why it left the CPU; time off the CPU by thread and reason, with wait queues symbolized; per-core busy time; and the clock history. `--systrace` writes `sched_switch`, `sched_waking` and `cpu_frequency` lines, which Perfetto shows as a scheduling timeline with wakeup arrows (its systrace importer ignores `sched_wakeup`). A recorded event costs about 170 instructions; with recording off a hook is a call and a load.
+
+On the Pi, idle is `wfi` only: no deeper idle state, core power-down, suspend or frequency scaling (600 MHz throughout). Wakeup to running takes about 2 µs. Interrupt handlers are not threads, so a wakeup from an interrupt names whatever thread was running as the waker.
+
 ## 5. Buffer layout, ownership, and lifecycle
 
 ### 5.1 Structure of arrays
@@ -438,6 +455,8 @@ The command runner recognizes the prompt by its received suffix. It is not a fra
 This **CRC-32** checks the image transfer. It is a different algorithm from the sample field named `crc`.
 
 ### 7.3 Sample text format
+
+Every dump (`dump`, `schedump`) starts with 32 `PAD ....` lines, which the host ignores: the USB-serial link loses data mostly in the first few KB after the line has been idle, and the padding takes that hit instead of the dump (record loss 0.09% with it, 0.15–0.18% without; K8).
 
 The current target emits one line per retained sample:
 
@@ -625,6 +644,10 @@ Timer samples are one per period at a uniformly random point of it, taken at the
 | `profiler maskon` / `maskoff` | None | Start a fresh IRQ-masked time accounting window on every core / stop it, keeping totals. `start` and `pmustart` turn it on if it is off; `clear` restarts the window |
 | `profiler mask` | None | Per-core masked share, IRQ-handler share, region count, longest region and its site, and the top five masking sites |
 | `profiler nmion` / `nmioff` | None | Switch every core to masking by GIC priority (pseudo-NMI, PMU samples reach masked code) / back to CPSR.I. `nmion` programs priorities and refuses to enable if they do not read back; `status` shows the mode per core |
+| `profiler sched on [freq_ms]` / `off` / `sched` | 100 ms; 0 = no clock thread | Record context switches, wakeups and thread names on every core (rings cleared on `on`), with the ARM clock sampled every `freq_ms`; `sched` shows per-core counts |
+| `profiler schedump` | None | Stop recording and print the checksummed scheduler dump (§4.8) |
+| `profiler schedtest [iters]` | 200 | Ground truth: a waker/waiter pair on an event and two lockers on a mutex, with every sleep timed by CNTPCT |
+| `profiler freq` | None | Measured and set ARM clock and throttling flags from the VideoCore mailbox |
 | `profiler dbginfo` / `dbgrom` / `dbgpcsr` | None | K11 probes: PC-sampling support and debug authentication from CP14; walk of the CoreSight ROM table; per-core `EDPCSR` reads after clearing the OS lock (§4.7) |
 | `profiler buildid` | None | Print the running image's read-only range and its FNV-1a hash (the dump's `build` value) and how long hashing took |
 | `profiler memtest [iters]` | 200000 | Ground-truth workload for code without CFI: `profiler_copy_a` calls `memcpy`, `profiler_fill_b` calls `memset`, each `iters` times on 4 KiB |
@@ -717,7 +740,8 @@ Hardware results: [results/k6_irqmask_20261005](results/k6_irqmask_20261005/READ
 | Missing assembly CFI | Validated LR fallback at the sampled PC: caller recovered when LR follows a call outside the leaf (K3) | The stack ends at that caller; a leaf reached by a tail branch is credited to the caller's caller; a leaf that reused LR as scratch keeps leaf-only |
 | Bad symbol attribution | ELF checked against the dump's image hash (K2) | Nearest-start mapping lacks function-extent validation; return-address boundaries remain |
 | A55 transfer | Mechanism demonstrated on A72 | Target routing, ABI, event support, performance, and footprint unvalidated |
-| Scheduling/wakeups/blocking/frequency | Timestamped stack samples and CPU/thread identity only | No context-switch/wakeup events, blocking reasons/durations, or CPU-frequency history; additional target event instrumentation/export is required |
+| Scheduling/wakeups/blocking/frequency | Since K8: switch, wakeup, name and clock events, reported per thread and exported for Perfetto | Interrupt handlers are not threads; transfer loss can break a switch chain (counted); the dump stops recording |
+| (before K8) Scheduling/wakeups/blocking/frequency | Timestamped stack samples and CPU/thread identity only | No context-switch/wakeup events, blocking reasons/durations, or CPU-frequency history; additional target event instrumentation/export is required |
 
 The stack-bound issue concerned **reading above SP** near a stack's high address, when a thread has little active stack. It was the normal case, not an edge case: every sample of the four-core workload had only 20 bytes above SP and read 108 bytes past its stack before K1. A 128-byte copy is still not a complete call-chain snapshot for deep stacks.
 
@@ -744,6 +768,7 @@ The following summarizes the repository's prior observations; it is not a claim 
 | UART integrity | 6-Mbaud console operation; sequence/checksum validation reported losses in real captures |
 | IRQ-masked time (K6) | Ground truth 50% masked: accounting 49.6%, PMU samples 48.2% on the masked side, all delayed samples attributed; console masking (up to 350 µs per line) removed |
 | Pseudo-NMI (K12) | Ground truth: 50.5% of PMU samples inside masked code, 0 delayed; stress with mode switching and a 6-minute soak (944,589 samples) clean |
+| Scheduling (K8) | `schedtest`: 200 event blocks, CPU times equal to the work done, sleeps equal to independent CNTPCT timing once wakeup latency is added; Perfetto's `trace_processor` CPU times equal the report's and its waker links match the event and mutex hand-offs; stress with pseudo-NMI and sampling clean; ~170 instructions per event |
 | Counting (K4, K7) | `stat 1000` 77,928 -> 2,009 cycles without printing in the window; built-in workload 4.000 instructions and 2.000 cycles per iteration; CPU_CYCLES = 64-bit cycle counter on every core; 12.0e9 instructions counted across 32-bit wraps; `smp` counted on all four cores; sampling unaffected |
 | Timer grid (K10) | `masktest` 50% masked, about 4000 samples per run: 49.0% (1 ms), 50.9% (10 ms, commensurate with the workload), 50.4% under pseudo-NMI with 0 of 15999 delayed; was 65% on LK's tick |
 | Cross-core PC sampling (K11) | A72 implements `EDPCSR` and its debug blocks are reachable at `0xff{c,d,e,f}10000`, but `EDPCSR` reads `ffffffff` everywhere: non-invasive debug disabled (`DBGAUTHSTATUS` `0xaa`) |
@@ -791,6 +816,7 @@ Avoid turning a raw LR guess, a checksum-valid dump, or a plausible FlameGraph i
 | [0012](../overlay/lk/0012-irqmask-accounting.patch) | IRQ-masked time accounting (`arch/arm/arm/irqmask.c`, masking hooks, GIC entry and IRQ exit) |
 | [0013](../overlay/lk/0013-console-print-without-irq-masking.patch) | Thread-context printing on a mutex instead of an IRQ-masking spinlock (supersedes 0005's masking) |
 | [0014](../overlay/lk/0014-gic-priority-pseudo-nmi.patch) | Opt-in pseudo-NMI: priority masking in the hooks, IRQ-path mask save/restore |
+| [0015](../overlay/lk/0015-sched-trace-hooks.patch) | Scheduler event hooks (K8) in `kernel/thread.c` |
 | [pi4_serial_boot.py](../scripts/pi4_serial_boot.py) | Loader transport, baud switch, reboot helper, terminal/logging |
 | [pi4_run.py](../scripts/pi4_run.py) | Prompt-driven ordered shell commands |
 | [pi4_pc_histogram.py](../scripts/pi4_pc_histogram.py) | Text parser/integrity checks, snapshot reader, reporting, folded output, annotation |
@@ -798,6 +824,7 @@ Avoid turning a raw LR guess, a checksum-valid dump, or a plausible FlameGraph i
 | [test_perf_export.py](../scripts/test_perf_export.py), [perf_export.S](../scripts/testdata/perf_export.S) | Offline capture/export regressions and optional real Perfetto consumer test |
 | [dwarf_unwind.py](../scripts/dwarf_unwind.py) | CFI evaluator and ELF function/source resolution |
 | [test_dwarf_unwind.py](../scripts/test_dwarf_unwind.py), [testdata](../scripts/testdata) | Offline compiler/assembly fixtures and unwind regressions, including `nocfi.S` for the K3 LR fallback |
+| [pi4_sched_report.py](../scripts/pi4_sched_report.py), [test_sched_report.py](../scripts/test_sched_report.py) | Scheduler dump report and systrace export (K8), with offline regressions |
 | [test_irqmask_report.py](../scripts/test_irqmask_report.py) | K6/K12 record, MASK-line and delay-attribution regressions |
 | [pi4_doctor.py](../scripts/pi4_doctor.py), [pi4_baud_calibrate.py](../scripts/pi4_baud_calibrate.py) | Serial readiness and calibration tooling |
 | [experiments/pi4-serialboot](../experiments/pi4-serialboot/README.md) | Persistent image loader |

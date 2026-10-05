@@ -90,7 +90,9 @@ At the LK shell, once booted, `profiler` with no arguments lists its
 subcommands; [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the full
 command reference. Captures come back over serial with `profiler dump` and
 are reported by `scripts/pi4_pc_histogram.py` or exported for Perfetto by
-`scripts/pi4_perf_export.py`.
+`scripts/pi4_perf_export.py`. Scheduler events (`profiler sched on`,
+`profiler schedump`) are reported, and exported as a Perfetto systrace, by
+`scripts/pi4_sched_report.py`.
 
 ## Layout
 

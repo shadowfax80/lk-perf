@@ -1,0 +1,88 @@
+--- a/kernel/include/kernel/thread.h
++++ b/kernel/include/kernel/thread.h
+@@ -201,6 +201,10 @@ extern struct list_node thread_list;
+ // scheduler lock
+ extern spin_lock_t thread_lock;
+ 
++/* lk-perf K8: scheduler event hooks (weak no-ops in kernel/thread.c) */
++void lkperf_sched_switch(thread_t *oldthread, thread_t *newthread);
++void lkperf_sched_wakeup(thread_t *t, enum thread_state from, void *wq, status_t err);
++
+ #define THREAD_LOCK(state) arch_interrupt_saved_state_t state = spin_lock_irqsave(&thread_lock)
+ #define THREAD_UNLOCK(state) spin_unlock_irqrestore(&thread_lock, state)
+ 
+--- a/kernel/thread.c
++++ b/kernel/thread.c
+@@ -49,6 +49,15 @@ struct thread_stats thread_stats[SMP_MAX_CPUS];
+ /* global thread list */
+ struct list_node thread_list;
+ 
++/* lk-perf K8: scheduler events for app/profiler. Weak no-ops unless the
++ * profiler is linked in. Both are called with thread_lock held and
++ * interrupts disabled, so they must only record, never block or print.
++ * `from` is the state the thread leaves; `wq` the wait queue it blocked or
++ * blocks on (NULL if none); `err` the wait result handed to the woken
++ * thread (ERR_TIMED_OUT for a timeout). */
++__WEAK void lkperf_sched_switch(thread_t *oldthread, thread_t *newthread) {}
++__WEAK void lkperf_sched_wakeup(thread_t *t, enum thread_state from, void *wq, status_t err) {}
++
+ /* master thread spinlock */
+ spin_lock_t thread_lock = SPIN_LOCK_INITIAL_VALUE;
+ 
+@@ -284,6 +293,7 @@ status_t thread_resume(thread_t *t) {
+     bool ints_disabled = arch_ints_disabled();
+     THREAD_LOCK(state);
+     if (t->state == THREAD_SUSPENDED) {
++        lkperf_sched_wakeup(t, THREAD_SUSPENDED, NULL, NO_ERROR);
+         t->state = THREAD_READY;
+         insert_in_run_queue_head(t);
+         if (!ints_disabled) /* HACK, don't resced into bootstrap thread before idle thread is set up */
+@@ -600,6 +610,8 @@ void thread_resched(void) {
+     }
+ #endif
+ 
++    lkperf_sched_switch(oldthread, newthread);
++
+     /* do the low level context switch */
+     arch_context_switch(oldthread, newthread);
+ }
+@@ -705,6 +717,7 @@ void thread_unblock(thread_t *t, bool resched) {
+     DEBUG_ASSERT(spin_lock_held(&thread_lock));
+     DEBUG_ASSERT(!thread_is_idle(t));
+ 
++    lkperf_sched_wakeup(t, THREAD_BLOCKED, t->blocking_wait_queue, NO_ERROR);
+     t->state = THREAD_READY;
+     insert_in_run_queue_head(t);
+     wakeup_cpu_for_thread(t);
+@@ -736,6 +749,7 @@ static enum handler_return thread_sleep_handler(timer_t *timer, lk_time_t now, v
+ 
+     THREAD_LOCK(state);
+ 
++    lkperf_sched_wakeup(t, THREAD_SLEEPING, NULL, NO_ERROR);
+     t->state = THREAD_READY;
+     insert_in_run_queue_head(t);
+ 
+@@ -1181,6 +1195,7 @@ int wait_queue_wake_one(wait_queue_t *wait, bool reschedule, status_t wait_queue
+     if (t) {
+         wait->count--;
+         DEBUG_ASSERT(t->state == THREAD_BLOCKED);
++        lkperf_sched_wakeup(t, THREAD_BLOCKED, wait, wait_queue_error);
+         t->state = THREAD_READY;
+         t->wait_queue_block_ret = wait_queue_error;
+         t->blocking_wait_queue = NULL;
+@@ -1245,6 +1260,7 @@ int wait_queue_wake_all(wait_queue_t *wait, bool reschedule, status_t wait_queue
+     while ((t = list_remove_tail_type(&wait->list, thread_t, queue_node))) {
+         wait->count--;
+         DEBUG_ASSERT(t->state == THREAD_BLOCKED);
++        lkperf_sched_wakeup(t, THREAD_BLOCKED, wait, wait_queue_error);
+         t->state = THREAD_READY;
+         t->wait_queue_block_ret = wait_queue_error;
+         t->blocking_wait_queue = NULL;
+@@ -1311,6 +1327,7 @@ status_t thread_unblock_from_wait_queue(thread_t *t, status_t wait_queue_error)
+ 
+     list_delete(&t->queue_node);
+     t->blocking_wait_queue->count--;
++    lkperf_sched_wakeup(t, THREAD_BLOCKED, t->blocking_wait_queue, wait_queue_error);
+     t->blocking_wait_queue = NULL;
+     t->state = THREAD_READY;
+     t->wait_queue_block_ret = wait_queue_error;

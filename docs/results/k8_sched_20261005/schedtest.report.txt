@@ -1,0 +1,39 @@
+warning: rejected lines: {'format': 3}
+warning: 2 switch(es) did not continue the previous one on their core (lost events)
+sched dump: run 000000002421ba92, 470.760 ms window, 4 cores; ELF matches the image (9ad39561)
+  cpu0: 582 events
+  cpu1: 705 events
+  cpu2: 726 events
+  cpu3: 788 events
+events: 2801 sent, 2747 accepted, 54 lost or rejected in transfer
+
+per thread (CPU time over the window; wakeup-to-running mean; why it left the CPU):
+  thread                cpu ms      %     in  wake us  left the CPU
+  idle_0               412.755  87.7%    169        -  preempted/yielded 169
+  idle_2               402.627  85.5%    210        -  preempted/yielded 210
+  idle_3               394.904  83.9%    231        -  preempted/yielded 231
+  idle_1               373.185  79.3%    181        -  preempted/yielded 182
+  st_waiter             99.066  21.0%    198      1.1  blocked 197, exited 1
+  st_lock1              60.663  12.9%    243      2.8  preempted/yielded 15, blocked 26, sleeping 199, exited 1
+  st_lock2              58.849  12.5%    234      1.9  preempted/yielded 27, blocked 14, sleeping 192, exited 1
+  st_waker              40.438   8.6%    393     46.9  preempted/yielded 197, sleeping 196, exited 1
+  profiler_freq         10.873   2.3%     17     63.3  preempted/yielded 7, sleeping 10
+  shell                  1.734   0.4%      7      2.9  preempted/yielded 2, blocked 5
+
+time off the CPU, by thread and reason (switch-out to wakeup):
+  thread             reason                                    count  total ms   mean us    max us
+  shell              blocked on st_waiter's thread_t+0x50          1   454.815  454814.9  454814.9
+  profiler_freq      sleeping                                      9   450.861   50095.6   50711.5
+  st_waker           sleeping                                    196   394.585    2013.2    2906.6
+  st_waiter          blocked on profiler_st_event+0xc            196   353.856    1805.4    4823.6
+  st_lock1           sleeping                                    199   199.905    1004.5    1908.4
+  st_lock2           sleeping                                    191   192.802    1009.4    1899.7
+  shell              blocked on uart_rx_buf+0x1c                   4    14.191    3547.8   13362.0
+  st_lock1           blocked on profiler_st_mutex+0xc             26     2.117      81.4     297.2
+  st_lock2           blocked on profiler_st_mutex+0xc             14     1.035      73.9     295.4
+
+wakeup -> running: 843 wakeups, p50 1.9 us, p90 2.2 us, p99 306.8 us, max 307.6 us
+busy (not idle) per core: cpu0 12.3%, cpu1 14.8%, cpu2 14.5%, cpu3 16.1%
+ARM clock: 11 samples, measured 600.117-600.170 MHz, set 600 MHz; throttling now: none; since boot: none
+
+systrace: 2737 events -> g.systrace (open in ui.perfetto.dev)

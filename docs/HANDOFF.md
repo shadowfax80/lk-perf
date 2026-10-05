@@ -80,13 +80,13 @@ snapshot, not a live guarantee.
 
 | Holder | Since | Purpose |
 |---|---|---|
-| Claude | 2026-10-05 | K8 (scheduling/frequency capture), K9 (small fixes) |
+| — (free) | 2026-10-05 | Released by Claude after K8/K9; shared checkout at the K8 commit, untracked `scripts/flamegraph.pl` (Codex) left in place |
 
 ## Pi state (last release, copied from bolt-aarch32)
 
 | Released by | When | Board state |
 |---|---|---|
-| Claude | 2026-10-05 | lk-perf K7 image (lk.bin `5a9b62ed…`) at the shell, 6000000 baud, pseudo-NMI off, samplers stopped, COM5 closed. Recheck before use; `--reboot` at 6 Mbaud returns it to the loader |
+| Claude | 2026-10-05 | lk-perf K8 image (lk.bin `5c6af40e…`) at the shell, 6000000 baud, pseudo-NMI off, samplers and scheduler recording stopped, COM5 closed. Recheck before use; `--reboot` at 6 Mbaud returns it to the loader |
 
 ## Claims (consolidated TODO)
 
@@ -99,13 +99,13 @@ current source. *Owner* is empty until someone claims it.
 | Order | ID | Item | Priority | Owner | Status | Notes |
 |---|---|---|---|---|---|---|
 | 1 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Blocked | Feasibility done (Claude, K11): A72 implements `EDPCSR` and the CPU reaches every core's debug block, but the SoC disables non-invasive debug (`DBGAUTHSTATUS` 0xaa), so `EDPCSR` reads `ffffffff`. Untested lever: `enable_jtag_gpio=1` in `config.txt` (SD-card change, needs user approval). On the target: `profiler dbginfo`; [results](results/k11_edpcsr_feasibility_20261005/README.md) |
-| 2 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | Claude | In progress | Documented limitation; needs target event instrumentation |
-| 3 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
+| 2 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
 
 ### Done (recent)
 
 | ID | Item | Owner | Evidence |
 |---|---|---|---|
+| K8 | Scheduling capture: overlay 0015 hooks, per-core event rings (switch, wakeup, name, ARM clock/throttling), `profiler sched/schedump/schedtest/freq`, `pi4_sched_report.py` with systrace export for Perfetto | Claude | Pi `schedtest`: event blocks, CPU times and sleeps match the design and independent CNTPCT timing; Perfetto trace_processor CPU times equal the report, waker links match; stress with pseudo-NMI and sampling clean; ~170 instructions/event; `test_sched_report.py` 5; [results/k8_sched_20261005](results/k8_sched_20261005/README.md) |
 | K9 | Small fixes: `pmu` message; `resolve_lines()` ties (26 function starts in the LK image resolved to no line); DESIGN.md cache-line claim corrected; README/CLAUDE.md status; dangling memory link; one write per dump record | Claude | `test_dwarf_unwind.py` 7 PASS (new tie test fails without the fix); Pi: dump loss 0.17% one-write vs 0.18% fragmented over about 32,000 records each, so fragmentation is not the cause of link loss; the `mask` item was a wrong premise (it already prints whole lines) |
 | K7 | Full `profiler stat`: any console command, all cores, up to six events plus 64-bit cycles, 32-bit event wraps extended, derived IPC/miss/mispredict ratios; coexists with PMU sampling | Claude | Pi: 4.000 inst / 2.000 cycles per iteration on the built-in workload; CPU_CYCLES = cycle counter; 12.0e9 instructions across wraps; `smp` counted on 4 cores; sampling unaffected; bad input refused; [results/k7_stat_20261005](results/k7_stat_20261005/README.md) |
 | K4 | `profiler stat` counted its own `printf` output | Claude | Pi: `stat 1000` 77,928 -> 2,009 cycles (about 76,000 cycles were console printing); `stat 5000000` 10,053,414 -> 10,001,332 = 2.000 cycles/iteration |
@@ -126,6 +126,27 @@ Earlier milestones (M1–M5, DWARF unwinder, review Phases 1–2) are recorded i
 [RPI4_BRINGUP.md](RPI4_BRINGUP.md).
 
 ## Handoff log
+
+### 2026-10-05 — Claude: K9 and K8 done; lock and Pi released
+
+- K9 (6798386): one write per dump record, `pmu` message, `resolve_lines`
+  ties (26 function starts in the image had no line), DESIGN/README/
+  CLAUDE.md corrections. Correction to the K7 log entry below:
+  fragmented output is not the general cause of link loss (dump loss
+  0.17% vs 0.18% either way); `profiler mask` always printed whole lines.
+- Link loss clusters in the first records of a dump (after the line was
+  idle). K8 adds 32 padding lines before `dump`/`schedump`: 0.09% vs
+  0.15-0.18%, not zero. A 1 MB host receive buffer changed nothing.
+- K8: overlay 0015 (switch and six wakeup hooks in kernel/thread.c),
+  per-core event rings with NAME events (thread_t addresses are reused
+  after exit, so the host starts a new identity per exit), ARM clock and
+  throttling from the mailbox, `profiler sched on|off`, `schedump`,
+  `schedtest`, `freq`. Host `pi4_sched_report.py` (+ systrace export;
+  Perfetto needs `sched_waking`, it ignores `sched_wakeup`) and
+  `test_sched_report.py`. Pi evidence in results/k8_sched_20261005.
+- Answered the user: idle on the Pi is `wfi` only; no deep idle,
+  power-down, suspend or DVFS (600 MHz throughout).
+- Lock free, Pi released. Open: K11 (blocked), T4 (user).
 
 ### 2026-10-05 — Claude: K4, K5, K7 done; lock and Pi released
 

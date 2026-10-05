@@ -102,7 +102,9 @@
 #include <arch/arch_interrupts.h>
 #include <arch/arch_ops.h>
 #include <arch/arm.h>
+#include <kernel/event.h>
 #include <kernel/mp.h>
+#include <kernel/mutex.h>
 #include <kernel/thread.h>
 #include <lib/console.h>
 #include <lk/compiler.h>
@@ -1415,6 +1417,16 @@ static void profiler_dbgpcsr(void) {
 }
 #endif
 
+// The USB-serial link loses data mostly in the first few KB after the line
+// has been idle (records 0-11 of a dump were the most often lost). Padding
+// lines, which the host ignores, take that hit instead of the dump.
+static void profiler_link_warmup(void) {
+    static const char pad[] = "PAD ................................................................"
+                              "...............................................................\n";
+    for (int i = 0; i < 32; i++)
+        printf("%s", pad);
+}
+
 static uint32_t profiler_image_hash(void) {
     uint32_t h = 0x811c9dc5u;
     for (const uint8_t *p = _start; p < __rodata_end; p++)
@@ -1652,15 +1664,436 @@ static int profiler_stat(int argc, const console_cmd_args *argv) {
 }
 #endif
 
+// K8: scheduler events. LK's kernel/thread.c calls lkperf_sched_switch()
+// right before every context switch and lkperf_sched_wakeup() wherever a
+// thread becomes ready again (overlay 0015), both with thread_lock held and
+// interrupts disabled. Each core appends to its own ring (oldest entries
+// overwritten, counted); the host merges the rings by CNTPCT and derives
+// run, blocked and sleep intervals, wakeup latency, and a Perfetto
+// timeline. A low-priority thread adds the measured ARM clock and the
+// firmware's throttling flags from the VideoCore mailbox (on the Pi, LK
+// itself never changes the clock).
+#define PROFILER_SCHED_BUF 8192
+#define PROFILER_SCHED_SWITCH 1u
+#define PROFILER_SCHED_WAKE 2u
+#define PROFILER_SCHED_FREQ 3u
+#define PROFILER_SCHED_NAME 4u    // a: thread, b: priority, c: flags, name in the event
+#define PROFILER_SCHED_NAMES 256
+struct profiler_sched_ev {
+    uint64_t ts;      // CNTPCT
+    uint32_t a;       // switch: old thread; wake: woken thread; freq: measured ARM Hz
+    uint32_t b;       // switch: new thread; wake: current (waker) thread; freq: set ARM Hz
+    uint32_t c;       // switch: wait queue the old thread blocks on; wake: wait queue; freq: throttled flags
+    int32_t err;      // wake: wait result handed to the thread (ERR_TIMED_OUT = timeout)
+    uint32_t type_state;   // type | state << 8 (switch: state the old thread leaves in; wake: from)
+    char name[32];         // NAME events only
+};
+static struct profiler_sched_ev profiler_sched_buf[SMP_MAX_CPUS][PROFILER_SCHED_BUF];
+static volatile uint32_t profiler_sched_total[SMP_MAX_CPUS];
+static volatile uint32_t profiler_sched_on;
+static uint64_t profiler_sched_start, profiler_sched_stop;
+// Names of threads seen at a switch, so threads that exited before the dump
+// still have one. Written only under thread_lock (the hooks hold it).
+struct profiler_sched_name {
+    uint32_t tid;
+    int32_t prio;
+    uint32_t flags;
+    char name[32];
+};
+static struct profiler_sched_name profiler_sched_names[PROFILER_SCHED_NAMES];
+
+static void profiler_sched_put(uint32_t type, uint32_t state, uint32_t a, uint32_t b,
+                               uint32_t c, int32_t err) {
+    uint cpu = arch_curr_cpu_num();
+    uint32_t n = profiler_sched_total[cpu];
+    struct profiler_sched_ev *e = &profiler_sched_buf[cpu][n % PROFILER_SCHED_BUF];
+    e->ts = profiler_cntpct();
+    e->a = a;
+    e->b = b;
+    e->c = c;
+    e->err = err;
+    e->type_state = type | (state << 8);
+    profiler_sched_total[cpu] = n + 1;
+}
+
+// A thread_t address is reused once its thread exits, so names travel in
+// the event stream: a NAME event whenever a thread is seen with a name or
+// priority the cache does not hold for that address. The host starts a new
+// thread identity after each exit and takes its name from these events.
+static void profiler_sched_name_seen(const thread_t *t) {
+    struct profiler_sched_name *n =
+        &profiler_sched_names[((uint32_t)(uintptr_t)t >> 4) % PROFILER_SCHED_NAMES];
+    if (n->tid == (uint32_t)(uintptr_t)t && n->prio == t->priority &&
+        !strncmp(n->name, t->name, sizeof(n->name) - 1))
+        return;
+    n->tid = (uint32_t)(uintptr_t)t;
+    n->prio = t->priority;
+    n->flags = t->flags;
+    memcpy(n->name, t->name, sizeof(n->name));
+    n->name[sizeof(n->name) - 1] = 0;
+    uint cpu = arch_curr_cpu_num();
+    uint32_t i = profiler_sched_total[cpu];
+    profiler_sched_put(PROFILER_SCHED_NAME, 0, n->tid, (uint32_t)n->prio, n->flags, 0);
+    memcpy(profiler_sched_buf[cpu][i % PROFILER_SCHED_BUF].name, n->name, sizeof(n->name));
+}
+
+void lkperf_sched_switch(thread_t *oldthread, thread_t *newthread) {
+    if (!profiler_sched_on)
+        return;
+    // NAME events go before the switch, so the host knows both threads.
+    profiler_sched_name_seen(oldthread);
+    profiler_sched_name_seen(newthread);
+    uint32_t wq = oldthread->state == THREAD_BLOCKED
+                      ? (uint32_t)(uintptr_t)oldthread->blocking_wait_queue : 0;
+    profiler_sched_put(PROFILER_SCHED_SWITCH, oldthread->state, (uint32_t)(uintptr_t)oldthread,
+                       (uint32_t)(uintptr_t)newthread, wq, 0);
+}
+
+void lkperf_sched_wakeup(thread_t *t, enum thread_state from, void *wq, status_t err) {
+    if (!profiler_sched_on)
+        return;
+    profiler_sched_put(PROFILER_SCHED_WAKE, from, (uint32_t)(uintptr_t)t,
+                       (uint32_t)(uintptr_t)get_current_thread(), (uint32_t)(uintptr_t)wq, err);
+}
+
+#if BCM2711
+// VideoCore property mailbox, polled (same mechanism as overlay 0011's UART
+// clock request). One request at a time.
+static mutex_t profiler_mbox_lock = MUTEX_INITIAL_VALUE(profiler_mbox_lock);
+
+static uint32_t profiler_mbox_get(uint32_t tag, uint32_t id) {
+    static volatile uint32_t __ALIGNED(16) mbox[8];
+    mutex_acquire(&profiler_mbox_lock);
+    mbox[0] = sizeof(mbox);
+    mbox[1] = 0;
+    mbox[2] = tag;
+    mbox[3] = 8;
+    mbox[4] = 0;
+    mbox[5] = id;
+    mbox[6] = 0;
+    mbox[7] = 0;   // end tag
+    arch_clean_cache_range((addr_t)mbox, sizeof(mbox));
+    uint32_t bus = ((uint32_t)(uintptr_t)mbox & 0x3fffffff) + BCM_SDRAM_BUS_ADDR_BASE;
+    while (*REG32(ARM0_MAILBOX_STATUS) & (1u << 31)) {}
+    *REG32(ARM0_MAILBOX_WRITE) = (bus & ~0xfu) | 8u;
+    for (;;) {
+        while (*REG32(ARM0_MAILBOX_STATUS) & (1u << 30)) {}
+        if ((*REG32(ARM0_MAILBOX_READ) & 0xfu) == 8u)
+            break;
+    }
+    arch_invalidate_cache_range((addr_t)mbox, sizeof(mbox));
+    // GET_THROTTLED answers in the first value word, clock tags in the second.
+    uint32_t v = tag == 0x00030046 ? mbox[5] : mbox[6];
+    mutex_release(&profiler_mbox_lock);
+    return v;
+}
+
+#define PROFILER_MBOX_CLOCK_RATE 0x00030002u
+#define PROFILER_MBOX_CLOCK_MEASURED 0x00030047u
+#define PROFILER_MBOX_THROTTLED 0x00030046u
+#define PROFILER_MBOX_CLOCK_ARM 3u
+
+static void profiler_freq_read(uint32_t *measured, uint32_t *set, uint32_t *throttled) {
+    *measured = profiler_mbox_get(PROFILER_MBOX_CLOCK_MEASURED, PROFILER_MBOX_CLOCK_ARM);
+    *set = profiler_mbox_get(PROFILER_MBOX_CLOCK_RATE, PROFILER_MBOX_CLOCK_ARM);
+    *throttled = profiler_mbox_get(PROFILER_MBOX_THROTTLED, 0);
+}
+
+static void profiler_freq_record(void) {
+    uint32_t m, st, th;
+    profiler_freq_read(&m, &st, &th);
+    arch_interrupt_saved_state_t is = arch_interrupt_save();   // stay on this core's ring
+    profiler_sched_put(PROFILER_SCHED_FREQ, 0, m, st, th, 0);
+    arch_interrupt_restore(is);
+}
+
+static volatile uint32_t profiler_freq_ms;
+static volatile uint32_t profiler_freq_running;
+
+static int profiler_freq_thread(void *arg) {
+    (void)arg;
+    while (profiler_sched_on && profiler_freq_ms) {
+        profiler_freq_record();
+        thread_sleep(profiler_freq_ms);
+    }
+    profiler_freq_running = 0;
+    return 0;
+}
+#endif
+
+static void profiler_sched_enable(uint32_t freq_ms) {
+    if (!profiler_run_id)
+        profiler_session_start();
+    profiler_sched_on = 0;
+    for (int c = 0; c < SMP_MAX_CPUS; c++)
+        profiler_sched_total[c] = 0;
+    THREAD_LOCK(lock_state);   // the hooks write the name cache under thread_lock
+    memset(profiler_sched_names, 0, sizeof(profiler_sched_names));
+    THREAD_UNLOCK(lock_state);
+    profiler_sched_start = profiler_cntpct();
+    profiler_sched_stop = 0;
+    profiler_sched_on = 1;
+#if BCM2711
+    profiler_freq_ms = freq_ms;
+    if (freq_ms && !profiler_freq_running) {
+        profiler_freq_running = 1;
+        thread_t *t = thread_create("profiler_freq", profiler_freq_thread, NULL, LOW_PRIORITY,
+                                    DEFAULT_STACK_SIZE);
+        if (t)
+            thread_detach_and_resume(t);
+        else
+            profiler_freq_running = 0;
+    }
+#endif
+}
+
+static void profiler_sched_disable(void) {
+    if (profiler_sched_on) {
+#if BCM2711
+        profiler_freq_record();   // closing frequency sample
+#endif
+        profiler_sched_on = 0;
+        profiler_sched_stop = profiler_cntpct();
+    }
+}
+
+static void profiler_sched_status(void) {
+    printf("sched: recording %s, frequency thread %s (%u ms)\n", profiler_sched_on ? "on" : "off",
+#if BCM2711
+           profiler_freq_running ? "running" : "stopped", profiler_freq_ms);
+#else
+           "n/a", 0u);
+#endif
+    for (int c = 0; c < SMP_MAX_CPUS; c++) {
+        uint32_t n = profiler_sched_total[c];
+        printf("sched: cpu%d events=%u retained=%u overwritten=%u\n", c, n,
+               n < PROFILER_SCHED_BUF ? n : PROFILER_SCHED_BUF,
+               n > PROFILER_SCHED_BUF ? n - PROFILER_SCHED_BUF : 0);
+    }
+}
+
+// Thread names: live threads, then threads seen at a switch that have exited
+// since (the host keeps the first intact name it sees for a tid).
+static void profiler_sched_print_threads(void) {
+    static struct profiler_sched_name live[PROFILER_SCHED_NAMES];
+    uint32_t nlive = 0;
+    THREAD_LOCK(state);
+    thread_t *t;
+    list_for_every_entry(&thread_list, t, thread_t, thread_list_node) {
+        if (nlive == PROFILER_SCHED_NAMES)
+            break;
+        live[nlive].tid = (uint32_t)(uintptr_t)t;
+        live[nlive].prio = t->priority;
+        live[nlive].flags = t->flags;
+        memcpy(live[nlive].name, t->name, sizeof(live[nlive].name));
+        live[nlive].name[sizeof(live[nlive].name) - 1] = 0;
+        nlive++;
+    }
+    THREAD_UNLOCK(state);
+    for (uint32_t pass = 0; pass < 2; pass++) {
+        const struct profiler_sched_name *tab = pass ? profiler_sched_names : live;
+        uint32_t cnt = pass ? PROFILER_SCHED_NAMES : nlive;
+        for (uint32_t i = 0; i < cnt; i++) {
+            const struct profiler_sched_name *n = &tab[i];
+            if (!n->tid)
+                continue;
+            uint32_t h = profiler_fnv(profiler_fnv(profiler_fnv(0x811c9dc5u, n->tid),
+                                                   (uint32_t)n->prio), n->flags);
+            char name[32];
+            size_t len = 0;
+            for (; len < sizeof(name) - 1 && n->name[len]; len++) {
+                char ch = n->name[len];
+                name[len] = (ch > ' ' && ch < 127) ? ch : '_';
+                h = profiler_fnv(h, (uint8_t)name[len]);
+            }
+            name[len] = 0;
+            printf("THREAD tid=%08x prio=%08x flags=%08x name=%s crc=%08x\n", n->tid,
+                   (uint32_t)n->prio, n->flags, len ? name : "-", h);
+        }
+    }
+}
+
+// Checksummed text dump, like the sample dump. Recording stops first, so
+// nothing is overwritten while it prints.
+static void profiler_sched_dump(void) {
+    profiler_sched_disable();
+    profiler_link_warmup();
+    uint32_t freq = profiler_cntfrq();
+    uint32_t image_lo = (uint32_t)(uintptr_t)_start;
+    uint32_t image_hi = (uint32_t)(uintptr_t)__rodata_end;
+    uint32_t build = profiler_image_hash();
+    uint32_t w[] = { 1u, (uint32_t)profiler_run_id, (uint32_t)(profiler_run_id >> 32), freq,
+                     SMP_MAX_CPUS, PROFILER_SCHED_BUF, image_lo, image_hi, build,
+                     (uint32_t)profiler_sched_start, (uint32_t)(profiler_sched_start >> 32),
+                     (uint32_t)profiler_sched_stop, (uint32_t)(profiler_sched_stop >> 32) };
+    uint32_t k = 0x811c9dc5u;
+    for (unsigned i = 0; i < sizeof(w) / sizeof(w[0]); i++)
+        k = profiler_fnv(k, w[i]);
+    printf("SCHEDBEGIN fmt=00000001 run=%016llx cntfrq=%08x cpus=%08x buf=%08x "
+           "image=%08x-%08x build=%08x start=%016llx stop=%016llx crc=%08x\n",
+           (unsigned long long)profiler_run_id, freq, SMP_MAX_CPUS, PROFILER_SCHED_BUF, image_lo,
+           image_hi, build, (unsigned long long)profiler_sched_start,
+           (unsigned long long)profiler_sched_stop, k);
+    uint32_t sent = 0;
+    for (int c = 0; c < SMP_MAX_CPUS; c++) {
+        uint32_t n = profiler_sched_total[c];
+        uint32_t kept = n < PROFILER_SCHED_BUF ? n : PROFILER_SCHED_BUF;
+        k = profiler_fnv(profiler_fnv(profiler_fnv(0x811c9dc5u, (uint32_t)c), n), kept);
+        printf("SCHEDCPU cpu=%d total=%08x retained=%08x crc=%08x\n", c, n, kept, k);
+    }
+    profiler_sched_print_threads();
+    uint32_t seq = 0;
+    for (int c = 0; c < SMP_MAX_CPUS; c++) {
+        uint32_t n = profiler_sched_total[c];
+        uint32_t kept = n < PROFILER_SCHED_BUF ? n : PROFILER_SCHED_BUF;
+        for (uint32_t i = n - kept; i < n; i++) {
+            const struct profiler_sched_ev *e = &profiler_sched_buf[c][i % PROFILER_SCHED_BUF];
+            uint32_t ew[] = { seq, (uint32_t)c, (uint32_t)e->ts, (uint32_t)(e->ts >> 32),
+                              e->type_state, e->a, e->b, e->c, (uint32_t)e->err };
+            uint32_t h = 0x811c9dc5u;
+            for (unsigned j = 0; j < sizeof(ew) / sizeof(ew[0]); j++)
+                h = profiler_fnv(h, ew[j]);
+            char name[32] = "";
+            if ((e->type_state & 0xff) == PROFILER_SCHED_NAME) {
+                size_t len = 0;
+                for (; len < sizeof(name) - 1 && e->name[len]; len++) {
+                    char ch = e->name[len];
+                    name[len] = (ch > ' ' && ch < 127) ? ch : '_';
+                    h = profiler_fnv(h, (uint8_t)name[len]);
+                }
+                name[len] = 0;
+            }
+            printf("SCHED seq=%08x cpu=%d ts=%016llx ev=%08x a=%08x b=%08x c=%08x err=%08x "
+                   "%s%s%scrc=%08x\n", seq, c, (unsigned long long)e->ts, e->type_state, e->a,
+                   e->b, e->c, (uint32_t)e->err, name[0] ? "name=" : "", name,
+                   name[0] ? " " : "", h);
+            seq++;
+            sent++;
+        }
+    }
+    profiler_sched_print_threads();   // again: the host keeps the first intact copy
+    k = profiler_fnv(profiler_fnv(profiler_fnv(0x811c9dc5u, (uint32_t)profiler_run_id),
+                                  (uint32_t)(profiler_run_id >> 32)), sent);
+    printf("SCHEDEND run=%016llx events=%08x crc=%08x\n", (unsigned long long)profiler_run_id,
+           sent, k);
+}
+
+// K8 ground truth. A waker sleeps 2 ms, works 200 us and signals an event; a
+// waiter blocks on that event and works 500 us per wakeup. Two lockers take
+// turns on a mutex, holding it 300 us and sleeping 1 ms between turns. So,
+// per iteration: one waiter wakeup from `profiler_st_event`, one waker
+// wakeup from sleep, and some blocking on `profiler_st_mutex`.
+static event_t profiler_st_event;
+static mutex_t profiler_st_mutex;
+static volatile uint32_t profiler_st_iters;
+// Independent check of the trace: CNTPCT around every thread_sleep() call,
+// [0] for the waker's 2 ms sleeps, [1] for the lockers' 1 ms sleeps.
+static uint64_t profiler_st_slept[2];
+static uint32_t profiler_st_sleeps[2];
+static spin_lock_t profiler_st_lock = SPIN_LOCK_INITIAL_VALUE;
+
+static void profiler_st_sleep(uint32_t ms, int which) {
+    uint64_t t0 = profiler_cntpct();
+    thread_sleep(ms);
+    uint64_t d = profiler_cntpct() - t0;
+    arch_interrupt_saved_state_t st = spin_lock_irqsave(&profiler_st_lock);
+    profiler_st_slept[which] += d;
+    profiler_st_sleeps[which]++;
+    spin_unlock_irqrestore(&profiler_st_lock, st);
+}
+
+static void profiler_st_work(uint32_t us) {
+    profiler_spin_ticks(((uint64_t)us * profiler_cntfrq()) / 1000000u);
+}
+
+static int profiler_st_waker(void *arg) {
+    for (uint32_t i = 0; i < profiler_st_iters; i++) {
+        profiler_st_sleep(2, 0);
+        profiler_st_work(200);
+        event_signal(&profiler_st_event, true);
+    }
+    return 0;
+}
+
+static int profiler_st_waiter(void *arg) {
+    for (uint32_t i = 0; i < profiler_st_iters; i++) {
+        event_wait(&profiler_st_event);
+        profiler_st_work(500);
+    }
+    return 0;
+}
+
+static int profiler_st_locker(void *arg) {
+    for (uint32_t i = 0; i < profiler_st_iters; i++) {
+        mutex_acquire(&profiler_st_mutex);
+        profiler_st_work(300);
+        mutex_release(&profiler_st_mutex);
+        profiler_st_sleep(1, 1);
+    }
+    return 0;
+}
+
+static void profiler_schedtest(uint32_t iters) {
+    profiler_st_iters = iters;
+    memset(profiler_st_slept, 0, sizeof(profiler_st_slept));
+    memset(profiler_st_sleeps, 0, sizeof(profiler_st_sleeps));
+    event_init(&profiler_st_event, false, EVENT_FLAG_AUTOUNSIGNAL);
+    mutex_init(&profiler_st_mutex);
+    thread_t *t[4];
+    t[0] = thread_create("st_waiter", profiler_st_waiter, NULL, DEFAULT_PRIORITY, DEFAULT_STACK_SIZE);
+    t[1] = thread_create("st_waker", profiler_st_waker, NULL, DEFAULT_PRIORITY, DEFAULT_STACK_SIZE);
+    t[2] = thread_create("st_lock1", profiler_st_locker, NULL, DEFAULT_PRIORITY, DEFAULT_STACK_SIZE);
+    t[3] = thread_create("st_lock2", profiler_st_locker, NULL, DEFAULT_PRIORITY, DEFAULT_STACK_SIZE);
+    for (int i = 0; i < 4; i++)
+        thread_resume(t[i]);
+    for (int i = 0; i < 4; i++)
+        thread_join(t[i], NULL, INFINITE_TIME);
+    event_destroy(&profiler_st_event);
+    mutex_destroy(&profiler_st_mutex);
+    for (int i = 0; i < 2; i++) {
+        uint64_t mean_us = profiler_st_sleeps[i]
+            ? (profiler_st_slept[i] * 1000000u) / profiler_cntfrq() / profiler_st_sleeps[i] : 0;
+        printf("schedtest: thread_sleep(%d) x %u: mean %llu us (measured with CNTPCT)\n",
+               i ? 1 : 2, profiler_st_sleeps[i], (unsigned long long)mean_us);
+    }
+}
+
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
-        printf("usage: profiler <start [period_us]|stop|stat [-e ev,...] [cmd...]|status|clear|dump|bench|nest|smp|edgetest|pmustart|pmustop|pmu|maskon|maskoff|mask|masktest|memtest|nmion|nmioff|buildid|dbginfo|dbgrom|dbgpcsr>\n");
+        printf("usage: profiler <start [period_us]|stop|stat [-e ev,...] [cmd...]|status|clear|dump|bench|nest|smp|edgetest|pmustart|pmustop|pmu|maskon|maskoff|mask|masktest|memtest|nmion|nmioff|buildid|dbginfo|dbgrom|dbgpcsr|sched [on [freq_ms]|off]|schedump|schedtest|freq>\n");
         return -1;
     }
 
     const char *sub = argv[1].str;
 
-    if (!strcmp(sub, "dbginfo")) {
+    if (!strcmp(sub, "sched")) {
+        if (argc >= 3 && !strcmp(argv[2].str, "on")) {
+            uint32_t ms = argc >= 4 ? (uint32_t)argv[3].u : 100;
+            profiler_sched_enable(ms);
+            printf("sched: recording context switches and wakeups on all %d cores "
+                   "(%u events/core ring), ARM clock every %u ms\n", SMP_MAX_CPUS,
+                   PROFILER_SCHED_BUF, ms);
+        } else if (argc >= 3 && !strcmp(argv[2].str, "off")) {
+            profiler_sched_disable();
+            printf("sched: recording off\n");
+        } else {
+            profiler_sched_status();
+        }
+    } else if (!strcmp(sub, "schedump")) {
+        profiler_sched_dump();
+    } else if (!strcmp(sub, "schedtest")) {
+        uint32_t iters = argc >= 3 ? (uint32_t)argv[2].u : 200;
+        printf("schedtest: %u iterations: waiter/waker on an event, two lockers on a mutex ...\n",
+               iters);
+        profiler_schedtest(iters);
+        printf("schedtest: done\n");
+#if BCM2711
+    } else if (!strcmp(sub, "freq")) {
+        uint32_t m, st, th;
+        profiler_freq_read(&m, &st, &th);
+        printf("freq: ARM clock measured %u Hz, set %u Hz, throttled flags %08x\n", m, st, th);
+#endif
+    } else if (!strcmp(sub, "dbginfo")) {
         profiler_dbginfo();
 #if BCM2711
     } else if (!strcmp(sub, "dbgrom")) {
@@ -1834,6 +2267,7 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         // agree even if a sampler is still running (stop both first anyway).
         if (!profiler_run_id)
             profiler_session_start();
+        profiler_link_warmup();
         uint32_t dump_no = ++profiler_dump_no;
         uint32_t snap_total[SMP_MAX_CPUS], snap_head[SMP_MAX_CPUS];
         for (int c = 0; c < SMP_MAX_CPUS; c++) {
