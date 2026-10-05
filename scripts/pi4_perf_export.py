@@ -24,7 +24,9 @@ import uuid
 from elftools.common.exceptions import ELFError
 
 from dwarf_unwind import DwarfCFIUnwinder, find_function, strip_isa_bit
-from pi4_pc_histogram import SAMPLE_RE, _sample_checksum, sample_extra, unwind_sample
+from pi4_pc_histogram import (MODE_PMU, MODE_TIMER, SAMPLE_RE, _sample_checksum, check_build,
+                              parse_session, read_lines, sample_extra, select_dump,
+                              unwind_sample)
 
 
 KNOWN_LIMITATIONS = [
@@ -32,12 +34,14 @@ KNOWN_LIMITATIONS = [
     "registers/CFI, unsupported CFI rules, and optimized-away frames limit unwinding.",
     "Execution while IRQs are masked is invisible to both IRQ-driven sampling "
     "modes; a delayed sample cannot reconstruct that execution.",
-    "The target dump has no build/run/mode/event identity. ELF pairing and "
-    "single-mode capture are operator responsibilities; artifact hashes do not "
-    "prove that the ELF matches the running image.",
-    "The completion marker is required, but no target footer count proves "
-    "absence of trailing loss or ring overwrite; captures must be stopped "
-    "before dumping for a coherent snapshot.",
+    "Older-format dumps (no DUMPBEGIN header) carry no build/run/mode/event "
+    "identity: ELF pairing and single-mode capture are operator responsibilities. "
+    "Current dumps state them and the ELF is checked against the image hash; the "
+    "event label itself is still operator-supplied.",
+    "Older-format dumps have no footer, so trailing loss and ring overwrite are "
+    "not counted. Current dumps give exact per-core retained/overwritten counts "
+    "and a record count; captures must still be stopped before dumping for a "
+    "coherent snapshot.",
     "Thread-object pointers may be reused. Synthetic IDs identify pointer "
     "values within this export, not operating-system PIDs or thread lifetimes.",
     "Timestamps are target generic-timer microseconds, not a host/Linux clock. "
@@ -57,7 +61,7 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def read_capture(log: Path) -> tuple[list[dict], dict]:
+def read_capture(log: Path, dump: int = -1) -> tuple[list[dict], dict]:
     """Require exactly one completed dump; discard corrupt records with counts.
 
     Sequence is validated only after checksum verification: a damaged sequence
@@ -69,58 +73,69 @@ def read_capture(log: Path) -> tuple[list[dict], dict]:
                "sequence_gaps": 0, "dump_done_observed": False,
                "trailing_loss_count_known": False, "overwrite_count_known": False}
     expected_seq = 0
-    with log.open("r", encoding="utf-8", errors="replace") as stream:
-        for line_number, line in enumerate(stream, 1):
-            if line.strip() == "SAMPLE done":
-                if quality["dump_done_observed"]:
-                    raise ValueError("multiple dumps: use a fresh log containing one dump")
-                quality["dump_done_observed"] = True
-                continue
-            if "SAMPLE seq=" not in line:
-                continue
+    lines, where = select_dump(read_lines(log), dump)
+    session = parse_session(lines) if not where["legacy"] else None
+    for line_number, line in enumerate(lines, 1):
+        if line.strip() == "SAMPLE done":
             if quality["dump_done_observed"]:
-                raise ValueError(f"sample after completion marker at line {line_number}; "
-                                 "multiple dumps are not supported")
-            match = SAMPLE_RE.search(line)
-            if (match is None or line[match.end():].strip()
-                    or len(match["cpu"]) > 10
-                    or any(len(match[field]) != 8 for field in
-                           ("seq", "pc", "lr", "fp", "sp", "spsr", "tid", "crc"))
-                    or len(match["ts"]) != 16 or len(match["stack"]) != 256
-                    or (match["src"] is not None
-                        and any(len(match[field]) != 8 for field in ("lat", "msite", "mgap")))
-                    or (match["slen"] is not None
-                        and (match["src"] is None or len(match["slen"]) != 8
-                             or int(match["slen"], 16) > 128))):
-                quality["malformed_records"] += 1
-                continue
-            sample = {field: int(match[field], 16) for field in
-                      ("seq", "pc", "lr", "fp", "sp", "spsr", "tid", "ts")}
-            sample["cpu"] = int(match["cpu"])
-            sample["stack"] = bytes.fromhex(match["stack"])
-            sample["slen"] = int(match["slen"], 16) if match["slen"] is not None else None
-            if sample["cpu"] > 0xffffffff:
-                quality["malformed_records"] += 1
-                continue
-            checksum = _sample_checksum(
-                sample["cpu"], sample["seq"], sample["pc"], sample["lr"],
-                sample["fp"], sample["sp"], sample["spsr"], sample["tid"],
-                sample["ts"], sample["stack"], sample_extra(match))
-            if checksum != int(match["crc"], 16):
-                quality["checksum_rejections"] += 1
-                continue
-            if sample["ts"] > ((1 << 63) - 1) // 1000:
-                raise ValueError("timestamp exceeds signed 64-bit nanosecond importer range")
-            if sample["seq"] < expected_seq:
-                raise ValueError(f"sequence reset/duplicate at line {line_number}; "
-                                 "multiple or reordered dumps are not supported")
-            quality["sequence_gaps"] += sample["seq"] - expected_seq
-            expected_seq = sample["seq"] + 1
-            samples.append(sample)
+                raise ValueError("multiple dumps: use a fresh log containing one dump")
+            quality["dump_done_observed"] = True
+            continue
+        if "SAMPLE seq=" not in line:
+            continue
+        if quality["dump_done_observed"]:
+            raise ValueError(f"sample after completion marker at line {line_number}; "
+                             "multiple dumps are not supported")
+        match = SAMPLE_RE.search(line)
+        if (match is None or line[match.end():].strip()
+                or len(match["cpu"]) > 10
+                or any(len(match[field]) != 8 for field in
+                       ("seq", "pc", "lr", "fp", "sp", "spsr", "tid", "crc"))
+                or len(match["ts"]) != 16 or len(match["stack"]) != 256
+                or (match["src"] is not None
+                    and any(len(match[field]) != 8 for field in ("lat", "msite", "mgap")))
+                or (match["slen"] is not None
+                    and (match["src"] is None or len(match["slen"]) != 8
+                         or int(match["slen"], 16) > 128))):
+            quality["malformed_records"] += 1
+            continue
+        sample = {field: int(match[field], 16) for field in
+                  ("seq", "pc", "lr", "fp", "sp", "spsr", "tid", "ts")}
+        sample["cpu"] = int(match["cpu"])
+        sample["stack"] = bytes.fromhex(match["stack"])
+        sample["slen"] = int(match["slen"], 16) if match["slen"] is not None else None
+        if sample["cpu"] > 0xffffffff:
+            quality["malformed_records"] += 1
+            continue
+        checksum = _sample_checksum(
+            sample["cpu"], sample["seq"], sample["pc"], sample["lr"],
+            sample["fp"], sample["sp"], sample["spsr"], sample["tid"],
+            sample["ts"], sample["stack"], sample_extra(match))
+        if checksum != int(match["crc"], 16):
+            quality["checksum_rejections"] += 1
+            continue
+        if sample["ts"] > ((1 << 63) - 1) // 1000:
+            raise ValueError("timestamp exceeds signed 64-bit nanosecond importer range")
+        if sample["seq"] < expected_seq:
+            raise ValueError(f"sequence reset/duplicate at line {line_number}; "
+                             "multiple or reordered dumps are not supported")
+        quality["sequence_gaps"] += sample["seq"] - expected_seq
+        expected_seq = sample["seq"] + 1
+        samples.append(sample)
     if not quality["dump_done_observed"]:
         raise ValueError("incomplete dump: missing SAMPLE done marker")
     if not samples:
         raise ValueError("no checksum-valid samples in completed dump")
+    if session:
+        if session["problems"]:
+            raise ValueError("dump session: " + "; ".join(session["problems"]))
+        sent = session["footer"]["samples"]
+        quality.update(
+            dumps_in_log=where["dumps"], dump_index=where["index"],
+            expected_samples=sent, lost_or_rejected_samples=sent - len(samples),
+            trailing_loss_count_known=True, overwrite_count_known=True,
+            per_cpu_counts={str(c): v for c, v in sorted(session["cpus"].items())})
+        quality["session"] = session
     return samples, quality
 
 
@@ -183,7 +198,8 @@ def write_perf_script(stream: TextIO, elf: Path, samples: list[dict], *,
 
 def export_capture(log: Path, elf: Path, output: Path, *, mode: str = "unknown",
                    event: str | None = None, period: int | None = None,
-                   image: Path | None = None, run_id: str | None = None) -> dict:
+                   image: Path | None = None, run_id: str | None = None,
+                   dump: int = -1) -> dict:
     """Export with a sidecar; never overwrite inputs or existing outputs."""
     if mode not in ("timer", "pmu", "unknown"):
         raise ValueError("mode must be timer, pmu, or unknown")
@@ -201,7 +217,31 @@ def export_capture(log: Path, elf: Path, output: Path, *, mode: str = "unknown",
         raise ValueError("output must not overwrite a capture, ELF, or image")
     if output.exists() or sidecar.exists():
         raise ValueError("output or metadata already exists; choose a fresh output path")
-    samples, quality = read_capture(log)
+    samples, quality = read_capture(log, dump)
+    session = quality.pop("session", None)
+    target = None
+    if session:
+        built, host_hash = check_build(elf, session)
+        h = session["header"]
+        if not built:
+            got = ("does not contain the whole image range "
+                   f"{h['lo']:08x}-{h['hi']:08x}" if host_hash is None
+                   else f"hashes to {host_hash:08x}")
+            raise ValueError(f"ELF does not match the captured image (image hash "
+                             f"{h['build']:08x}; the ELF {got})")
+        if mode == "timer" and not h["modes"] & MODE_TIMER:
+            raise ValueError("--mode timer, but the target took no timer samples in this run")
+        if mode == "pmu" and (not h["modes"] & MODE_PMU or period != h["period"]):
+            raise ValueError(f"--mode pmu/--period {period} disagree with the target "
+                             f"(PMU period {h['period']})")
+        target = {"run_id": f"{h['run']:016x}", "dump": h["dump"],
+                  "image_range": f"{h['lo']:08x}-{h['hi']:08x}",
+                  "image_hash": f"{h['build']:08x}", "elf_matches_image": True,
+                  "timer_sampling": bool(h["modes"] & MODE_TIMER),
+                  "pmu_sampling": bool(h["modes"] & MODE_PMU),
+                  "pmu_event_id": f"0x{h['event']:x}" if h["modes"] & MODE_PMU else None,
+                  "pmu_period": h["period"] if h["modes"] & MODE_PMU else None,
+                  "pmu_config_changed_mid_run": bool(h["mixed"])}
     artifacts = {"log": {"path": str(log), "sha256": sha256_file(log)},
                  "elf": {"path": str(elf), "sha256": sha256_file(elf)}}
     if image:
@@ -219,7 +259,11 @@ def export_capture(log: Path, elf: Path, output: Path, *, mode: str = "unknown",
             "export_id": str(uuid.uuid4()), "capture_run_id": run_id,
             "artifacts": artifacts,
             "capture": {"mode": mode, "event": event, "period": period,
-                        "metadata_source": "operator-supplied; not target-verified",
+                        "metadata_source": ("target header (K2) for identity, modes and "
+                                            "period; operator for the event label"
+                                            if target else
+                                            "operator-supplied; not target-verified"),
+                        "target": target,
                         "clock": "target-generic-timer-microseconds",
                         "clock_offset_applied_us": 0, "pid": 1,
                         "pid_tid_kind": "synthetic; pointer mapping below",
@@ -255,11 +299,13 @@ def main() -> None:
     parser.add_argument("--period", type=int, help="PMU overflow period, decimal")
     parser.add_argument("--image", type=Path, help="optional matching image to hash")
     parser.add_argument("--run-id", help="optional operator-assigned capture ID")
+    parser.add_argument("--dump", type=int, default=-1,
+                        help="which dump of the log to export: 0 = first, -1 = latest")
     args = parser.parse_args()
     try:
         metadata = export_capture(args.log, args.elf, args.output, mode=args.mode,
                                   event=args.event, period=args.period,
-                                  image=args.image, run_id=args.run_id)
+                                  image=args.image, run_id=args.run_id, dump=args.dump)
     except (OSError, ValueError, NotImplementedError, ELFError) as error:
         parser.exit(1, f"error: {error}\n")
     quality = metadata["quality"]

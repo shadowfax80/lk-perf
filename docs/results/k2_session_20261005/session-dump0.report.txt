@@ -1,0 +1,42 @@
+dump 1 of 2 in this log: run 000000001fef55dd, dump #1 of that run; modes pmu, PMU event 0x11 every 1000000; ELF matches the image (7591f122)
+  cpu0: 100 taken, 100 retained
+  cpu1: 100 taken, 100 retained
+  cpu2: 100 taken, 100 retained
+  cpu3: 100 taken, 100 retained
+records: 400 sent, 385 accepted, 15 lost or rejected in transfer
+
+385 samples across 4 cpu(s): {0: 85, 1: 100, 2: 100, 3: 100}
+4 distinct thread(s) sampled (by thread_t* -- see profiler.c)
+unwind depth histogram (frames per sample): {3: 385}
+stack window: 385 sample(s) bounded by their stack top (< 128 bytes above SP), 0 with SP on no known stack (nothing copied)
+
+   count       %  leaf function (source line)
+     385  100.0%  profiler_workload_inner  (profiler.c:731)
+
+IRQ-masked time (invisible to IRQ sampling), accounting on at dump time:
+  cpu0:  0.11% masked (0.11% in IRQ handlers), 143 regions, longest 17.0 us at [irq handler, GIC ID 153]
+  cpu1:  0.08% masked (0.07% in IRQ handlers), 159 regions, longest 4.1 us at [irq handler, GIC ID 15]
+  cpu2:  0.08% masked (0.08% in IRQ handlers), 146 regions, longest 4.3 us at [irq handler, GIC ID 15]
+  cpu3:  0.11% masked (0.07% in IRQ handlers), 252 regions, longest 3.9 us at thread_yield
+
+  % of time   regions     longest  masking site
+     0.018%        64       2.9us  [irq handler, GIC ID 30]
+     0.015%        36       4.3us  [irq handler, GIC ID 15]
+     0.012%        13      17.0us  [irq handler, GIC ID 153]
+     0.010%       100       1.7us  [irq handler, GIC ID 51]
+     0.009%       100       2.3us  [irq handler, GIC ID 50]
+     0.008%       100       1.5us  [irq handler, GIC ID 48]
+     0.008%       100       1.7us  [irq handler, GIC ID 49]
+     0.004%        53       1.9us  cbuf_read_char
+     0.004%        53       1.7us  event_wait_timeout
+     0.002%         6       3.2us  [irq handler, GIC ID 14]
+     0.002%         4       3.9us  thread_yield
+     0.002%        26       2.3us  mutex_acquire_timeout
+     0.001%         4       3.0us  thread_exit
+     0.001%        26       0.4us  mutex_release
+     0.001%         4       1.8us  thread_join
+
+Samples delayed by IRQ masking (taken late, so the PC is the unmask point):
+  PMU, events: 0/385 delayed (threshold 1760), 0 attributed to the region that held them
+warning: 0 sample(s) failed their checksum, 15 sample(s) missing entirely (seq gap) -- both dropped, not trusted
+note: the log holds 2 dumps; reporting dump 1, the others are ignored (--dump N picks another)

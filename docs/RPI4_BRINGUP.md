@@ -3,6 +3,15 @@
 > Work queue, ownership and status updates: [HANDOFF.md](HANDOFF.md). This
 > file is the hardware evidence record.
 
+**Self-describing capture, K2 (2026-10-05, Claude):** every dump now states
+its session (run id, dump number), its image (a hash of the read-only bytes
+that the host checks against the ELF), its sampling modes and PMU settings,
+per-core taken/retained/overwritten/lost counts, and the exact number of
+records sent. On the Pi this exposed exact serial loss (for example 7 of 8458
+records) that sequence gaps alone could only estimate, and the host now
+refuses a mismatched ELF. Details:
+[results/k2_session_20261005](results/k2_session_20261005/README.md).
+
 **Stack-copy bounds, K1 (2026-10-05, Claude):** the per-sample 128-byte
 stack copy read past the end of thread stacks whenever a thread ran near its
 stack top. That was the normal case: every four-core-workload sample had only

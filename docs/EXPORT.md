@@ -22,7 +22,7 @@ Hotspot's native `perf.data` input remain separate interfaces.
    and PMU modes use ordinary IRQ delivery on the Non-secure SVC Pi and intended
    target. A sample delivered after unmasking cannot reconstruct the masked
    execution. The exporter cannot correct it; it accepts dumps carrying the
-   K6 `src/lat/msite/mgap` fields, and `pi4_pc_histogram.py` reports the
+   K6 `src/lat/msite/mgap` fields (and K1 `slen`), and `pi4_pc_histogram.py` reports the
    masked time and the delayed samples (ARCHITECTURE.md §11.1). In
    pseudo-NMI mode (`profiler nmion`) PMU samples reach masked thread code
    directly; IRQ handlers stay unsampled.

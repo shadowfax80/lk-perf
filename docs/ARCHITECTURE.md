@@ -8,6 +8,7 @@
 | exporter | Timestamped perf-script export ([EXPORT.md](EXPORT.md), [verification](results/PERF_EXPORT_VERIFICATION.md)) |
 | `0f7f5e3` (K6) | IRQ-masked time accounting, delayed-sample attribution, delay-compensated PMU reload, console printing without IRQ masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
 | `84c25a9` (K12) | Opt-in pseudo-NMI sampling by GIC priority masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
+| K2 | Self-describing dumps: session header with run id, image hash, modes/event/period; per-core taken/retained/overwritten/lost counts; footer record count ([§7.3](#73-sample-text-format), [§7.5](#75-transfer-cost-and-run-isolation)) |
 | K1 | Stack copy bounded by the top of the sampled stack, `slen` field, unwinder stops at the stack top ([§4.4](#44-captured-context), [§8.2](#82-per-sample-algorithm)) |
 
 lk-perf is a statistical sampling profiler for Little Kernel (LK) workloads executing in AArch32 on multiple cores. The target captures interrupted execution state and a bounded stack snapshot; Python tools recover call chains from the matching debug ELF and produce function histograms, disassembly annotations, and FlameGraph input. It is a standalone performance tool. It has no dependency on BOLT and does not validate BOLT transformations.
@@ -432,7 +433,34 @@ priority at dump time, one
 per core, and one `MASKSITE cpu=<n> site=… count=… ticks=… max=… crc=…` per
 recorded masking site. All durations are CNTPCT ticks at `cntfrq`.
 
-The final target marker is `SAMPLE done`. There is no build ID, format version, run ID, mode/event ID, declared expected sample count, or structured footer. The parser accepts the field order above but its regex accepts variable hex widths and it does not explicitly require the target's stack length. Older samples without `seq`/`crc` do not match this parser. Console echoes and unrelated text are ignored.
+Since K2 every dump is a checksummed envelope around those records:
+
+```text
+DUMPBEGIN fmt=<n> run=<hex> dump=<n> image=<lo>-<hi> build=<hash> modes=<bits> event=<id> period=<n> mixed=<0|1> cpus=<n> buf=<n> crc=<hex>
+DUMPCPU cpu=<n> total=<n> retained=<n> overwritten=<n> pmumissed=<n> crc=<hex>    (one per core)
+SAMPLE ...                                                                       (records)
+MASKINFO / MASKNMI / MASKCPU / MASKSITE ...                                      (K6/K12)
+DUMPEND run=<hex> dump=<n> samples=<n> crc=<hex>
+SAMPLE done
+```
+
+| Field | Meaning |
+|---|---|
+| `fmt` | Dump format version (2) |
+| `run` | Session id: CNTPCT when the session began (`profiler clear`, or first use after boot) |
+| `dump` | Dump number within the session |
+| `image`, `build` | Address range `[_start, __rodata_end)` and the FNV-1a hash of its bytes, which the host recomputes from the ELF |
+| `modes`, `event`, `period`, `mixed` | Sampling modes armed in the session (bit 0 timer, bit 1 PMU), the last PMU event and period, and whether a different PMU configuration was used earlier in the session |
+| `total`, `retained`, `overwritten`, `pmumissed` | Per core: samples taken, kept in the ring, overwritten, and PMU overflows lost inside masked spans |
+| `samples` | Exact number of SAMPLE records this dump printed |
+
+The read-only image range is never written at run time (verified on the Pi
+across workloads, sampling, pseudo-NMI and dumps), so its hash identifies the
+build; computing it costs about 0.7 ms per dump. Per-core totals are read once
+at the start of the dump and the export uses exactly those values, so header,
+records and footer agree. The final marker is still `SAMPLE done`. The parser
+accepts variable hex widths for the record fields and does not explicitly
+require the target's stack length; the exporter does. Older samples without `seq`/`crc` do not match this parser. Console echoes and unrelated text are ignored.
 
 ### 7.4 Sample checksum
 
@@ -457,7 +485,7 @@ The parser tracks the next sequence number and warns about gaps; checksum failur
 
 Hex encoding doubles the stack payload, and text metadata adds more bytes. With one-digit CPU IDs, current fields occupy 397 bytes per line including LF; a full four-core dump is roughly 6.20 MiB before console/log additions and possible CRLF expansion. At ideal 8N1 6-Mbaud throughput (600,000 bytes/s), that alone takes about 10.8 seconds. Actual throughput depends on formatted-print cost, USB/driver behavior, and host logging; this is a theoretical lower bound, not a measured promise.
 
-Logs open in append mode. The host parser scans **every matching line** in the file, including earlier boots and repeated dumps. Use a new log path per capture and do not report the same ring repeatedly into it. A future run-aware header/footer is needed to make isolation and completeness automatic.
+Logs open in append mode, so one log can hold several dumps and boots. With K2 dumps, both host tools split the log at `DUMPBEGIN` lines and use the **latest** dump unless `--dump N` selects another (0 = first, -1 = latest); the report names the dump, its run and its number, and notes when others were ignored. The footer turns transfer loss into an exact count (`samples` sent minus records accepted), including trailing loss that sequence numbers alone cannot show; a dump without its footer is reported as incomplete, and the exporter refuses it. Older-format logs without `DUMPBEGIN` are scanned as before, line by line across the whole file, so a fresh log per capture is still required for them.
 
 ## 8. Offline unwinding and symbolization
 
@@ -550,12 +578,13 @@ Timer samples approximate where execution is observed at scheduler timer interru
 | `profiler start` / `stop` | None | Enable/disable timer sampling; no implicit clear and no PMU stop |
 | `profiler pmustart` | Required event and count, base-0 parsing | Arm counter-0 overflow sampling on all cores; count must be at least 10000 |
 | `profiler pmustop` | None | Synchronously disarm PMU sampling across cores; no timer stop |
-| `profiler clear` | None | Zero sample arrays and ring counters; no automatic producer stop |
+| `profiler clear` | None | Zero sample arrays and ring counters and start a new capture session (new run id); no automatic producer stop |
 | `profiler status` | None | Show per-core lifetime totals, heads, wrap indication, PMU overflows lost inside masked spans longer than a period (`pmu_missed`), and timer-enable flag; no complete PMU-mode status |
 | `profiler dump` | None | Export retained records in CPU/slot order, then the masked-time accounting, and print `SAMPLE done`; ends the accounting window (turns it off) so the dump's own output is not counted; no automatic sampler freeze |
 | `profiler maskon` / `maskoff` | None | Start a fresh IRQ-masked time accounting window on every core / stop it, keeping totals. `start` and `pmustart` turn it on if it is off; `clear` restarts the window |
 | `profiler mask` | None | Per-core masked share, IRQ-handler share, region count, longest region and its site, and the top five masking sites |
 | `profiler nmion` / `nmioff` | None | Switch every core to masking by GIC priority (pseudo-NMI, PMU samples reach masked code) / back to CPSR.I. `nmion` programs priorities and refuses to enable if they do not read back; `status` shows the mode per core |
+| `profiler buildid` | None | Print the running image's read-only range and its FNV-1a hash (the dump's `build` value) and how long hashing took |
 | `profiler masktest [loops] [us]` | 2000, 500 | Ground-truth workload: alternate `us` microseconds with IRQs masked and `us` unmasked, so half the time is masked by construction |
 | `profiler bench [iters]` | 20000000 iterations per function | Alternate two arithmetic leaf workloads four times; does not start sampling |
 | `profiler nest [iters]` | 20000000 | Nested workload; optimization can eliminate wrapper frames via tail calls |
@@ -573,7 +602,7 @@ capability.
 
 ### 10.1 Preserve the build identity
 
-Record the lk-perf revision, resolved LK revision, toolchain version, build configuration, ordered patch set, image hash, ELF hash, sampling mode/event/period, and intended console baud with each capture. These are recommended capture notes, not fields generated by the current tool. Always keep the ELF produced by the same build as the uploaded binary; fetching only a fresh `.bin` and using an older `.elf` is a documented failure mode.
+The dump now carries the image hash, the sampling modes and the PMU event/period itself, and both host tools refuse an ELF whose bytes do not hash to the dump's `build` value (`--allow-elf-mismatch` overrides the report). Still record the lk-perf revision, resolved LK revision, toolchain version, ordered patch set and console baud with each capture; the target cannot report those. `profiler buildid` prints the running image's range and hash at any time.
 
 Build using a Linux environment or WSL. Run serial tools where the actual USB-serial adapter is exposed; WSL build access does not imply WSL serial access. A Windows host may load/analyze artifacts built in WSL. Inspect the current generated-tree state before invoking setup because it resets tracked LK edits.
 
@@ -615,7 +644,7 @@ To see into IRQ-masked code, add `profiler nmion` (and optionally `profiler mask
 
 ### 10.4 Assess a report before using it
 
-Confirm that the log contains the completed dump marker and command completion, that accepted counts are consistent with retained per-core counts, and that warnings/losses are understood. A total above 4096 on a core means overwrite occurred; compare against retained counts, not lifetime totals. Inspect unwind depths and leaf-only warnings before treating a FlameGraph as a complete calling-context distribution. This assessment is presently manual because the parser does not enforce a complete session envelope.
+The report's session summary states the checks that used to be manual: which dump of the log is used, whether the ELF matches the image, per-core taken/retained/overwritten counts, PMU overflows lost while masked, and the exact number of records lost in transfer. Read its warnings (a damaged header or footer, counts that do not add up, a PMU configuration changed mid-session) before trusting the numbers. Then inspect unwind depths and leaf-only warnings before treating a FlameGraph as a complete calling-context distribution.
 
 ## 11. Correctness boundaries and failure behavior
 
@@ -639,11 +668,11 @@ Hardware results: [results/k6_irqmask_20261005](results/k6_irqmask_20261005/READ
 | Deep/large frames | Snapshot-backed reads stop beyond available memory; `slen` says whether the copy ended at the stack top or at the 128-byte limit | A walk cut by the 128-byte limit still has no explicit stop reason |
 | Stack-copy bounds | Copy bounded by the top of the sampled stack (thread stack, or per-core boot stack for idle/bootstrap threads); nothing copied when SP is on no known stack (K1) | Bounds come from LK's thread records and boot-stack layout; another stack kind (e.g. a separate IRQ stack on a target port) would need its own bounds |
 | Concurrent clear/dump | Operational stop-before-export sequence | No enforced freeze, synchronized timer stop, or record-generation validation |
-| Buffer overflow | Preserve most recent per-core slots; status marks wrap | Older samples lost; no exported overwrite counter/session totals |
-| Mixed sampling modes/runs | Operator chooses one mode and fresh log; each record now carries its trigger (`src`) | Records lack event, run, build, and format identity |
+| Buffer overflow | Preserve most recent per-core slots; dumps report taken, retained and overwritten per core (K2) | Older samples are lost; only their count is known |
+| Mixed sampling modes/runs | Dump header gives run, dump number, modes, PMU event/period and a changed-config flag; host picks one dump of a log; records carry their trigger (`src`) | A session that mixes PMU configurations is flagged, not split per configuration |
 | Context sufficiency | Capture SP/LR and one FP candidate; carry recoverable registers through CFI | Other live registers and the other FP candidate are missing |
 | Missing assembly CFI | Stop the walk | No validated LR fallback; caller contributions underrepresented |
-| Bad symbol attribution | Matching ELF supplied by operator | Nearest-start mapping lacks function-extent validation; return-address boundaries remain |
+| Bad symbol attribution | ELF checked against the dump's image hash (K2) | Nearest-start mapping lacks function-extent validation; return-address boundaries remain |
 | A55 transfer | Mechanism demonstrated on A72 | Target routing, ABI, event support, performance, and footprint unvalidated |
 | Scheduling/wakeups/blocking/frequency | Timestamped stack samples and CPU/thread identity only | No context-switch/wakeup events, blocking reasons/durations, or CPU-frequency history; additional target event instrumentation/export is required |
 
@@ -651,9 +680,9 @@ The stack-bound issue concerned **reading above SP** near a stack's high address
 
 ### 11.3 What “valid sample” currently means
 
-A checksum-valid record means its parsed fields agree with the emitted field checksum. It does not imply the record belongs to the intended run/build, contains a consistent snapshot, has trustworthy symbols, represents all workload time, or unwinds to the true root. Keep transport integrity, context validity, unwind completeness, and statistical representativeness as separate judgments.
+A checksum-valid record means its parsed fields agree with the emitted field checksum. With a K2 dump, the record's run and build are established by the checksummed header and the ELF check. It still does not imply that the record contains a consistent snapshot, has trustworthy symbols, represents all workload time, or unwinds to the true root. Keep transport integrity, context validity, unwind completeness, and statistical representativeness as separate judgments.
 
-The backend exports masked time per core and site and a per-sample delay, but no structured stop reason, overwrite count, mode-specific loss count, or statistical confidence. The warning counts/depth histogram provide useful diagnostics, but they are not a full capture-quality model.
+The backend exports masked time per core and site, a per-sample delay, per-core overwrite and PMU-loss counts and an exact record count, but no structured unwind stop reason, mode-specific loss count, or statistical confidence. The warning counts/depth histogram provide useful diagnostics, but they are not a full capture-quality model.
 
 ## 12. Validation evidence and extension design
 
@@ -672,6 +701,7 @@ The following summarizes the repository's prior observations; it is not a claim 
 | UART integrity | 6-Mbaud console operation; sequence/checksum validation reported losses in real captures |
 | IRQ-masked time (K6) | Ground truth 50% masked: accounting 49.6%, PMU samples 48.2% on the masked side, all delayed samples attributed; console masking (up to 350 µs per line) removed |
 | Pseudo-NMI (K12) | Ground truth: 50.5% of PMU samples inside masked code, 0 delayed; stress with mode switching and a 6-minute soak (944,589 samples) clean |
+| Capture sessions (K2) | Image hash identical on the Pi and from the ELF across workloads, sampling, pseudo-NMI and dumps (0.7 ms); two-dump log split; exact loss (7/8458) and overwrite counts; wrong ELF refused; older capture exported byte-identically |
 | Stack bounds (K1) | Four-core workload: all samples bounded at 20 bytes (previously 108 bytes past the stack), clean `initial_thread_func` root; idle samples bounded exactly at the per-core boot-stack top |
 | Offline regressions | `scripts/test_dwarf_unwind.py`: nested/Thumb address handling, register propagation, noreturn-boundary FDE lookup, recursive cycle guard; `scripts/test_irqmask_report.py`: K6/K12 record format, MASK lines, delay classification, exporter acceptance |
 
@@ -685,7 +715,7 @@ These are architectural directions, **not additional claimed work items or a rep
 |---|---|---|
 | Coherent capture lifecycle | Synchronous producer stop/freeze and guarded clear/export with an explicit state model | Concurrent all-core start/stop/dump/clear stress with no mixed generations |
 | Safe and richer context | Bounds check: done (K1). Remaining: capture both r7/r11 and required GPRs or declare a smaller supported CFI subset | Large-frame, mixed-mode, and alternate-CFA fixtures on hardware |
-| Self-describing session | Versioned header/footer, run/build identity, mode/event/period, expected per-core retained/total/loss counts | Reject wrong ELF and incomplete/trailing-corrupt dumps; isolate appended runs |
+| Self-describing session | Done (K2): versioned header/footer, run/build identity, modes/event/period, per-core counts, exact record count, latest-dump selection | Done on the Pi: wrong ELF refused, two-dump log split, exact transfer loss and overwrite counts |
 | Reporting integrity | Function range validation, consistent return-address attribution, explicit unwind stop reasons | Assembly gaps, function-boundary calls, missing CFI, and corrupted context regressions |
 | Bias/overhead accounting | IRQ-masked duration: done (K6). Remaining: measured sampler cost, timer-mode grid (K10), cross-core PC sampling for handlers (K11) | Controlled masked-region workload (`masktest`) and sampling-rate sweeps |
 | Accurate counting | Define PMU ownership, preserve state, pin execution or collect per-core, bracket counts outside prints, extend overflow handling | Stat-only and stat-with-sampling comparisons, migration/wrap cases |

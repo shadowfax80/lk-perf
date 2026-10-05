@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""K6 regressions: IRQ-masked time accounting in dumps (host side).
+"""K6/K1/K2 regressions: dump format and capture-session handling (host side).
 
 Covers the SAMPLE line's src/lat/msite/mgap extension and its checksum,
 older dumps without those fields, MASKINFO/MASKCPU/MASKSITE parsing with
@@ -14,8 +14,12 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).parent))
-from pi4_pc_histogram import (_fnv, _sample_checksum, classify_delays, parse_mask,
-                              parse_samples)
+import shutil
+import subprocess
+
+from pi4_pc_histogram import (_fnv, _sample_checksum, check_build, classify_delays, image_hash,
+                              parse_mask, parse_samples, parse_session, read_lines,
+                              select_dump)
 from pi4_perf_export import read_capture
 
 FREQ = 54000000
@@ -49,6 +53,33 @@ def mask_lines(now=10 * FREQ, start=FREQ, masked=FREQ // 10, site=0x80001234):
     site_line = (f"MASKSITE cpu=0 site={site:08x} count=00000005 ticks={masked:016x} "
                  f"max=000001f4 crc={_fnv([0, site, 5, masked, masked >> 32, 500]):08x}\n")
     return info + cpu + site_line
+
+
+def dump_text(run=0x1234, dump=1, samples=((0, 0x8000),), build=0xabcdef01, lo=0x8000,
+              hi=0x8010, modes=2, event=0x11, period=1000000, mixed=0, cpus=1,
+              totals=None, footer_count=None, header_crc=None):
+    """One complete K2 dump: header, per-core lines, samples, footer."""
+    words = [2, run, run >> 32, dump, lo, hi, build, modes, event, period, mixed, cpus, 4096]
+    hcrc = _fnv(words) if header_crc is None else header_crc
+    text = (f"DUMPBEGIN fmt=00000002 run={run:016x} dump={dump:08x} image={lo:08x}-{hi:08x} "
+            f"build={build:08x} modes={modes:08x} event={event:08x} period={period:08x} "
+            f"mixed={mixed:08x} cpus={cpus:08x} buf=00001000 crc={hcrc:08x}\n")
+    per_cpu = {}
+    for cpu, _ in samples:
+        per_cpu[cpu] = per_cpu.get(cpu, 0) + 1
+    for cpu in range(cpus):
+        kept = per_cpu.get(cpu, 0)
+        total = (totals or {}).get(cpu, kept)
+        text += (f"DUMPCPU cpu={cpu} total={total:08x} retained={kept:08x} "
+                 f"overwritten={total - kept:08x} pmumissed=00000000 "
+                 f"crc={_fnv([cpu, total, kept, total - kept, 0]):08x}\n")
+    for seq, (cpu, pc) in enumerate(samples):
+        text += sample_line(seq=seq, cpu=cpu, pc=pc, ts=1000000 + seq,
+                            k6=("p", 400, 0, 0xffffffff), slen=128)
+    count = len(samples) if footer_count is None else footer_count
+    text += (f"DUMPEND run={run:016x} dump={dump:08x} samples={count:08x} "
+             f"crc={_fnv([run, run >> 32, dump, count]):08x}\nSAMPLE done\n")
+    return text
 
 
 class K6Tests(unittest.TestCase):
@@ -101,6 +132,70 @@ class K6Tests(unittest.TestCase):
         bad = sample_line(k6=("p", 400, 0, 0xffffffff), slen=200) + "SAMPLE done\n"
         with self.assertRaises(ValueError):
             read_capture(Path(self.write(bad)))
+
+    def test_latest_dump_is_selected_and_earlier_ones_ignored(self):
+        log = self.write(dump_text(run=0x1, samples=((0, 0x1000),) * 3)
+                         + "] profiler dump\n"
+                         + dump_text(run=0x2, samples=((0, 0x2000),) * 2))
+        self.assertEqual([s["pc"] for s in parse_samples(log)], [0x2000, 0x2000])
+        self.assertEqual([s["pc"] for s in parse_samples(log, 0)], [0x1000] * 3)
+        _, where = select_dump(read_lines(log))
+        self.assertEqual((where["dumps"], where["index"]), (2, 1))
+        with self.assertRaises(ValueError):
+            select_dump(read_lines(log), 5)
+
+    def test_session_header_cpu_lines_and_footer(self):
+        lines, _ = select_dump(read_lines(self.write(dump_text(totals={0: 5000},
+                                                                samples=((0, 0x1000),) * 4))))
+        s = parse_session(lines)
+        self.assertEqual(s["problems"], [])
+        self.assertEqual(s["header"]["period"], 1000000)
+        self.assertEqual(s["cpus"][0]["overwritten"], 4996)
+        self.assertEqual(s["footer"]["samples"], 4)
+
+    def test_damaged_header_and_missing_footer_are_reported(self):
+        lines, _ = select_dump(read_lines(self.write(dump_text(header_crc=0))))
+        self.assertIn("dump header missing or damaged", parse_session(lines)["problems"])
+        cut = dump_text().split("DUMPEND")[0]
+        lines, where = select_dump(read_lines(self.write(cut)))
+        self.assertFalse(where["complete"])
+        self.assertTrue(any("footer" in p for p in parse_session(lines)["problems"]))
+
+    def test_footer_gives_exact_transfer_loss(self):
+        text = dump_text(samples=((0, 0x1000),) * 3)
+        damaged = text.replace("seq=00000001", "seq=0000000x")   # one record unreadable
+        samples, quality = read_capture(Path(self.write(damaged)))
+        self.assertEqual((quality["expected_samples"], quality["lost_or_rejected_samples"]),
+                         (3, 1))
+        self.assertTrue(quality["trailing_loss_count_known"])
+
+    def test_exporter_refuses_inconsistent_session(self):
+        text = dump_text(samples=((0, 0x1000),) * 2, footer_count=5)
+        with self.assertRaisesRegex(ValueError, "do not add up"):
+            read_capture(Path(self.write(text)))
+
+    @unittest.skipUnless(shutil.which("arm-none-eabi-as") and shutil.which("arm-none-eabi-ld"),
+                         "needs arm-none-eabi binutils")
+    def test_image_hash_matches_elf_bytes_and_detects_mismatch(self):
+        tmp = Path(self.temp.name)
+        payload = bytes(range(1, 33))
+        (tmp / "img.s").write_text(".text\n.global _start\n_start:\n.byte "
+                                   + ",".join(str(b) for b in payload) + "\n")
+        subprocess.run(["arm-none-eabi-as", "-o", str(tmp / "img.o"), str(tmp / "img.s")],
+                       check=True)
+        subprocess.run(["arm-none-eabi-ld", "-Ttext=0x8000", "-o", str(tmp / "img.elf"),
+                        str(tmp / "img.o")], check=True)
+        h = 0x811c9dc5
+        for b in payload:
+            h = ((h ^ b) * 16777619) & 0xffffffff
+        self.assertEqual(image_hash(tmp / "img.elf", 0x8000, 0x8020), h)
+        self.assertIsNone(image_hash(tmp / "img.elf", 0x8000, 0x9000))   # not all in file
+        lines, _ = select_dump(read_lines(self.write(dump_text(build=h, lo=0x8000,
+                                                                hi=0x8020))))
+        self.assertEqual(check_build(tmp / "img.elf", parse_session(lines)), (True, h))
+        lines, _ = select_dump(read_lines(self.write(dump_text(build=h ^ 1, lo=0x8000,
+                                                                hi=0x8020))))
+        self.assertEqual(check_build(tmp / "img.elf", parse_session(lines))[0], False)
 
     def test_older_record_still_parses_without_k6_fields(self):
         s = parse_samples(self.write(sample_line()))

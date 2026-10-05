@@ -1,0 +1,46 @@
+dump 2 of 2 in this log: run 000000001fef55dd, dump #2 of that run; modes timer+pmu, PMU event 0x11 every 100000 (CONFIG CHANGED MID-SESSION); ELF matches the image (7591f122)
+  cpu0: 2112 taken, 2112 retained
+  cpu1: 2119 taken, 2119 retained
+  cpu2: 2113 taken, 2113 retained
+  cpu3: 2114 taken, 2114 retained
+records: 8458 sent, 8451 accepted, 7 lost or rejected in transfer
+
+8451 samples across 4 cpu(s): {0: 2108, 1: 2117, 2: 2113, 3: 2113}
+5 distinct thread(s) sampled (by thread_t* -- see profiler.c)
+unwind depth histogram (frames per sample): {2: 6, 3: 8444, 7: 1}
+stack window: 8443 sample(s) bounded by their stack top (< 128 bytes above SP), 0 with SP on no known stack (nothing copied)
+
+   count       %  leaf function (source line)
+    8449  100.0%  profiler_workload_inner  (profiler.c:731)
+       1    0.0%  thread_yield  (thread.c:635)
+       1    0.0%  event_wait_timeout  (event.c:103)
+
+IRQ-masked time (invisible to IRQ sampling), accounting on at dump time:
+  cpu0:  0.34% masked (0.34% in IRQ handlers), 2089 regions, longest 17.8 us at [irq handler, GIC ID 153]
+  cpu1:  0.33% masked (0.31% in IRQ handlers), 2212 regions, longest 4.9 us at [irq handler, GIC ID 15]
+  cpu2:  0.39% masked (0.37% in IRQ handlers), 2158 regions, longest 4.6 us at [irq handler, GIC ID 15]
+  cpu3:  0.38% masked (0.37% in IRQ handlers), 2147 regions, longest 5.3 us at [irq handler, GIC ID 15]
+
+  % of time   regions     longest  masking site
+     0.086%      2014       1.2us  [irq handler, GIC ID 51]
+     0.086%      2013       1.1us  [irq handler, GIC ID 50]
+     0.070%      2013       1.0us  [irq handler, GIC ID 49]
+     0.068%      2012       0.9us  [irq handler, GIC ID 48]
+     0.017%       138       2.8us  [irq handler, GIC ID 30]
+     0.012%        28      17.8us  [irq handler, GIC ID 153]
+     0.010%        48       5.3us  [irq handler, GIC ID 15]
+     0.004%       123       1.9us  cbuf_read_char
+     0.003%       123       2.0us  event_wait_timeout
+     0.001%         6       3.1us  [irq handler, GIC ID 14]
+     0.001%        33       1.7us  mutex_acquire_timeout
+     0.001%         4       3.8us  thread_exit
+     0.000%        33       0.3us  mutex_release
+     0.000%         4       2.4us  thread_join
+     0.000%         4       1.4us  thread_yield
+
+Samples delayed by IRQ masking (taken late, so the PC is the unmask point):
+  timer, CNTPCT ticks: 0/6 delayed (threshold 144), 0 attributed to the region that held them
+  PMU, events: 2/8445 delayed (threshold 1928), 2 attributed to the region that held them
+         2  [irq handler, GIC ID 15]
+warning: 0 sample(s) failed their checksum, 7 sample(s) missing entirely (seq gap) -- both dropped, not trusted
+note: the log holds 2 dumps; reporting dump 2, the others are ignored (--dump N picks another)

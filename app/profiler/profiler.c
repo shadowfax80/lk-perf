@@ -1001,6 +1001,45 @@ static void profiler_mask_print(void) {
     }
 }
 
+// K2: image identity. The read-only part of the image -- code, unwind index,
+// rodata and LK's constant tables (lk_init, commands, apps) -- spans
+// [_start, __rodata_end) and is never written at run time, so an FNV-1a hash
+// of those bytes identifies the build. The host recomputes it from the ELF it
+// is given and refuses a mismatched ELF.
+extern const uint8_t _start[];
+extern const uint8_t __rodata_end[];
+
+// K2: capture session. A session starts at `profiler clear` (or at boot) and
+// may be dumped several times; every dump says which session it belongs to,
+// which sampling modes and PMU configuration produced it, and how many
+// samples each core took, kept, overwrote and lost, so a log holding several
+// dumps or a damaged transfer can be interpreted without operator notes.
+#define PROFILER_DUMP_FORMAT 2u
+#define PROFILER_MODE_TIMER (1u << 0)
+#define PROFILER_MODE_PMU (1u << 1)
+static uint64_t profiler_run_id;       // CNTPCT when the session started
+static uint32_t profiler_dump_no;      // dumps of this session so far
+static uint32_t profiler_modes_used;   // PROFILER_MODE_* armed in this session
+static uint32_t profiler_pmu_event_used;
+static uint32_t profiler_pmu_period_used;
+static uint32_t profiler_pmu_config_mixed;  // a second, different PMU config
+
+static void profiler_session_start(void) {
+    profiler_run_id = profiler_cntpct();
+    profiler_dump_no = 0;
+    profiler_modes_used = 0;
+    profiler_pmu_event_used = 0;
+    profiler_pmu_period_used = 0;
+    profiler_pmu_config_mixed = 0;
+}
+
+static uint32_t profiler_image_hash(void) {
+    uint32_t h = 0x811c9dc5u;
+    for (const uint8_t *p = _start; p < __rodata_end; p++)
+        h = (h ^ *p) * 16777619u;
+    return h;
+}
+
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
         printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|edgetest|stat|pmustart|pmustop|pmu|maskon|maskoff|mask|masktest|nmion|nmioff>\n");
@@ -1009,7 +1048,15 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
 
     const char *sub = argv[1].str;
 
-    if (!strcmp(sub, "maskon")) {
+    if (!strcmp(sub, "buildid")) {
+        uint64_t t0 = profiler_cntpct();
+        uint32_t h = profiler_image_hash();
+        uint64_t t1 = profiler_cntpct();
+        printf("buildid: image %08x-%08x fnv1a=%08x (%u bytes, %u us)\n",
+               (uint32_t)(uintptr_t)_start, (uint32_t)(uintptr_t)__rodata_end, h,
+               (uint32_t)(__rodata_end - _start),
+               (uint32_t)(((t1 - t0) * 1000000u) / profiler_cntfrq()));
+    } else if (!strcmp(sub, "maskon")) {
         profiler_mask_on();
         printf("mask: IRQ-masked time accounting on (new window on all %d cores)\n",
                SMP_MAX_CPUS);
@@ -1042,6 +1089,9 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         profiler_masktest(loops, us);
         printf("masktest: done\n");
     } else if (!strcmp(sub, "start")) {
+        if (!profiler_run_id)
+            profiler_session_start();
+        profiler_modes_used |= PROFILER_MODE_TIMER;
         if (!arm_irqmask_on) {
             profiler_mask_on();
             printf("mask: IRQ-masked time accounting started with sampling\n");
@@ -1071,6 +1121,7 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         memset(profiler_msite_buf, 0, sizeof(profiler_msite_buf));
         memset(profiler_mgap_buf, 0, sizeof(profiler_mgap_buf));
         memset(profiler_slen_buf, 0, sizeof(profiler_slen_buf));
+        profiler_session_start();
         for (int c = 0; c < SMP_MAX_CPUS; c++)
             profiler_pmu_missed[c] = 0;
         if (arm_irqmask_on)
@@ -1121,12 +1172,52 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         static struct arm_irqmask_cpu mask_snap[SMP_MAX_CPUS];
         memcpy(mask_snap, arm_irqmask_cpu, sizeof(mask_snap));
 
+        // K2: header. Per-core totals are read once here and the export below
+        // uses exactly these values, so the header, the records and the footer
+        // agree even if a sampler is still running (stop both first anyway).
+        if (!profiler_run_id)
+            profiler_session_start();
+        uint32_t dump_no = ++profiler_dump_no;
+        uint32_t snap_total[SMP_MAX_CPUS], snap_head[SMP_MAX_CPUS];
+        for (int c = 0; c < SMP_MAX_CPUS; c++) {
+            snap_total[c] = profiler_total[c];
+            snap_head[c] = profiler_head[c];
+        }
+        uint32_t image_lo = (uint32_t)(uintptr_t)_start;
+        uint32_t image_hi = (uint32_t)(uintptr_t)__rodata_end;
+        uint32_t build = profiler_image_hash();
+        uint32_t hk = 0x811c9dc5u;
+        uint32_t hv[] = { PROFILER_DUMP_FORMAT, (uint32_t)profiler_run_id,
+                          (uint32_t)(profiler_run_id >> 32), dump_no, image_lo, image_hi,
+                          build, profiler_modes_used, profiler_pmu_event_used,
+                          profiler_pmu_period_used, profiler_pmu_config_mixed, SMP_MAX_CPUS,
+                          PROFILER_BUF_SIZE };
+        for (unsigned i = 0; i < sizeof(hv) / sizeof(hv[0]); i++)
+            hk = profiler_fnv(hk, hv[i]);
+        printf("DUMPBEGIN fmt=%08x run=%016llx dump=%08x image=%08x-%08x build=%08x "
+               "modes=%08x event=%08x period=%08x mixed=%08x cpus=%08x buf=%08x crc=%08x\n",
+               PROFILER_DUMP_FORMAT, (unsigned long long)profiler_run_id, dump_no, image_lo,
+               image_hi, build, profiler_modes_used, profiler_pmu_event_used,
+               profiler_pmu_period_used, profiler_pmu_config_mixed, SMP_MAX_CPUS,
+               PROFILER_BUF_SIZE, hk);
+        for (int c = 0; c < SMP_MAX_CPUS; c++) {
+            uint32_t kept = snap_total[c] < PROFILER_BUF_SIZE ? snap_total[c] : PROFILER_BUF_SIZE;
+            uint32_t ck = 0x811c9dc5u;
+            uint32_t cv[] = { (uint32_t)c, snap_total[c], kept, snap_total[c] - kept,
+                              profiler_pmu_missed[c] };
+            for (unsigned i = 0; i < sizeof(cv) / sizeof(cv[0]); i++)
+                ck = profiler_fnv(ck, cv[i]);
+            printf("DUMPCPU cpu=%d total=%08x retained=%08x overwritten=%08x pmumissed=%08x "
+                   "crc=%08x\n", c, snap_total[c], kept, snap_total[c] - kept,
+                   profiler_pmu_missed[c], ck);
+        }
+
         uint32_t seq = 0;
         for (int c = 0; c < SMP_MAX_CPUS; c++) {
-            uint32_t count = profiler_total[c] < PROFILER_BUF_SIZE ?
-                             profiler_total[c] : PROFILER_BUF_SIZE;
-            uint32_t start = profiler_total[c] < PROFILER_BUF_SIZE ?
-                             0 : profiler_head[c];
+            uint32_t count = snap_total[c] < PROFILER_BUF_SIZE ?
+                             snap_total[c] : PROFILER_BUF_SIZE;
+            uint32_t start = snap_total[c] < PROFILER_BUF_SIZE ?
+                             0 : snap_head[c];
             for (uint32_t n = 0; n < count; n++) {
                 uint32_t idx = (start + n) % PROFILER_BUF_SIZE;
                 uint32_t pc = profiler_pc_buf[c][idx];
@@ -1209,6 +1300,12 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
                        c, e->site, e->count, (unsigned long long)e->ticks, e->max_ticks, sk);
             }
         }
+        // K2: footer -- the exact number of SAMPLE records this dump printed.
+        uint32_t fk = profiler_fnv(profiler_fnv(profiler_fnv(profiler_fnv(0x811c9dc5u,
+                      (uint32_t)profiler_run_id), (uint32_t)(profiler_run_id >> 32)),
+                      dump_no), seq);
+        printf("DUMPEND run=%016llx dump=%08x samples=%08x crc=%08x\n",
+               (unsigned long long)profiler_run_id, dump_no, seq, fk);
         printf("SAMPLE done\n");
     } else if (!strcmp(sub, "bench")) {
         uint32_t iters = argc >= 3 ? (uint32_t)argv[2].u : 20000000;
@@ -1367,6 +1464,14 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         profiler_pmu_route_and_unmask();
 
         profiler_pmu_reload = 0xFFFFFFFFu - count + 1u;
+        if (!profiler_run_id)
+            profiler_session_start();
+        if ((profiler_modes_used & PROFILER_MODE_PMU) &&
+            (profiler_pmu_event_used != event || profiler_pmu_period_used != count))
+            profiler_pmu_config_mixed = 1;
+        profiler_modes_used |= PROFILER_MODE_PMU;
+        profiler_pmu_event_used = event;
+        profiler_pmu_period_used = count;
         printf("pmustart: arming event counter 0 on all %d cores for event "
                "0x%x, reload every %u ...\n", SMP_MAX_CPUS, event, count);
         struct profiler_pmu_arm_ctx ctx = { .event = event };

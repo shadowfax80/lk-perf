@@ -25,6 +25,15 @@ hotspot view, not just "which function". objdump itself already
 handles ARM/Thumb-correct disassembly from the ELF's own `$t`/`$a`
 mapping symbols, so this doesn't need to track instruction sets itself.
 
+Capture sessions (K2): dumps from current images start with a checksummed
+DUMPBEGIN header (session run id, dump number, image range and hash,
+sampling modes, PMU event/period) and per-core DUMPCPU lines (total,
+retained, overwritten, PMU overflows lost), and end with a DUMPEND footer
+giving the exact number of SAMPLE records. A log may hold several dumps; the
+latest is used unless `--dump N` picks another (0 = first, -1 = latest). The
+image hash is recomputed from the ELF and a mismatch is refused
+(`--allow-elf-mismatch` overrides). Logs without DUMPBEGIN are read as before.
+
 IRQ-masked time (K6): dumps from images with masked-time accounting add
 `src/lat/msite/mgap` to each sample and MASKINFO/MASKCPU/MASKSITE lines.
 The report then states how much of each core's time ran with IRQs masked
@@ -79,6 +88,24 @@ MASKSITE_RE = re.compile(
     r"ticks=(?P<ticks>[0-9a-fA-F]{16}) max=(?P<max>[0-9a-fA-F]{8}) crc=(?P<crc>[0-9a-fA-F]{8})\s*$"
 )
 MASKNMI_RE = re.compile(r"MASKNMI cpus=(?P<cpus>[0-9a-fA-F]{8}) crc=(?P<crc>[0-9a-fA-F]{8})\s*$")
+DUMPBEGIN_RE = re.compile(
+    r"DUMPBEGIN fmt=(?P<fmt>[0-9a-fA-F]{8}) run=(?P<run>[0-9a-fA-F]{16}) "
+    r"dump=(?P<dump>[0-9a-fA-F]{8}) image=(?P<lo>[0-9a-fA-F]{8})-(?P<hi>[0-9a-fA-F]{8}) "
+    r"build=(?P<build>[0-9a-fA-F]{8}) modes=(?P<modes>[0-9a-fA-F]{8}) "
+    r"event=(?P<event>[0-9a-fA-F]{8}) period=(?P<period>[0-9a-fA-F]{8}) "
+    r"mixed=(?P<mixed>[0-9a-fA-F]{8}) cpus=(?P<cpus>[0-9a-fA-F]{8}) "
+    r"buf=(?P<buf>[0-9a-fA-F]{8}) crc=(?P<crc>[0-9a-fA-F]{8})\s*$"
+)
+DUMPCPU_RE = re.compile(
+    r"DUMPCPU cpu=(?P<cpu>\d+) total=(?P<total>[0-9a-fA-F]{8}) "
+    r"retained=(?P<retained>[0-9a-fA-F]{8}) overwritten=(?P<overwritten>[0-9a-fA-F]{8}) "
+    r"pmumissed=(?P<pmumissed>[0-9a-fA-F]{8}) crc=(?P<crc>[0-9a-fA-F]{8})\s*$"
+)
+DUMPEND_RE = re.compile(
+    r"DUMPEND run=(?P<run>[0-9a-fA-F]{16}) dump=(?P<dump>[0-9a-fA-F]{8}) "
+    r"samples=(?P<samples>[0-9a-fA-F]{8}) crc=(?P<crc>[0-9a-fA-F]{8})\s*$"
+)
+MODE_TIMER, MODE_PMU = 1, 2
 IRQ_SITE = 0xffff0000  # app/profiler + arch/arm irqmask.c: IRQ regions are IRQ_SITE | vector
 
 SPSR_T_BIT = 1 << 5  # Thumb state -- same bit app/profiler.c reads
@@ -90,6 +117,123 @@ def _fnv(values) -> int:
     for v in values:
         c = ((c ^ (v & 0xffffffff)) * 16777619) & 0xffffffff
     return c
+
+
+def read_lines(log_path) -> list[str]:
+    with open(log_path, "r", errors="replace") as f:
+        return f.readlines()
+
+
+def split_dumps(lines: list[str]) -> list[dict] | None:
+    """K2 dumps in a log, in order: each runs from a DUMPBEGIN line to the next
+    `SAMPLE done` (inclusive). A dump cut short by the next DUMPBEGIN or the end
+    of the log is kept but marked incomplete. None for a log with no DUMPBEGIN
+    at all (an older image's dump format)."""
+    starts = [i for i, line in enumerate(lines) if "DUMPBEGIN" in line]
+    if not starts:
+        return None
+    dumps = []
+    for n, start in enumerate(starts):
+        limit = starts[n + 1] if n + 1 < len(starts) else len(lines)
+        end = next((i for i in range(start, limit) if lines[i].strip() == "SAMPLE done"), None)
+        dumps.append({"lines": lines[start:(end + 1 if end is not None else limit)],
+                      "complete": end is not None})
+    return dumps
+
+
+def select_dump(lines: list[str], index: int = -1) -> tuple[list[str], dict]:
+    """The lines of one dump (default: the latest) and where it came from."""
+    dumps = split_dumps(lines)
+    if dumps is None:
+        return lines, {"legacy": True, "dumps": None, "index": None, "complete": None}
+    if not -len(dumps) <= index < len(dumps):
+        raise ValueError(f"log has {len(dumps)} dump(s); --dump {index} does not exist")
+    chosen = index % len(dumps)
+    return dumps[chosen]["lines"], {"legacy": False, "dumps": len(dumps), "index": chosen,
+                                    "complete": dumps[chosen]["complete"]}
+
+
+def parse_session(lines: list[str]) -> dict | None:
+    """K2 header, per-core lines and footer of one dump, checksum-verified.
+    None when the lines hold no DUMPBEGIN."""
+    header, cpus, footer, rejected = None, {}, None, 0
+    for line in lines:
+        if "DUMP" not in line:
+            continue
+        line = line.strip()
+        if m := DUMPBEGIN_RE.search(line):
+            v = {k: int(m[k], 16) for k in ("fmt", "run", "dump", "lo", "hi", "build", "modes",
+                                             "event", "period", "mixed", "cpus", "buf")}
+            words = [v["fmt"], v["run"], v["run"] >> 32, v["dump"], v["lo"], v["hi"],
+                     v["build"], v["modes"], v["event"], v["period"], v["mixed"], v["cpus"],
+                     v["buf"]]
+            if _fnv(words) != int(m["crc"], 16):
+                rejected += 1
+                continue
+            header = v
+        elif m := DUMPCPU_RE.search(line):
+            v = {k: int(m[k], 16) for k in ("total", "retained", "overwritten", "pmumissed")}
+            cpu = int(m["cpu"])
+            if _fnv([cpu, v["total"], v["retained"], v["overwritten"], v["pmumissed"]]) != \
+                    int(m["crc"], 16):
+                rejected += 1
+                continue
+            cpus[cpu] = v
+        elif m := DUMPEND_RE.search(line):
+            v = {k: int(m[k], 16) for k in ("run", "dump", "samples")}
+            if _fnv([v["run"], v["run"] >> 32, v["dump"], v["samples"]]) != int(m["crc"], 16):
+                rejected += 1
+                continue
+            footer = v
+        elif line.startswith("DUMP"):
+            rejected += 1
+    if header is None and footer is None and not cpus:
+        return None
+    problems = []
+    if header is None:
+        problems.append("dump header missing or damaged")
+    if footer is None:
+        problems.append("dump footer missing or damaged: trailing loss unknown")
+    if header and footer and (header["run"], header["dump"]) != (footer["run"], footer["dump"]):
+        problems.append("header and footer belong to different dumps")
+    if header and len(cpus) != header["cpus"]:
+        problems.append(f"{header['cpus'] - len(cpus)} per-core line(s) missing or damaged")
+    if footer and cpus and len(cpus) == (header or {}).get("cpus") and \
+            sum(c["retained"] for c in cpus.values()) != footer["samples"]:
+        problems.append("per-core retained counts do not add up to the footer count")
+    return {"header": header, "cpus": cpus, "footer": footer, "rejected": rejected,
+            "problems": problems}
+
+
+def image_hash(elf_path, lo: int, hi: int) -> int | None:
+    """FNV-1a over the ELF's loadable bytes in [lo, hi) -- the same bytes the
+    target hashes for DUMPBEGIN's build= field. None if the range is not
+    fully present in the file."""
+    from elftools.elf.elffile import ELFFile
+    data = bytearray()
+    with open(elf_path, "rb") as f:
+        for seg in ELFFile(f).iter_segments():
+            if seg["p_type"] != "PT_LOAD":
+                continue
+            va, size = seg["p_vaddr"], seg["p_filesz"]
+            a, b = max(lo, va), min(hi, va + size)
+            if a < b:
+                data += seg.data()[a - va:b - va]
+    if len(data) != hi - lo:
+        return None
+    h = 0x811c9dc5
+    for byte in data:
+        h = ((h ^ byte) * 16777619) & 0xffffffff
+    return h
+
+
+def check_build(elf_path, session: dict | None) -> tuple[bool | None, int | None]:
+    """(True/False, host hash) when the dump states its image; (None, None) if not."""
+    if not session or not session["header"]:
+        return None, None
+    h = session["header"]
+    host = image_hash(elf_path, h["lo"], h["hi"])
+    return host == h["build"], host
 
 
 def sample_extra(m: re.Match) -> tuple[int, ...] | None:
@@ -124,7 +268,7 @@ def _sample_checksum(cpu: int, seq: int, pc: int, lr: int, fp: int, sp: int,
     return c
 
 
-def parse_samples(log_path: str) -> list[dict]:
+def parse_samples(log_path: str, dump: int = -1) -> list[dict]:
     """Parses "SAMPLE ..." lines, verifying each one's seq/crc fields.
 
     Found on real hardware (2026-09-29): a sustained UART transfer of a
@@ -146,45 +290,45 @@ def parse_samples(log_path: str) -> list[dict]:
     expected_seq = 0
     crc_mismatches = 0
     seq_gaps = 0
-    with open(log_path, "r", errors="replace") as f:
-        for line in f:
-            m = SAMPLE_RE.search(line)
-            if not m:
-                continue
-            seq = int(m["seq"], 16)
-            if seq != expected_seq:
-                seq_gaps += max(seq - expected_seq, 1)
-            expected_seq = seq + 1
+    lines, _ = select_dump(read_lines(log_path), dump)
+    for line in lines:
+        m = SAMPLE_RE.search(line)
+        if not m:
+            continue
+        seq = int(m["seq"], 16)
+        if seq != expected_seq:
+            seq_gaps += max(seq - expected_seq, 1)
+        expected_seq = seq + 1
 
-            try:
-                stack = bytes.fromhex(m["stack"])
-            except ValueError:
-                crc_mismatches += 1
-                continue
+        try:
+            stack = bytes.fromhex(m["stack"])
+        except ValueError:
+            crc_mismatches += 1
+            continue
 
-            cpu, pc, lr = int(m["cpu"]), int(m["pc"], 16), int(m["lr"], 16)
-            fp, sp = int(m["fp"], 16), int(m["sp"], 16)
-            spsr, tid, ts = int(m["spsr"], 16), int(m["tid"], 16), int(m["ts"], 16)
-            extra = sample_extra(m)
-            expected_crc = _sample_checksum(cpu, seq, pc, lr, fp, sp, spsr, tid, ts, stack,
-                                             extra)
-            if int(m["crc"], 16) != expected_crc:
-                crc_mismatches += 1
-                continue
+        cpu, pc, lr = int(m["cpu"]), int(m["pc"], 16), int(m["lr"], 16)
+        fp, sp = int(m["fp"], 16), int(m["sp"], 16)
+        spsr, tid, ts = int(m["spsr"], 16), int(m["tid"], 16), int(m["ts"], 16)
+        extra = sample_extra(m)
+        expected_crc = _sample_checksum(cpu, seq, pc, lr, fp, sp, spsr, tid, ts, stack,
+                                         extra)
+        if int(m["crc"], 16) != expected_crc:
+            crc_mismatches += 1
+            continue
 
-            sample = {
-                "cpu": cpu, "pc": pc, "lr": lr, "fp": fp, "sp": sp,
-                "spsr": spsr, "tid": tid, "ts": ts, "stack": stack,
-                "src": None, "lat": None, "msite": None, "mgap": None, "slen": None,
-            }
-            if extra:
-                sample.update(src=m["src"], lat=extra[1], msite=extra[2], mgap=extra[3])
-                if len(extra) > 4:
-                    if extra[4] > len(stack):
-                        crc_mismatches += 1   # inconsistent record: not trusted
-                        continue
-                    sample["slen"] = extra[4]
-            samples.append(sample)
+        sample = {
+            "cpu": cpu, "pc": pc, "lr": lr, "fp": fp, "sp": sp,
+            "spsr": spsr, "tid": tid, "ts": ts, "stack": stack,
+            "src": None, "lat": None, "msite": None, "mgap": None, "slen": None,
+        }
+        if extra:
+            sample.update(src=m["src"], lat=extra[1], msite=extra[2], mgap=extra[3])
+            if len(extra) > 4:
+                if extra[4] > len(stack):
+                    crc_mismatches += 1   # inconsistent record: not trusted
+                    continue
+                sample["slen"] = extra[4]
+        samples.append(sample)
 
     if crc_mismatches or seq_gaps:
         print(f"warning: {crc_mismatches} sample(s) failed their checksum, "
@@ -193,51 +337,51 @@ def parse_samples(log_path: str) -> list[dict]:
     return samples
 
 
-def parse_mask(log_path: str) -> dict | None:
+def parse_mask(log_path: str, dump: int = -1) -> dict | None:
     """Parses K6 MASKINFO/MASKCPU/MASKSITE lines (checksum-verified, the
     same drop-and-count policy as samples). Returns None when the log has
     no masked-time accounting at all (older images)."""
     info, cpus, sites, rejected, nmi = None, {}, {}, 0, None
-    with open(log_path, "r", errors="replace") as f:
-        for line in f:
-            if "MASK" not in line:
-                continue
-            line = line.strip()
-            if m := MASKINFO_RE.search(line):
-                freq, on, now = int(m["freq"], 16), int(m["on"]), int(m["now"], 16)
-                if _fnv([freq, on, now, now >> 32]) != int(m["crc"], 16):
-                    rejected += 1
-                    continue
-                info = {"cntfrq": freq, "on": bool(on), "now": now}
-            elif m := MASKNMI_RE.search(line):
-                bits = int(m["cpus"], 16)
-                if _fnv([bits]) != int(m["crc"], 16):
-                    rejected += 1
-                    continue
-                nmi = bits
-            elif m := MASKCPU_RE.search(line):
-                v = {k: int(m[k], 16) for k in ("start", "masked", "regions", "irq",
-                                                 "irqregions", "max", "maxsite", "dropped",
-                                                 "droppedticks")}
-                cpu = int(m["cpu"])
-                words = [cpu, v["start"], v["start"] >> 32, v["masked"], v["masked"] >> 32,
-                         v["regions"], v["irq"], v["irq"] >> 32, v["irqregions"], v["max"],
-                         v["maxsite"], v["dropped"], v["droppedticks"], v["droppedticks"] >> 32]
-                if _fnv(words) != int(m["crc"], 16):
-                    rejected += 1
-                    continue
-                cpus[cpu] = v
-            elif m := MASKSITE_RE.search(line):
-                cpu = int(m["cpu"])
-                site, count = int(m["site"], 16), int(m["count"], 16)
-                ticks, mx = int(m["ticks"], 16), int(m["max"], 16)
-                if _fnv([cpu, site, count, ticks, ticks >> 32, mx]) != int(m["crc"], 16):
-                    rejected += 1
-                    continue
-                sites.setdefault(cpu, []).append({"site": site, "count": count,
-                                                   "ticks": ticks, "max": mx})
-            elif line.startswith("MASK"):
+    lines, _ = select_dump(read_lines(log_path), dump)
+    for line in lines:
+        if "MASK" not in line:
+            continue
+        line = line.strip()
+        if m := MASKINFO_RE.search(line):
+            freq, on, now = int(m["freq"], 16), int(m["on"]), int(m["now"], 16)
+            if _fnv([freq, on, now, now >> 32]) != int(m["crc"], 16):
                 rejected += 1
+                continue
+            info = {"cntfrq": freq, "on": bool(on), "now": now}
+        elif m := MASKNMI_RE.search(line):
+            bits = int(m["cpus"], 16)
+            if _fnv([bits]) != int(m["crc"], 16):
+                rejected += 1
+                continue
+            nmi = bits
+        elif m := MASKCPU_RE.search(line):
+            v = {k: int(m[k], 16) for k in ("start", "masked", "regions", "irq",
+                                             "irqregions", "max", "maxsite", "dropped",
+                                             "droppedticks")}
+            cpu = int(m["cpu"])
+            words = [cpu, v["start"], v["start"] >> 32, v["masked"], v["masked"] >> 32,
+                     v["regions"], v["irq"], v["irq"] >> 32, v["irqregions"], v["max"],
+                     v["maxsite"], v["dropped"], v["droppedticks"], v["droppedticks"] >> 32]
+            if _fnv(words) != int(m["crc"], 16):
+                rejected += 1
+                continue
+            cpus[cpu] = v
+        elif m := MASKSITE_RE.search(line):
+            cpu = int(m["cpu"])
+            site, count = int(m["site"], 16), int(m["count"], 16)
+            ticks, mx = int(m["ticks"], 16), int(m["max"], 16)
+            if _fnv([cpu, site, count, ticks, ticks >> 32, mx]) != int(m["crc"], 16):
+                rejected += 1
+                continue
+            sites.setdefault(cpu, []).append({"site": site, "count": count,
+                                               "ticks": ticks, "max": mx})
+        elif line.startswith("MASK"):
+            rejected += 1
     if info is None and not cpus:
         return None
     if rejected:
@@ -283,6 +427,35 @@ def site_name(elf_path: str, site: int) -> str:
     if site >= IRQ_SITE:
         return f"[irq handler, GIC ID {site & 0xffff}]"
     return symbolize(elf_path, [site])[0]
+
+
+def print_session(session: dict, where: dict, accepted: int, built: bool | None) -> None:
+    h, f = session["header"], session["footer"]
+    if h:
+        modes = "+".join(n for bit, n in ((MODE_TIMER, "timer"), (MODE_PMU, "pmu"))
+                         if h["modes"] & bit) or "none"
+        pmu = (f", PMU event 0x{h['event']:x} every {h['period']}"
+               f"{' (CONFIG CHANGED MID-SESSION)' if h['mixed'] else ''}"
+               if h["modes"] & MODE_PMU else "")
+        print(f"dump {where['index'] + 1} of {where['dumps']} in this log: run "
+              f"{h['run']:016x}, dump #{h['dump']} of that run; modes {modes}{pmu}; "
+              f"ELF {'matches' if built else 'DOES NOT MATCH'} the image "
+              f"({h['build']:08x})")
+    for cpu, c in sorted(session["cpus"].items()):
+        extra = f", {c['overwritten']} overwritten" if c["overwritten"] else ""
+        extra += f", {c['pmumissed']} PMU overflows lost while masked" if c["pmumissed"] else ""
+        print(f"  cpu{cpu}: {c['total']} taken, {c['retained']} retained{extra}")
+    if f:
+        lost = f["samples"] - accepted
+        print(f"records: {f['samples']} sent, {accepted} accepted"
+              f"{f', {lost} lost or rejected in transfer' if lost else ', none lost'}")
+    for problem in session["problems"]:
+        print(f"warning: {problem}", file=sys.stderr)
+    if where["dumps"] and where["dumps"] > 1:
+        print(f"note: the log holds {where['dumps']} dumps; reporting dump "
+              f"{where['index'] + 1}, the others are ignored (--dump N picks another)",
+              file=sys.stderr)
+    print()
 
 
 def print_mask_report(elf_path: str, samples: list[dict], mask: dict | None,
@@ -423,14 +596,36 @@ def main() -> None:
     ap.add_argument("--annotate", type=int, metavar="N",
                     help="disassemble the N hottest functions with per-instruction "
                          "sample counts (needs arm-none-eabi-objdump on PATH)")
+    ap.add_argument("--dump", type=int, default=-1,
+                    help="which dump of the log to report: 0 = first, -1 = latest (default)")
+    ap.add_argument("--allow-elf-mismatch", action="store_true",
+                    help="report even if the ELF does not match the captured image")
     ap.add_argument("--no-mask-frames", action="store_true",
                     help="do not add [irq-masked: ...] leaf frames to delayed samples "
                          "in --folded output")
     args = ap.parse_args()
 
-    samples = parse_samples(args.log)
+    all_lines = read_lines(args.log)
+    try:
+        dump_lines, where = select_dump(all_lines, args.dump)
+    except ValueError as error:
+        sys.exit(f"error: {error}")
+    session = parse_session(dump_lines)
+    if session:
+        built, host_hash = check_build(args.elf, session)
+        h = session["header"]
+        if built is False and not args.allow_elf_mismatch:
+            got = ("does not contain the whole image range "
+                   f"{h['lo']:08x}-{h['hi']:08x}" if host_hash is None
+                   else f"hashes to {host_hash:08x}")
+            sys.exit(f"error: {args.elf} does not match the captured image (image hash "
+                     f"{h['build']:08x}; the ELF {got}); use the ELF from the same build, "
+                     f"or --allow-elf-mismatch")
+    samples = parse_samples(args.log, args.dump)
     if not samples:
         sys.exit(f"error: no SAMPLE lines found in {args.log}")
+    if session:
+        print_session(session, where, len(samples), built)
 
     # Review finding #12, fixed: a single sample whose CFA rule needs a
     # register this sample didn't capture (only whichever of r7/r11
@@ -487,7 +682,7 @@ def main() -> None:
         suffix = f"  ({line})" if line else ""
         print(f"{count:>8}  {100 * count / total:5.1f}%  {name}{suffix}")
 
-    mask = parse_mask(args.log)
+    mask = parse_mask(args.log, args.dump)
     delay = None
     if any(s["src"] for s in samples):
         delay = classify_delays(samples, mask["info"]["cntfrq"]
