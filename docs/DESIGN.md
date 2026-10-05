@@ -1,5 +1,10 @@
 # Design: bare-metal statistical sampling profiler for LK, AArch32
 
+For a detailed source-based description of the current implementation,
+including capture lifecycle, PMU ownership, dump integrity, and report
+limitations, see [ARCHITECTURE.md](ARCHITECTURE.md). This document retains
+the original staged design rationale and development history.
+
 ## Goal
 
 A `perf`-style statistical sampling profiler for LK running in AArch32

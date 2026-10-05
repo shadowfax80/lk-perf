@@ -1,5 +1,15 @@
 # Raspberry Pi 4B bring-up plan
 
+**Architecture documentation (2026-10-05, Codex):**
+[ARCHITECTURE.md](ARCHITECTURE.md) describes the implementation at `5919f40`,
+with diagrams, source references, capture/dump contracts, and correctness
+boundaries. It reconciles earlier stage descriptions with current source,
+including all-core PMU sampling, counter-1 `stat`, the 6-Mbaud payload versus
+3-Mbaud host default, and the corrected Non-secure SVC target. This was a
+documentation-only change; no new build, capture, or hardware verification
+was performed. This file remains the hardware evidence and work-backlog
+record; the architecture document creates no separate TODO queue.
+
 Why this exists: `docs/DESIGN.md`'s Stage 5 (PMU-event-triggered sampling)
 was confirmed real-hardware-only on QEMU (no PMU IRQ route in the virt
 device tree, and PMU register access itself faults without a

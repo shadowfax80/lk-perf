@@ -7,6 +7,13 @@ LK workloads, developed and validated on real Raspberry Pi 4B hardware
 not for this project's hardware-validation work). See
 [docs/RPI4_BRINGUP.md](docs/RPI4_BRINGUP.md) for current status.
 
+For the current implementation's architecture, data formats, operational
+workflow, and correctness boundaries, see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The staged status and quick-start
+text below retain earlier milestones; the architecture document explicitly
+identifies current behavior, including the payload's 6,000,000-baud console
+and the host tools' required baud override.
+
 **Scope: a PoC for a real target platform's actual perf use case.**
 Stack unwinding uses DWARF CFI (`.debug_frame`), not ARM's own EXIDX --
 the target platform's shipped firmware carries no EXIDX (dropped from the production
