@@ -6,16 +6,15 @@ current work is the **Raspberry Pi 4B real-hardware track**.
 **docs/RPI4_BRINGUP.md is the source of truth for its state and plan:
 read its "Start here" section before doing anything on the Pi.**
 
-## Current task
+## Coordination with Codex (read first)
 
-Step 3 of docs/RPI4_BRINGUP.md: port LK to `TARGET=rpi4` (AArch32),
-milestones M1-M5 in that doc. Before porting on a new machine, prove the
-serial path works:
-
-    python scripts/pi4_doctor.py --no-pi
-    python scripts/pi4_doctor.py --boot-test   # user power-cycles the Pi when told
-
-Don't start porting work until `--boot-test` shows the heartbeat.
+Claude and Codex may work on this repo at the same time.
+**[docs/HANDOFF.md](docs/HANDOFF.md) is the single work queue and controls
+shared resources:** claim an item before working, hold the live-tree lock
+before touching the shared WSL checkout `/home/user/lk-perf` (otherwise work
+in `C:\Users\User\CURSOR\ClaudeProjects\lk-perf`), reserve the Pi in
+bolt-aarch32's HANDOFF before opening COM5, and add a handoff log entry
+before stopping.
 
 ## How the Pi is driven
 

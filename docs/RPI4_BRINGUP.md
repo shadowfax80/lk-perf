@@ -1,5 +1,8 @@
 # Raspberry Pi 4B bring-up plan
 
+> Work queue, ownership and status updates: [HANDOFF.md](HANDOFF.md). This
+> file is the hardware evidence record.
+
 **Hardware profile demo complete (2026-10-05, Codex):**
 [`profiler smp 400000000` demo](results/lk_perf_demo_20261005/README.md)
 captured PMU CPU-cycle samples (event 0x11, period 1000000) on all four Pi
@@ -862,6 +865,10 @@ deferred as should-fix, not must:
   exits 0 either way.
 
 ## Outstanding work, by priority (2026-09-28)
+
+> **Superseded as the live backlog (2026-10-05):** open items now live in
+> [HANDOFF.md](HANDOFF.md#claims-consolidated-todo) (IDs K1–K9). This section
+> is kept as the original review record.
 
 Everything below was surfaced by the code review and is tracked but
 not yet done, ordered by actual priority -- not the order it was
