@@ -80,7 +80,7 @@ snapshot, not a live guarantee.
 
 | Holder | Since | Purpose |
 |---|---|---|
-| — (free) | 2026-10-05 | Released by Claude after K4/K5/K7; shared checkout at the K7 commit, untracked `scripts/flamegraph.pl` (Codex) left in place |
+| Claude | 2026-10-05 | K8 (scheduling/frequency capture), K9 (small fixes) |
 
 ## Pi state (last release, copied from bolt-aarch32)
 
@@ -99,8 +99,8 @@ current source. *Owner* is empty until someone claims it.
 | Order | ID | Item | Priority | Owner | Status | Notes |
 |---|---|---|---|---|---|---|
 | 1 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Blocked | Feasibility done (Claude, K11): A72 implements `EDPCSR` and the CPU reaches every core's debug block, but the SoC disables non-invasive debug (`DBGAUTHSTATUS` 0xaa), so `EDPCSR` reads `ffffffff`. Untested lever: `enable_jtag_gpio=1` in `config.txt` (SD-card change, needs user approval). On the target: `profiler dbginfo`; [results](results/k11_edpcsr_feasibility_20261005/README.md) |
-| 2 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
-| 3 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim; `profiler mask` prints lines in fragments, which the USB-serial link loses (build whole lines as `stat` does) | P3 | — | Open | Fold into the next commit touching the same file |
+| 2 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | Claude | In progress | Documented limitation; needs target event instrumentation |
+| 3 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim; `profiler mask` prints lines in fragments, which the USB-serial link loses (build whole lines as `stat` does) | P3 | Claude | In progress | Fold into the next commit touching the same file |
 | 4 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
 
 ### Done (recent)
