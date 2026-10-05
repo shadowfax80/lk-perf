@@ -1,6 +1,6 @@
 # lk-perf architecture and design
 
-**Implementation baseline:** lk-perf commit `84c25a9` (2026-10-05), LK `88a8efae` plus overlays 0001–0015 (they also apply to upstream `fe5e5a00`). Hardware observations are attributed to [RPI4_BRINGUP.md](RPI4_BRINGUP.md) and the `docs/results/` records.
+**Implementation baseline:** lk-perf commit `84c25a9` (2026-10-05), LK `88a8efae` plus overlays 0001–0016 (they also apply to upstream `fe5e5a00`). Hardware observations are attributed to [RPI4_BRINGUP.md](RPI4_BRINGUP.md) and the `docs/results/` records.
 
 | Revision | Change described in this document |
 |---|---|
@@ -8,6 +8,7 @@
 | exporter | Timestamped perf-script export ([EXPORT.md](EXPORT.md), [verification](results/PERF_EXPORT_VERIFICATION.md)) |
 | `0f7f5e3` (K6) | IRQ-masked time accounting, delayed-sample attribution, delay-compensated PMU reload, console printing without IRQ masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
 | `84c25a9` (K12) | Opt-in pseudo-NMI sampling by GIC priority masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
+| K14 | Masking-site capture without reading the PC as data, so BOLT can relocate the kernel (overlay 0016, [§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
 | K13 | Image hash over gaps between load segments ([§7.3](#73-sample-text-format)) |
 | K8 | Scheduler events: context switches, wakeups (with reason and wait queue), thread names, ARM clock and throttling; report and Perfetto systrace export ([§4.8](#48-scheduler-events)) |
 | K9 | Small fixes: one write per dump record, `pmu` message, function-start line lookup, design-doc and README corrections ([§8.4](#84-symbol-and-source-mapping)) |
@@ -287,7 +288,7 @@ flowchart TB
     Acc --- NMI
 ```
 
-**1. Accounting** (overlay 0012, LK `arch/arm/arm/irqmask.c`). A region opens on every real unmasked-to-masked transition in `arch_disable_ints()`, at the PC of that call. An IRQ-handler region opens at the GIC entry, with site `0xffff0000 | GIC ID`. The region closes at the next `arch_enable_ints()` or at the IRQ exit, whichever comes first; after a context switch inside an IRQ, the resumed thread's unlock is what ends the span. Regions are exclusive per core, because a new one can only open while unmasked, so one active slot per core suffices. Time is `CNTPCT`, the architected system counter: same rate and phase on every core, and independent of the PMU that `stat` and `pmustart` reprogram. Per core: window start, masked and IRQ-handler ticks, region counts, the longest region and its site, and a 64-entry open-addressed site table whose overflow is counted, never merged. `profiler maskon` resets the window on every core via IPI; `start` and `pmustart` turn it on if off; `dump` freezes it (accounting off, IPI barrier, snapshot) before printing, so the dump's own output is not counted. When off, the inline hooks cost a load and a branch.
+**1. Accounting** (overlay 0012, LK `arch/arm/arm/irqmask.c`). A region opens on every real unmasked-to-masked transition in `arch_disable_ints()`, at the PC of that call. Since K14 the site is the return address of the out-of-line `arm_irqmask_begin_here()`; the inline `mov rX, pc` it replaces read the PC as data in every function that inlines `arch_disable_ints()`, and a binary rewriter must refuse such code (BOLT refused 44 LK kernel functions). An IRQ-handler region opens at the GIC entry, with site `0xffff0000 | GIC ID`. The region closes at the next `arch_enable_ints()` or at the IRQ exit, whichever comes first; after a context switch inside an IRQ, the resumed thread's unlock is what ends the span. Regions are exclusive per core, because a new one can only open while unmasked, so one active slot per core suffices. Time is `CNTPCT`, the architected system counter: same rate and phase on every core, and independent of the PMU that `stat` and `pmustart` reprogram. Per core: window start, masked and IRQ-handler ticks, region counts, the longest region and its site, and a 64-entry open-addressed site table whose overflow is counted, never merged. `profiler maskon` resets the window on every core via IPI; `start` and `pmustart` turn it on if off; `dump` freezes it (accounting off, IPI barrier, snapshot) before printing, so the dump's own output is not counted. When off, the inline hooks cost a load and a branch.
 
 **2. Attribution.** Each core tracks the *cause* of the code now running: when a region closes, it becomes the cause, unless it is an IRQ region that began within 2 µs of the previous cause's end. Interrupts held by a masked region are taken back to back at its unmask, so a sample queued behind the timer handler still names the code that masked. The sampler records `lat`, `msite` (the cause) and `mgap`. The host marks a sample as delayed when `lat` exceeds four times the 5th-percentile latency for its source. It uses a low percentile because, when masking dominates, the median is itself a delay. A delayed sample is attributed when `mgap` is within 2 µs, and the folded output gets an `[irq-masked: <site>]` leaf frame. The report also prints masked time per core and the top masking sites.
 
@@ -818,6 +819,7 @@ Avoid turning a raw LR guess, a checksum-valid dump, or a plausible FlameGraph i
 | [0013](../overlay/lk/0013-console-print-without-irq-masking.patch) | Thread-context printing on a mutex instead of an IRQ-masking spinlock (supersedes 0005's masking) |
 | [0014](../overlay/lk/0014-gic-priority-pseudo-nmi.patch) | Opt-in pseudo-NMI: priority masking in the hooks, IRQ-path mask save/restore |
 | [0015](../overlay/lk/0015-sched-trace-hooks.patch) | Scheduler event hooks (K8) in `kernel/thread.c` |
+| [0016](../overlay/lk/0016-bolt-safe-irqmask-site.patch) | Masking site from a return address, not a PC read (K14) |
 | [pi4_serial_boot.py](../scripts/pi4_serial_boot.py) | Loader transport, baud switch, reboot helper, terminal/logging |
 | [pi4_run.py](../scripts/pi4_run.py) | Prompt-driven ordered shell commands |
 | [pi4_pc_histogram.py](../scripts/pi4_pc_histogram.py) | Text parser/integrity checks, snapshot reader, reporting, folded output, annotation |

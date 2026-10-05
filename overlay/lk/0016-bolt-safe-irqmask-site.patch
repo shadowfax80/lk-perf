@@ -1,0 +1,56 @@
+--- a/arch/arm/include/arch/arch_interrupts.h
++++ b/arch/arm/include/arch/arch_interrupts.h
+@@ -64,6 +64,11 @@
+ extern volatile uint32_t arm_irqmask_on;
+ extern struct arm_irqmask_cpu arm_irqmask_cpu[];
+ void arm_irqmask_begin(uint32_t site);
++/* lk-perf K14: open a region at the caller's own location (its return
++ * address). The inline `mov rX, pc` this replaces read the PC as data, which
++ * makes every function that inlines arch_disable_ints() position-dependent:
++ * BOLT (and any other code mover) has to refuse it. */
++void arm_irqmask_begin_here(void);
+ void arm_irqmask_end(void);
+ void arm_irqmask_irq_enter(unsigned int vector);
+ void arm_irqmask_irq_exit(void);
+@@ -140,22 +145,16 @@
+                 *arm_nmi_pmr = ARM_NMI_PMR_MASKED;
+                 arm_nmi_masked[cpu] = 1;
+             }
+-            if (arm_irqmask_on && opened) {
+-                uint32_t site;
+-                __asm__ volatile("mov %0, pc" : "=r"(site));
+-                arm_irqmask_begin(site);
+-            }
++            if (arm_irqmask_on && opened)
++                arm_irqmask_begin_here();
+             CF;
+             __asm__ volatile("cpsie i");
+             return;
+         }
+     }
+     /* open a region only on a real unmasked -> masked transition */
+-    if (arm_irqmask_on && opened) {
+-        uint32_t site;
+-        __asm__ volatile("mov %0, pc" : "=r"(site));
+-        arm_irqmask_begin(site);
+-    }
++    if (arm_irqmask_on && opened)
++        arm_irqmask_begin_here();
+ }
+ 
+ static inline bool arch_ints_disabled(void) {
+--- a/arch/arm/arm/irqmask.c
++++ b/arch/arm/arm/irqmask.c
+@@ -116,6 +116,12 @@
+     c->active = 1;
+ }
+ 
++/* K14: the site is the instruction after the call, inside the function that
++ * masked; bit 0 (Thumb) cleared, as the old PC read gave a plain address. */
++__NO_INLINE void arm_irqmask_begin_here(void) {
++    arm_irqmask_begin((uint32_t)(uintptr_t)__builtin_return_address(0) & ~1u);
++}
++
+ void arm_irqmask_end(void) {
+     struct arm_irqmask_cpu *c = &arm_irqmask_cpu[arch_curr_cpu_num()];
+     if (c->active)
