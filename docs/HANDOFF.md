@@ -80,7 +80,7 @@ snapshot, not a live guarantee.
 
 | Holder | Since | Purpose |
 |---|---|---|
-| — (free) | 2026-10-05 | Created by Claude with this handoff scheme. Last observed: shared checkout clean at the published demo commits, untracked `scripts/flamegraph.pl` present |
+| Claude | 2026-10-05 | K6 (IRQ-masked accounting): edits, LK build and setup.sh in the shared checkout |
 
 ## Pi state (last release, copied from bolt-aarch32)
 
@@ -103,7 +103,7 @@ current source. *Owner* is empty until someone claims it.
 | 3 | K3 | No-CFI fallback: use the raw LR as the caller when hand-written assembly has no `.debug_frame` | P1 | — | Open | Finding #13; callers of memcpy/memset/spinlocks are undercounted |
 | 4 | K4 | `profiler stat` counts its own `printf` output (counters start before the status prints) | P2 | — | Open | Finding #10; confirmed still present in `profiler.c` |
 | 5 | K5 | `setup.sh` re-run fails on a file left by overlay patch 0004 (`gic.h`) | P2 | — | Open | Finding #14; scoped clean of that one path before the reset |
-| 6 | K6 | Masked-cycles counter: report time spent with IRQs masked next to every `stat`/`dump` | P2 | — | Open | Quantifies the IRQ-masked blind spot (RPI4_BRINGUP position item 3) |
+| 6 | K6 | IRQ-masked blind spot, route 1: per-core masked-cycle accounting with masking sites; tag samples delayed by masking and attribute them to the masked region; shorten lk-perf's own masked console printing | P1 | Claude | In progress | User request 2026-10-05 (raised to P1). Routes 2 (cross-core PC sampling via debug registers) and 3 (priority-mask pseudo-NMI) not started |
 | 7 | K7 | Full `profiler stat`: any command, all 6 counters, derived IPC | P3 | — | Open | Review Phase 3 item 3 |
 | 8 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
 | 9 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim | P3 | — | Open | Fold into the next commit touching the same file |
