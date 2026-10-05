@@ -1,0 +1,34 @@
+800 samples across 4 cpu(s): {0: 200, 1: 200, 2: 200, 3: 200}
+4 distinct thread(s) sampled (by thread_t* -- see profiler.c)
+unwind depth histogram (frames per sample): {4: 800}
+
+   count       %  leaf function (source line)
+     800  100.0%  profiler_workload_inner  (profiler.c:696)
+
+IRQ-masked time (invisible to IRQ sampling), accounting on at dump time:
+  cpu0:  0.10% masked (0.10% in IRQ handlers), 267 regions, longest 21.6 us at [irq handler, GIC ID 153]
+  cpu1:  0.07% masked (0.06% in IRQ handlers), 289 regions, longest 5.7 us at thread_exit
+  cpu2:  0.08% masked (0.07% in IRQ handlers), 362 regions, longest 4.8 us at [irq handler, GIC ID 15]
+  cpu3:  0.08% masked (0.06% in IRQ handlers), 381 regions, longest 4.6 us at thread_exit
+
+  % of time   regions     longest  masking site
+     0.020%       132       2.7us  [irq handler, GIC ID 30]
+     0.012%        21      21.6us  [irq handler, GIC ID 153]
+     0.009%       200       2.5us  [irq handler, GIC ID 50]
+     0.008%        33       5.9us  [irq handler, GIC ID 15]
+     0.007%       200       1.8us  [irq handler, GIC ID 51]
+     0.007%       200       1.8us  [irq handler, GIC ID 49]
+     0.007%       200       1.2us  [irq handler, GIC ID 48]
+     0.004%       101       2.3us  event_wait_timeout
+     0.004%       101       1.3us  cbuf_read_char
+     0.001%        41       3.6us  mutex_acquire_timeout
+     0.001%         4       5.7us  thread_exit
+     0.001%        41       2.2us  mutex_release
+     0.001%         4       4.2us  thread_yield
+     0.001%         6       2.9us  [irq handler, GIC ID 14]
+     0.000%         4       2.5us  thread_join
+
+Samples delayed by IRQ masking (taken late, so the PC is the unmask point):
+  PMU, events: 0/800 delayed (threshold 1636), 0 attributed to the region that held them
+
+wrote t10_nmi_smp.folded -- render with: perl scripts/flamegraph.pl t10_nmi_smp.folded > flame.svg

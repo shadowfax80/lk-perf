@@ -36,8 +36,9 @@ SQL analysis, and an offline replay with the matching image/ELF.
 incomplete captured context, and execution while IRQs are masked is invisible
 to both sampling modes. `profiler maskon` / `profiler mask` measure that
 masked time per core and per masking site, and the report attributes delayed
-samples to the region that held them (see ARCHITECTURE.md §11.1); the masked
-execution itself is still not sampled.
+samples to the region that held them; with `profiler nmion` (pseudo-NMI, GIC
+priority masking) PMU samples also reach masked thread code directly. IRQ
+handlers and timer-mode samples remain blind (see ARCHITECTURE.md §11.1).
 Scheduling, wakeups, blocking reasons/durations, and CPU-frequency history
 are also absent from capture; analyzing them requires additional event
 instrumentation rather than stack samples alone.

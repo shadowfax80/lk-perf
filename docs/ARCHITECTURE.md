@@ -358,7 +358,9 @@ covers the extra fields only when they are present).
 
 Before `SAMPLE done`, images with K6 also print the masked-time accounting
 (§11.1), frozen at the start of the dump, each line with its own checksum:
-`MASKINFO cntfrq=<hex> on=<0|1> now=<hex> crc=<hex>`, one
+`MASKINFO cntfrq=<hex> on=<0|1> now=<hex> crc=<hex>`, (K12) one
+`MASKNMI cpus=<hex bitmask> crc=<hex>` naming the cores masking by GIC
+priority at dump time, one
 `MASKCPU cpu=<n> start=… masked=… regions=… irq=… irqregions=… max=… maxsite=… dropped=… droppedticks=… crc=…`
 per core, and one `MASKSITE cpu=<n> site=… count=… ticks=… max=… crc=…` per
 recorded masking site. All durations are CNTPCT ticks at `cntfrq`.
@@ -485,6 +487,7 @@ Timer samples approximate where execution is observed at scheduler timer interru
 | `profiler dump` | None | Export retained records in CPU/slot order, then the masked-time accounting, and print `SAMPLE done`; ends the accounting window (turns it off) so the dump's own output is not counted; no automatic sampler freeze |
 | `profiler maskon` / `maskoff` | None | Start a fresh IRQ-masked time accounting window on every core / stop it, keeping totals. `start` and `pmustart` turn it on if it is off; `clear` restarts the window |
 | `profiler mask` | None | Per-core masked share, IRQ-handler share, region count, longest region and its site, and the top five masking sites |
+| `profiler nmion` / `nmioff` | None | Switch every core to masking by GIC priority (pseudo-NMI, PMU samples reach masked code) / back to CPSR.I. `nmion` programs priorities and refuses to enable if they do not read back; `status` shows the mode per core |
 | `profiler masktest [loops] [us]` | 2000, 500 | Ground-truth workload: alternate `us` microseconds with IRQs masked and `us` unmasked, so half the time is masked by construction |
 | `profiler bench [iters]` | 20000000 iterations per function | Alternate two arithmetic leaf workloads four times; does not start sampling |
 | `profiler nest [iters]` | 20000000 | Nested workload; optimization can eliminate wrapper frames via tail calls |
@@ -555,7 +558,9 @@ Both sampling sources are ordinary IRQs. While CPSR.I is set, they cannot interr
 - **Unbiased PMU sampling.** The overflow handler now credits the events counted while the interrupt was pending towards the next period, so delayed samples no longer shift the sampling grid; whole periods inside one masked span are counted as `pmu_missed`. Before this, the grid phase-locked to masking: a 50% masked ground-truth test put 999 of 1000 samples at the unmask point; now 48.2%.
 - **Console printing no longer masks IRQs** (overlay `0013`). Thread-context prints serialise on a mutex; only prints from IRQ handlers, from already-masked code or from idle threads keep the IRQ-masking spinlock. On the Pi this removed masked spans of up to 350 us per printed line.
 
-Hardware results are in [results/k6_irqmask_20261005](results/k6_irqmask_20261005/README.md). Remaining limits: timer-mode sampling still phase-locks to masking, because LK re-arms its scheduler tick from the time the tick is handled (65% vs 50% in the ground-truth test); use PMU mode for unbiased shares, and the accounting totals for the masked share itself. Attribution names the masking region, not the instruction inside it; per-site detail is limited to 64 sites per core; the hooks add a few CNTPCT reads to every masked region.
+- **Pseudo-NMI sampling, opt-in** (K12, overlay `0014`, `profiler nmion`). Thread-context masking raises the GIC CPU interface priority mask (`GICC_PMR`) instead of setting CPSR.I. Normal interrupts stay blocked, so critical sections keep their meaning. The PMU SPIs get the highest Non-secure priority and still interrupt masked code, so PMU samples land at the real masked PC with full stacks: 50.5% inside the masked half of the ground-truth test, 0 delayed. Safety rules: every read or change of a core's mask state runs with CPSR.I briefly set (no migration in between); the IRQ path saves the interrupted context's mask state on the thread's stack and restores it at exception return; a normal interrupt racing the mask write reads as spurious at the GIC and stays pending; the PMU handler never reschedules, locks or prints. IRQ handlers stay unsampled (exception entry still sets CPSR.I), and timer-mode sampling is unchanged. On GICv2 each mask change is a memory-mapped write; a GICv3 target would use `ICC_PMR`.
+
+Hardware results are in [results/k6_irqmask_20261005](results/k6_irqmask_20261005/README.md) and [results/k12_pseudo_nmi_20261005](results/k12_pseudo_nmi_20261005/README.md). Remaining limits: timer-mode sampling still phase-locks to masking, because LK re-arms its scheduler tick from the time the tick is handled (65% vs 50% in the ground-truth test); use PMU mode for unbiased shares, and the accounting totals for the masked share itself. Attribution names the masking region, not the instruction inside it; per-site detail is limited to 64 sites per core; the hooks add a few CNTPCT reads to every masked region.
 
 ### 11.2 Limitations by failure class
 

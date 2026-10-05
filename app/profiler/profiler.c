@@ -357,6 +357,110 @@ static void profiler_pmu_arm_this_cpu(void *context) {
     pmu_write_pmcr(pmcr | (1u << 0));
 }
 
+// K12 (route 3): pseudo-NMI sampling. GIC priorities are Non-secure view
+// values: the GIC-400 keeps 5 priority bits and a Non-secure write of v
+// stores (v >> 1) | 0x80, so the Non-secure range has 16 levels in steps of
+// 0x10, and an interrupt is signalled only if its priority is below the
+// priority mask. PMU SPIs get the highest Non-secure priority; everything
+// else gets ARM_NMI_PMR_MASKED, which the raised mask (also
+// ARM_NMI_PMR_MASKED) blocks and the open mask (0xff) admits.
+#define PROFILER_NMI_PRIO_PMU 0x00u
+#define PROFILER_NMI_PRIO_NORMAL ARM_NMI_PMR_MASKED
+#define PROFILER_GICD_IPRIORITY(irq) \
+    ((volatile uint8_t *)(PROFILER_PMU_GICD_VIRT + 0x400 + (irq)))
+#define PROFILER_GICC_PMR ((volatile uint32_t *)(BCM_GIC_BASE_VIRT + 0x2000 + 0x4))
+#define PROFILER_GICD_ISENABLER(n) \
+    ((volatile uint32_t *)(PROFILER_PMU_GICD_VIRT + 0x100 + 4 * (n)))
+// The Non-secure view of this GIC-400 keeps 4 priority-mask bits: an open
+// mask written as 0xff reads back as 0xf0.
+#define PROFILER_NMI_PMR_BITS 0xf0u
+
+// A priority has to read back only for interrupts that can reach LK.
+// Unimplemented IDs (GIC-400 PPIs 16-24) and Secure-only ones read as zero
+// and ignore writes; they are also never enabled in the Non-secure view.
+static bool profiler_nmi_prio_ok(unsigned int irq, uint8_t want) {
+    if (*PROFILER_GICD_IPRIORITY(irq) == want)
+        return true;
+    return !(*PROFILER_GICD_ISENABLER(irq / 32) & (1u << (irq % 32)));
+}
+
+static uint8_t profiler_nmi_prio_for(unsigned int irq) {
+    return (irq >= PROFILER_PMU_SPI_BASE && irq < PROFILER_PMU_SPI_BASE + 4)
+               ? PROFILER_NMI_PRIO_PMU : PROFILER_NMI_PRIO_NORMAL;
+}
+
+struct profiler_nmi_ctx {
+    volatile uint32_t ok[SMP_MAX_CPUS];
+    volatile uint32_t bad_irq[SMP_MAX_CPUS];   // first banked IRQ that did not read back, or 32
+    volatile uint32_t bad_prio[SMP_MAX_CPUS];
+    volatile uint32_t pmr[SMP_MAX_CPUS];       // PMR read back after opening
+};
+
+// Runs in an IPI on every core (CPSR.I set, core not masked by priority).
+static void profiler_nmi_on_this_cpu(void *context) {
+    struct profiler_nmi_ctx *ctx = (struct profiler_nmi_ctx *)context;
+    uint cpu = arch_curr_cpu_num();
+    bool ok = true;
+    ctx->bad_irq[cpu] = 32;
+    // SGIs and PPIs (0-31) have banked priorities: program them per core.
+    for (unsigned int irq = 0; irq < 32; irq++) {
+        *PROFILER_GICD_IPRIORITY(irq) = PROFILER_NMI_PRIO_NORMAL;
+        if (!profiler_nmi_prio_ok(irq, PROFILER_NMI_PRIO_NORMAL) && ctx->bad_irq[cpu] == 32) {
+            ctx->bad_irq[cpu] = irq;
+            ctx->bad_prio[cpu] = *PROFILER_GICD_IPRIORITY(irq);
+            ok = false;
+        }
+    }
+    *PROFILER_GICC_PMR = ARM_NMI_PMR_OPEN;
+    ctx->pmr[cpu] = *PROFILER_GICC_PMR & 0xff;
+    ok = ok && ctx->pmr[cpu] == (ARM_NMI_PMR_OPEN & PROFILER_NMI_PMR_BITS);
+    ctx->ok[cpu] = ok;
+    if (ok) {
+        arm_nmi_masked[cpu] = 0;
+        arm_nmi_mode[cpu] = 1;
+    }
+}
+
+static void profiler_nmi_off_this_cpu(void *context) {
+    (void)context;
+    uint cpu = arch_curr_cpu_num();
+    arm_nmi_mode[cpu] = 0;
+    arm_nmi_masked[cpu] = 0;
+    *PROFILER_GICC_PMR = ARM_NMI_PMR_OPEN;
+}
+
+static bool profiler_nmi_enable(void) {
+    // Shared SPIs once; read back so a priority write the GIC ignored
+    // (e.g. a Group 0 interrupt) refuses the mode instead of silently
+    // leaving it unmaskable.
+    for (unsigned int irq = 32; irq < MAX_INT; irq++)
+        *PROFILER_GICD_IPRIORITY(irq) = profiler_nmi_prio_for(irq);
+    for (unsigned int irq = 32; irq < MAX_INT; irq++) {
+        if (!profiler_nmi_prio_ok(irq, profiler_nmi_prio_for(irq))) {
+            printf("nmi: priority of IRQ %u reads back 0x%02x, expected 0x%02x -- not enabled\n",
+                   irq, *PROFILER_GICD_IPRIORITY(irq), profiler_nmi_prio_for(irq));
+            return false;
+        }
+    }
+    arm_nmi_pmr = PROFILER_GICC_PMR;
+    arm_nmi_any = 1;
+    struct profiler_nmi_ctx ctx = { { 0 } };
+    mp_sync_exec(MP_IPI_TARGET_ALL, 0, profiler_nmi_on_this_cpu, &ctx);
+    bool all = true;
+    for (int c = 0; c < SMP_MAX_CPUS; c++)
+        all = all && ctx.ok[c];
+    if (!all) {
+        mp_sync_exec(MP_IPI_TARGET_ALL, 0, profiler_nmi_off_this_cpu, NULL);
+        arm_nmi_any = 0;
+        for (int c = 0; c < SMP_MAX_CPUS; c++)
+            printf("nmi: cpu%d banked IRQ %u reads 0x%02x, PMR reads 0x%02x\n", c,
+                   ctx.bad_irq[c], ctx.bad_prio[c], ctx.pmr[c]);
+        printf("nmi: per-core priority/PMR setup did not read back -- not enabled\n");
+        return false;
+    }
+    return true;
+}
+
 static void profiler_pmu_disarm_this_cpu(void *context) {
     (void)context;
     uint cpu = arch_curr_cpu_num();
@@ -862,7 +966,7 @@ static void profiler_mask_print(void) {
 
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
-        printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|edgetest|stat|pmustart|pmustop|pmu|maskon|maskoff|mask|masktest>\n");
+        printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|edgetest|stat|pmustart|pmustop|pmu|maskon|maskoff|mask|masktest|nmion|nmioff>\n");
         return -1;
     }
 
@@ -877,6 +981,22 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         printf("mask: IRQ-masked time accounting off (totals kept)\n");
     } else if (!strcmp(sub, "mask")) {
         profiler_mask_print();
+    } else if (!strcmp(sub, "nmion")) {
+#if BCM2711
+        if (profiler_nmi_enable())
+            printf("nmi: pseudo-NMI on all %d cores: masked code is masked by GIC priority, "
+                   "PMU sampling still reaches it (IRQ handlers stay unsampled)\n", SMP_MAX_CPUS);
+#else
+        printf("nmi: needs real hardware (BCM2711)\n");
+#endif
+    } else if (!strcmp(sub, "nmioff")) {
+#if BCM2711
+        mp_sync_exec(MP_IPI_TARGET_ALL, 0, profiler_nmi_off_this_cpu, NULL);
+        arm_nmi_any = 0;
+        printf("nmi: off; masking uses CPSR.I again (GIC priorities left as set)\n");
+#else
+        printf("nmi: needs real hardware (BCM2711)\n");
+#endif
     } else if (!strcmp(sub, "masktest")) {
         uint32_t loops = argc >= 3 ? (uint32_t)argv[2].u : 2000;
         uint32_t us = argc >= 4 ? (uint32_t)argv[3].u : 500;
@@ -1005,6 +1125,13 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
             0x811c9dc5u, freq), mask_was_on), (uint32_t)now), (uint32_t)(now >> 32));
         printf("MASKINFO cntfrq=%08x on=%u now=%016llx crc=%08x\n", freq, mask_was_on,
                (unsigned long long)now, ic);
+        // K12: cores masking by GIC priority at dump time (bit n = cpu n);
+        // PMU samples reach their masked code, timer samples do not.
+        uint32_t nmi_cpus = 0;
+        for (int c = 0; c < SMP_MAX_CPUS; c++)
+            nmi_cpus |= (arm_nmi_mode[c] ? 1u : 0u) << c;
+        printf("MASKNMI cpus=%08x crc=%08x\n", nmi_cpus,
+               profiler_fnv(0x811c9dc5u, nmi_cpus));
         for (int c = 0; c < SMP_MAX_CPUS; c++) {
             const struct arm_irqmask_cpu *m = &mask_snap[c];
             uint32_t k = 0x811c9dc5u;
@@ -1268,6 +1395,10 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         }
         printf("profiler: enabled=%u total_samples(all cpus)=%u capacity=%d/core\n",
                profiler_enabled, total, PROFILER_BUF_SIZE);
+        printf("profiler: masking mode %s (per core:", arm_nmi_any ? "pseudo-NMI" : "CPSR.I");
+        for (int c = 0; c < SMP_MAX_CPUS; c++)
+            printf(" %u", arm_nmi_mode[c]);
+        printf(")\n");
     } else {
         printf("unknown subcommand '%s'\n", sub);
         return -1;

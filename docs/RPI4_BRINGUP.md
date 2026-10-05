@@ -3,6 +3,15 @@
 > Work queue, ownership and status updates: [HANDOFF.md](HANDOFF.md). This
 > file is the hardware evidence record.
 
+**Pseudo-NMI sampling, K12 (2026-10-05, Claude):** with `profiler nmion`,
+LK masks thread code by GIC priority and the PMU interrupts outrank it. In the
+ground-truth test, 50.5% of PMU samples landed inside the masked code itself
+(0 delayed), against 0% in the default mode. Stress and a 6-minute soak with
+both samplers and repeated mode switching ran clean (944,589 samples). Two
+GIC-400 facts found on the way: the Non-secure priority mask keeps 4 bits,
+and PPI IDs 16–24 are not implemented. Details:
+[results/k12_pseudo_nmi_20261005](results/k12_pseudo_nmi_20261005/README.md).
+
 **IRQ-masked time accounting, K6 (2026-10-05, Claude):** the profiler now
 measures the blind spot it cannot sample. On the Pi, the K6 ground-truth test
 (`profiler masktest`, 50% masked by construction) reported 49.6% masked time

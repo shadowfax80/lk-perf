@@ -1,0 +1,187 @@
+--- a/arch/arm/include/arch/arch_interrupts.h
++++ b/arch/arm/include/arch/arch_interrupts.h
+@@ -70,11 +70,58 @@
+ void arm_irqmask_reset_this_cpu(uint64_t window_start);
+ uint64_t arm_irqmask_now(void);
+ 
++/* lk-perf K12: optional masking by GIC priority ("pseudo-NMI").
++ *
++ * In this mode, thread-context masking raises the GIC CPU interface
++ * priority mask (GICC_PMR) instead of setting CPSR.I. Interrupts at
++ * normal priority stay blocked, so LK's critical sections keep their
++ * meaning, but higher-priority interrupts -- the PMU sampling SPIs --
++ * still arrive inside masked code and sample its real PC. Exception
++ * entry still sets CPSR.I, so interrupt handlers themselves stay
++ * unsampled. Off by default and switched per core from an IPI, which is
++ * only taken while that core is unmasked.
++ *
++ * Every read or change of a core's PMR state runs with CPSR.I set, so a
++ * thread cannot migrate between reading its core number and using that
++ * core's state. The IRQ exception path saves the interrupted context's
++ * state on the thread's own stack and restores it before returning
++ * (arm_nmi_irq_enter/exit), as the hardware does for CPSR.I. A normal
++ * interrupt racing with the PMR write reads as spurious at the GIC and
++ * stays pending. Interrupt handlers that may run in masked code (the PMU
++ * sampler) must not reschedule, take locks or print. */
++#define ARM_NMI_PMR_MASKED 0x80u /* Non-secure view; blocks normal priority */
++#define ARM_NMI_PMR_OPEN 0xffu
++extern volatile uint32_t *arm_nmi_pmr;
++extern volatile uint32_t arm_nmi_any;
++extern volatile uint32_t arm_nmi_mode[];
++extern volatile uint32_t arm_nmi_masked[];
++uint32_t arm_nmi_irq_enter(void);
++void arm_nmi_irq_exit(uint32_t saved);
++
++static inline uint32_t arm_nmi_cpu(void) {
++#if WITH_SMP
++    uint32_t mpidr;
++    __asm__ volatile("mrc p15, 0, %0, c0, c0, 5" : "=r"(mpidr));
++    return ((mpidr & ((1U << SMP_CPU_ID_BITS) - 1)) >> 8 << SMP_CPU_CLUSTER_SHIFT) |
++           (mpidr & 0xff);
++#else
++    return 0;
++#endif
++}
++
+ static inline void arch_enable_ints(void) {
+     CF;
+     /* close the masked region while still masked */
+     if (arm_irqmask_on)
+         arm_irqmask_end();
++    if (arm_nmi_any) {
++        __asm__ volatile("cpsid i");
++        uint32_t cpu = arm_nmi_cpu();
++        if (arm_nmi_masked[cpu]) {
++            arm_nmi_masked[cpu] = 0;
++            *arm_nmi_pmr = ARM_NMI_PMR_OPEN;
++        }
++    }
+     __asm__ volatile("cpsie i");
+ }
+ 
+@@ -83,8 +130,28 @@
+     __asm__ volatile("mrs %0, cpsr" : "=r"(prev));
+     __asm__ volatile("cpsid i");
+     CF;
++    bool opened = !(prev & (1u << 7));
++    if (arm_nmi_any && opened) {
++        uint32_t cpu = arm_nmi_cpu();
++        if (arm_nmi_mode[cpu]) {
++            /* mask by priority, then let CPSR.I go again */
++            opened = !arm_nmi_masked[cpu];
++            if (opened) {
++                *arm_nmi_pmr = ARM_NMI_PMR_MASKED;
++                arm_nmi_masked[cpu] = 1;
++            }
++            if (arm_irqmask_on && opened) {
++                uint32_t site;
++                __asm__ volatile("mov %0, pc" : "=r"(site));
++                arm_irqmask_begin(site);
++            }
++            CF;
++            __asm__ volatile("cpsie i");
++            return;
++        }
++    }
+     /* open a region only on a real unmasked -> masked transition */
+-    if (arm_irqmask_on && !(prev & (1u << 7))) {
++    if (arm_irqmask_on && opened) {
+         uint32_t site;
+         __asm__ volatile("mov %0, pc" : "=r"(site));
+         arm_irqmask_begin(site);
+@@ -100,6 +167,12 @@
+ #else
+     __asm__ volatile("mrs %0, cpsr" : "=r"(state));
+     state &= (1<<7);
++    if (!state && arm_nmi_any) {
++        /* masked by priority? read this core's state without migrating */
++        __asm__ volatile("cpsid i");
++        state = arm_nmi_masked[arm_nmi_cpu()];
++        __asm__ volatile("cpsie i");
++    }
+ #endif
+ 
+     return !!state;
+--- a/arch/arm/arm/irqmask.c
++++ b/arch/arm/arm/irqmask.c
+@@ -37,6 +37,12 @@
+ volatile uint32_t arm_irqmask_on;
+ struct arm_irqmask_cpu arm_irqmask_cpu[SMP_MAX_CPUS];
+ 
++/* K12 pseudo-NMI state (see arch_interrupts.h). */
++volatile uint32_t *arm_nmi_pmr;
++volatile uint32_t arm_nmi_any;
++volatile uint32_t arm_nmi_mode[SMP_MAX_CPUS];
++volatile uint32_t arm_nmi_masked[SMP_MAX_CPUS];
++
+ static inline uint64_t irqmask_cntpct(void) {
+     uint32_t lo, hi;
+     __asm__ volatile("mrrc p15, 0, %0, %1, c14" : "=r"(lo), "=r"(hi));
+@@ -130,6 +136,33 @@
+     arm_irqmask_end();
+ }
+ 
++// K12: IRQ entry, CPSR.I set. Returns whether the interrupted code was
++// masked by priority; the exception path keeps it on the thread's stack.
++uint32_t arm_nmi_irq_enter(void) {
++    return arm_nmi_masked[arch_curr_cpu_num()];
++}
++
++// K12: IRQ exit, just before the exception return (replaces the direct
++// arm_irqmask_irq_exit call). Restores the interrupted context's priority
++// mask on the core it now returns on, and closes accounting regions: all
++// of them when that context was unmasked, only the handler's own when it
++// was masked by priority (a pseudo-NMI inside a masked region).
++void arm_nmi_irq_exit(uint32_t saved) {
++    uint cpu = arch_curr_cpu_num();
++    if (arm_irqmask_on) {
++        struct arm_irqmask_cpu *c = &arm_irqmask_cpu[cpu];
++        if (c->active && (!saved || c->site >= ARM_IRQMASK_IRQ_SITE))
++            irqmask_close(c);
++    }
++    if (saved && !arm_nmi_masked[cpu]) {
++        arm_nmi_masked[cpu] = 1;
++        *arm_nmi_pmr = ARM_NMI_PMR_MASKED;
++    } else if (!saved && arm_nmi_masked[cpu]) {
++        arm_nmi_masked[cpu] = 0;
++        *arm_nmi_pmr = ARM_NMI_PMR_OPEN;
++    }
++}
++
+ // Run on each core (for example via mp_sync_exec) with IRQs masked.
+ void arm_irqmask_reset_this_cpu(uint64_t window_start) {
+     struct arm_irqmask_cpu *c = &arm_irqmask_cpu[arch_curr_cpu_num()];
+--- a/arch/arm/arm/exceptions.S
++++ b/arch/arm/arm/exceptions.S
+@@ -204,6 +204,16 @@
+ 
+     /* r0 now holds pointer to iframe */
+ 
++    /* lk-perf K12: keep the interrupted context's GIC-priority mask state
++     * on this thread's stack (it may resume on another core after a
++     * preemption) and restore it before the exception return, as the
++     * hardware does for CPSR.I. Two words keep the stack 8-byte aligned. */
++    push    { r0, r1 }
++    bl      arm_nmi_irq_enter
++    mov     r1, r0
++    pop     { r0, r2 }
++    push    { r1, r2 }
++
+     /* lk-perf (stage 4, fixed): compute this core's index using the
+      * SAME expression as arch_curr_cpu_num() (arch/arm/include/arch/
+      * arch_ops.h), built from the identical SMP_CPU_ID_BITS/
+@@ -259,9 +269,11 @@
+     cmp     r0, #0
+     blne    thread_preempt
+ 
+-    /* lk-perf: close the IRQ's masked region just before the exception
+-     * return unmasks this core (restore reloads r0-r3/r12/lr itself) */
+-    bl      arm_irqmask_irq_exit
++    /* lk-perf: close the IRQ's masked region and restore the interrupted
++     * context's priority mask just before the exception return (restore
++     * reloads r0-r3/r12/lr itself) */
++    pop     { r0, r1 }
++    bl      arm_nmi_irq_exit
+ 
+     restore
+ 

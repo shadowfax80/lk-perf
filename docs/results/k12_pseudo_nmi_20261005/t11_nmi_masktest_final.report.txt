@@ -1,0 +1,30 @@
+1201 samples across 1 cpu(s): {1: 1201}
+1 distinct thread(s) sampled (by thread_t* -- see profiler.c)
+unwind depth histogram (frames per sample): {2: 594, 3: 607}
+
+   count       %  leaf function (source line)
+    1201  100.0%  profiler_spin_ticks  (profiler.c:535)
+
+IRQ-masked time; cpu0, cpu1, cpu2, cpu3 masked by GIC priority (pseudo-NMI): PMU samples reach that masked code, timer samples and IRQ handlers do not. Accounting on at dump time:
+  cpu0:  0.01% masked (0.01% in IRQ handlers), 26 regions, longest 21.8 us at [irq handler, GIC ID 153]
+  cpu1: 49.91% masked (0.03% in IRQ handlers), 2861 regions, longest 500.5 us at profiler_masked_spin
+  cpu2:  0.00% masked (0.00% in IRQ handlers), 105 regions, longest 3.9 us at [irq handler, GIC ID 15]
+  cpu3:  0.00% masked (0.00% in IRQ handlers), 105 regions, longest 3.0 us at [irq handler, GIC ID 15]
+
+  % of time   regions     longest  masking site
+    12.469%      2000     500.5us  profiler_masked_spin
+     0.004%       200       2.0us  [irq handler, GIC ID 30]
+     0.003%       594       2.0us  [irq handler, GIC ID 49]
+     0.002%        24      21.8us  [irq handler, GIC ID 153]
+     0.001%       105       2.3us  event_wait_timeout
+     0.001%       105       1.5us  cbuf_read_char
+     0.001%        15       3.9us  [irq handler, GIC ID 15]
+     0.000%         6       3.1us  [irq handler, GIC ID 14]
+     0.000%        23       0.5us  mutex_acquire_timeout
+     0.000%        23       0.4us  mutex_release
+     0.000%         2       0.6us  mp_sync_exec_etc
+
+Samples delayed by IRQ masking (taken late, so the PC is the unmask point):
+  PMU, events: 0/1201 delayed (threshold 1676), 0 attributed to the region that held them
+
+wrote t11_nmi_masktest_final.folded -- render with: perl scripts/flamegraph.pl t11_nmi_masktest_final.folded > flame.svg

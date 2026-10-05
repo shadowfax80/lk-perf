@@ -1,0 +1,32 @@
+1201 samples across 1 cpu(s): {3: 1201}
+1 distinct thread(s) sampled (by thread_t* -- see profiler.c)
+unwind depth histogram (frames per sample): {2: 1201}
+
+   count       %  leaf function (source line)
+     617   51.4%  profiler_spin_ticks  (profiler.c:535)
+     584   48.6%  profiler_masked_spin  (profiler.c:724)
+
+IRQ-masked time (invisible to IRQ sampling), accounting on at dump time:
+  cpu0:  0.01% masked (0.01% in IRQ handlers), 26 regions, longest 18.9 us at [irq handler, GIC ID 153]
+  cpu1:  0.00% masked (0.00% in IRQ handlers), 47 regions, longest 4.1 us at [irq handler, GIC ID 15]
+  cpu2:  0.00% masked (0.00% in IRQ handlers), 117 regions, longest 4.0 us at [irq handler, GIC ID 15]
+  cpu3: 49.62% masked (0.04% in IRQ handlers), 3520 regions, longest 500.1 us at profiler_masked_spin
+
+  % of time   regions     longest  masking site
+    12.392%      2000     500.1us  profiler_masked_spin
+     0.007%      1201       2.1us  [irq handler, GIC ID 51]
+     0.004%       200       2.0us  [irq handler, GIC ID 30]
+     0.002%        24      18.9us  [irq handler, GIC ID 153]
+     0.001%        21       4.1us  [irq handler, GIC ID 15]
+     0.001%       105       1.9us  cbuf_read_char
+     0.001%       105       1.5us  event_wait_timeout
+     0.000%         6       3.7us  [irq handler, GIC ID 14]
+     0.000%        23       0.5us  mutex_acquire_timeout
+     0.000%        23       0.3us  mutex_release
+     0.000%         2       0.7us  mp_sync_exec_etc
+
+Samples delayed by IRQ masking (taken late, so the PC is the unmask point):
+  PMU, events: 582/1201 delayed (threshold 1676), 582 attributed to the region that held them
+       582  profiler_masked_spin
+
+wrote t9_off_masktest.folded -- render with: perl scripts/flamegraph.pl t9_off_masktest.folded > flame.svg

@@ -80,13 +80,13 @@ snapshot, not a live guarantee.
 
 | Holder | Since | Purpose |
 |---|---|---|
-| Claude | 2026-10-05 | K12 (GIC-priority pseudo-NMI prototype): edits, LK build in the shared checkout |
+| — (free) | 2026-10-05 | Released by Claude after K12; shared checkout at the K12 commit, untracked `scripts/flamegraph.pl` (Codex) left in place |
 
 ## Pi state (last release, copied from bolt-aarch32)
 
 | Released by | When | Board state |
 |---|---|---|
-| Claude | 2026-10-05 | lk-perf K6 final image (lk.bin `b85c9df8…`) at the shell, 6000000 baud, timer and PMU samplers stopped, masked-time accounting off (the dump ends it), samples retained, COM5 closed; no watchdog command issued. Recheck before use; `--reboot` at 6 Mbaud returns it to the loader |
+| Claude | 2026-10-05 | lk-perf K12 image (lk.bin `9001ea77…`) at the shell, 6000000 baud, pseudo-NMI mode **on** (`profiler nmioff` to return to CPSR.I masking), timer and PMU samplers stopped, accounting off, COM5 closed; no watchdog command issued. Recheck before use; `--reboot` at 6 Mbaud returns it to the loader |
 
 ## Claims (consolidated TODO)
 
@@ -105,16 +105,16 @@ current source. *Owner* is empty until someone claims it.
 | 5 | K5 | `setup.sh` re-run fails on a file left by overlay patch 0004 (`gic.h`) | P2 | — | Open | Finding #14; scoped clean of that one path before the reset |
 | 6 | K10 | Timer-mode sampling phase-locks to IRQ masking: LK re-arms its scheduler tick from the handling time, so delayed ticks shift every later one (65% vs 50% in the K6 ground-truth test) | P2 | — | Open | Re-arm from the missed deadline (LK timer, an overlay) or a dedicated sampling timer; PMU mode is already fixed |
 | 7 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Open | Feasibility first on the Pi: `EDDEVID.PCSample`, debug APB address, non-invasive debug enabled in Non-secure state; leaf PC only |
-| 8 | K12 | IRQ-masked blind spot, route 3: mask by GIC priority (pseudo-NMI) instead of CPSR.I so the PMU interrupt still fires in masked code | P3 | P2 | Claude | In progress |
-| 9 | K7 | Full `profiler stat`: any command, all 6 counters, derived IPC | P3 | — | Open | Review Phase 3 item 3 |
-| 10 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
-| 11 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim | P3 | — | Open | Fold into the next commit touching the same file |
-| 12 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses |
+| 8 | K7 | Full `profiler stat`: any command, all 6 counters, derived IPC | P3 | — | Open | Review Phase 3 item 3 |
+| 9 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
+| 10 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim | P3 | — | Open | Fold into the next commit touching the same file |
+| 11 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
 
 ### Done (recent)
 
 | ID | Item | Owner | Evidence |
 |---|---|---|---|
+| K12 | IRQ-masked blind spot, route 3: GIC-priority pseudo-NMI sampling (Pi prototype, opt-in) | Claude | Overlay `0014`, `profiler nmion|nmioff`, `MASKNMI` dump line; ground truth 50.5% of PMU samples inside masked code, 0 delayed (default mode: 0%); stress + 6-min soak clean; `test_irqmask_report.py` 10; [results/k12_pseudo_nmi_20261005](results/k12_pseudo_nmi_20261005/README.md) |
 | K6 | IRQ-masked blind spot, route 1: masked-time accounting, delayed-sample attribution, unbiased PMU reload, console printing without IRQ masking | Claude | Overlays `0012`/`0013`, `profiler maskon|maskoff|mask|masktest`, extended dump; `scripts/test_irqmask_report.py` (9) + existing suites; Pi ground truth: accounting 49.6% vs 50%, samples 48.2% vs 50%, 574/574 delayed samples attributed; [results/k6_irqmask_20261005](results/k6_irqmask_20261005/README.md) |
 | — | Real four-core FlameGraph and Perfetto demo | Codex | [results/lk_perf_demo_20261005](results/lk_perf_demo_20261005/README.md): 3200 samples, 800/core, zero integrity rejections |
 | — | perf-script export with metadata sidecar | Codex | `scripts/pi4_perf_export.py`, [EXPORT.md](EXPORT.md), 26 exporter tests |
@@ -126,6 +126,33 @@ Earlier milestones (M1–M5, DWARF unwinder, review Phases 1–2) are recorded i
 [RPI4_BRINGUP.md](RPI4_BRINGUP.md).
 
 ## Handoff log
+
+### 2026-10-05 — Claude: K12 done (route 3, GIC-priority pseudo-NMI on the Pi); lock and Pi released
+
+- Overlay `0014`: opt-in masking by GIC priority. In this mode thread-context
+  `arch_disable_ints` raises `GICC_PMR` instead of setting CPSR.I. The PMU SPIs
+  get the top Non-secure priority, so PMU samples land inside masked code.
+- Safety:
+  - every read or change of a core's mask state runs with CPSR.I briefly set;
+  - the IRQ path keeps the interrupted context's mask state on the thread's
+    stack and restores it at exit;
+  - an interrupt racing the mask write reads as spurious and stays pending;
+  - the PMU handler never reschedules, locks or prints.
+- `profiler nmion|nmioff` switches every core through an IPI.
+  `nmion` checks that priorities and the mask read back, else refuses.
+  GIC-400 facts found: the Non-secure PMR keeps 4 bits; PPIs 16–24 are absent.
+- Pi results:
+  - ground truth: 50.5% of samples inside the masked code, 0 delayed
+    (default mode 0%);
+  - four-core workload unchanged;
+  - stress with mode switching, and a 6-minute soak (944,589 samples), clean.
+  Two attempts lost the shell prompt to host-side USB-serial drops on long
+  output; LK was alive both times (probed).
+- Overlays 0001–0014 replay byte for byte; host tests pass (K6 suite now 10);
+  no FPU instructions; both archived images rebuild reproducibly.
+- Not covered: IRQ handlers, timer-mode samples. The target needs its GIC
+  version (T4 note). Pi left in pseudo-NMI mode (state above).
+- Lock free. Next: K1 (stack bounds), K10 (timer phase lock) or K11 (route 2).
 
 ### 2026-10-05 — Claude: K6 done (IRQ-masked blind spot, route 1); lock and Pi released
 

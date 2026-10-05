@@ -76,6 +76,7 @@ MASKSITE_RE = re.compile(
     r"MASKSITE cpu=(?P<cpu>\d+) site=(?P<site>[0-9a-fA-F]{8}) count=(?P<count>[0-9a-fA-F]{8}) "
     r"ticks=(?P<ticks>[0-9a-fA-F]{16}) max=(?P<max>[0-9a-fA-F]{8}) crc=(?P<crc>[0-9a-fA-F]{8})\s*$"
 )
+MASKNMI_RE = re.compile(r"MASKNMI cpus=(?P<cpus>[0-9a-fA-F]{8}) crc=(?P<crc>[0-9a-fA-F]{8})\s*$")
 IRQ_SITE = 0xffff0000  # app/profiler + arch/arm irqmask.c: IRQ regions are IRQ_SITE | vector
 
 SPSR_T_BIT = 1 << 5  # Thumb state -- same bit app/profiler.c reads
@@ -186,7 +187,7 @@ def parse_mask(log_path: str) -> dict | None:
     """Parses K6 MASKINFO/MASKCPU/MASKSITE lines (checksum-verified, the
     same drop-and-count policy as samples). Returns None when the log has
     no masked-time accounting at all (older images)."""
-    info, cpus, sites, rejected = None, {}, {}, 0
+    info, cpus, sites, rejected, nmi = None, {}, {}, 0, None
     with open(log_path, "r", errors="replace") as f:
         for line in f:
             if "MASK" not in line:
@@ -198,6 +199,12 @@ def parse_mask(log_path: str) -> dict | None:
                     rejected += 1
                     continue
                 info = {"cntfrq": freq, "on": bool(on), "now": now}
+            elif m := MASKNMI_RE.search(line):
+                bits = int(m["cpus"], 16)
+                if _fnv([bits]) != int(m["crc"], 16):
+                    rejected += 1
+                    continue
+                nmi = bits
             elif m := MASKCPU_RE.search(line):
                 v = {k: int(m[k], 16) for k in ("start", "masked", "regions", "irq",
                                                  "irqregions", "max", "maxsite", "dropped",
@@ -226,7 +233,7 @@ def parse_mask(log_path: str) -> dict | None:
     if rejected:
         print(f"warning: {rejected} masked-time line(s) failed their checksum or format "
               f"-- dropped, so masked totals may be incomplete", file=sys.stderr)
-    return {"info": info, "cpus": cpus, "sites": sites, "rejected": rejected}
+    return {"info": info, "cpus": cpus, "sites": sites, "rejected": rejected, "nmi": nmi}
 
 
 def classify_delays(samples: list[dict], cntfrq: int | None,
@@ -274,8 +281,15 @@ def print_mask_report(elf_path: str, samples: list[dict], mask: dict | None,
         info = mask["info"]
         freq = info["cntfrq"] or 1
         us = lambda ticks: 1e6 * ticks / freq
-        print("\nIRQ-masked time (invisible to IRQ sampling), accounting "
-              f"{'on' if info['on'] else 'off'} at dump time:")
+        nmi = mask.get("nmi") or 0
+        if nmi:
+            cores = ", ".join(f"cpu{c}" for c in range(32) if nmi >> c & 1)
+            print(f"\nIRQ-masked time; {cores} masked by GIC priority (pseudo-NMI): PMU samples "
+                  "reach that masked code, timer samples and IRQ handlers do not. Accounting "
+                  f"{'on' if info['on'] else 'off'} at dump time:")
+        else:
+            print("\nIRQ-masked time (invisible to IRQ sampling), accounting "
+                  f"{'on' if info['on'] else 'off'} at dump time:")
         total_window = total_masked = 0
         for cpu in sorted(mask["cpus"]):
             v = mask["cpus"][cpu]

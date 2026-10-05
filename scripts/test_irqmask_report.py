@@ -83,6 +83,14 @@ class K6Tests(unittest.TestCase):
         self.assertEqual(mask["rejected"], 1)
         self.assertNotIn(0, mask["sites"])
 
+    def test_pseudo_nmi_cores_are_reported(self):
+        line = f"MASKNMI cpus=0000000f crc={_fnv([0xf]):08x}\n"
+        self.assertEqual(parse_mask(self.write(mask_lines() + line))["nmi"], 0xf)
+        bad = line.replace("cpus=0000000f", "cpus=0000000e")
+        mask = parse_mask(self.write(mask_lines() + bad))
+        self.assertIsNone(mask["nmi"])
+        self.assertEqual(mask["rejected"], 1)
+
     def test_no_mask_lines_means_no_accounting(self):
         self.assertIsNone(parse_mask(self.write(sample_line())))
 
