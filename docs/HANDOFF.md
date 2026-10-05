@@ -80,7 +80,7 @@ snapshot, not a live guarantee.
 
 | Holder | Since | Purpose |
 |---|---|---|
-| — (free) | 2026-10-05 | Released by Claude after K1; shared checkout at the K1 commit, untracked `scripts/flamegraph.pl` (Codex) left in place |
+| Claude | 2026-10-05 | K2 (self-describing capture): profiler, host tools and LK build in the shared checkout |
 
 ## Pi state (last release, copied from bolt-aarch32)
 
@@ -98,7 +98,7 @@ current source. *Owner* is empty until someone claims it.
 
 | Order | ID | Item | Priority | Owner | Status | Notes |
 |---|---|---|---|---|---|---|
-| 1 | K2 | Self-describing capture: run-id, build-id, mode/event, per-CPU totals and overwrite/loss counts in a dump header/footer; parser keeps only the latest run | P1 | — | Open | Review findings #6 and #11 (labelling); logs append and mix runs today (ARCHITECTURE §7.5) |
+| 1 | K2 | Self-describing capture: run-id, build-id, mode/event, per-CPU totals and overwrite/loss counts in a dump header/footer; parser keeps only the latest run | P1 | Claude | In progress | Review findings #6 and #11 (labelling); logs append and mix runs today (ARCHITECTURE §7.5) |
 | 2 | K3 | No-CFI fallback: use the raw LR as the caller when hand-written assembly has no `.debug_frame` | P1 | — | Open | Finding #13; callers of memcpy/memset/spinlocks are undercounted |
 | 3 | K4 | `profiler stat` counts its own `printf` output (counters start before the status prints) | P2 | — | Open | Finding #10; confirmed still present in `profiler.c` |
 | 4 | K5 | `setup.sh` re-run fails on a file left by overlay patch 0004 (`gic.h`) | P2 | — | Open | Finding #14; scoped clean of that one path before the reset |
