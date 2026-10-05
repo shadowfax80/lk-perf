@@ -1,0 +1,4 @@
+profiler_copy_a;memcpy 299
+cmd_profiler;profiler_copy_a 2
+profiler_fill_b;memset 161
+cmd_profiler;profiler_fill_b 2

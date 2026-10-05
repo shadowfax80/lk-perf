@@ -191,13 +191,26 @@ class ExportTests(unittest.TestCase):
         self.assertIn(" arm_leaf ", blocks[1])
         self.assertEqual(metadata["quality"]["unwind_exception_samples"], 1)
 
-    def test_no_cfi_keeps_leaf_and_does_not_claim_complete_unwind(self):
+    def test_no_cfi_uses_checked_lr_and_does_not_claim_complete_unwind(self):
+        # K3: LR here is a real return address (after `bl leaf` in caller),
+        # so the no-CFI leaf gets that caller and the stack ends there.
         self.log.write_text(self.good_line(pc=self.symbols["no_cfi"], spsr=0x13)
                             + "SAMPLE done\n")
         metadata = self.export()
-        self.assertIn(" no_cfi ", self.output.read_text())
-        self.assertEqual(metadata["quality"]["unwind_depth_counts"], {1: 1})
+        text = self.output.read_text()
+        self.assertIn(" no_cfi ", text)
+        self.assertIn(" caller ", text)
+        self.assertEqual(metadata["quality"]["unwind_depth_counts"], {2: 1})
+        self.assertEqual(metadata["quality"]["lr_fallback_samples"], 1)
         self.assertEqual(metadata["quality"]["unwind_completeness"], "not_proven")
+
+    def test_no_cfi_with_lr_not_after_a_call_keeps_leaf_only(self):
+        self.log.write_text(self.good_line(pc=self.symbols["no_cfi"], spsr=0x13,
+                                           lr=self.symbols["caller"] | 1)
+                            + "SAMPLE done\n")
+        metadata = self.export()
+        self.assertEqual(metadata["quality"]["unwind_depth_counts"], {1: 1})
+        self.assertEqual(metadata["quality"]["lr_fallback_samples"], 0)
 
     def test_unmapped_pc_is_not_attributed_to_nearest_function(self):
         self.log.write_text(self.good_line(pc=0x12340000, spsr=0x13) + "SAMPLE done\n")

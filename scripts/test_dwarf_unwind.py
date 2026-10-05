@@ -113,6 +113,53 @@ def build_thumb_edge(tmp: Path) -> Path:
     return tmp / "thumb_edge.elf"
 
 
+def build_nocfi(tmp: Path) -> Path:
+    """K3 fixture (testdata/nocfi.S): assembly leaves without CFI called
+    from ARM and Thumb functions that have CFI."""
+    (tmp / "nocfi.S").write_text((TESTDATA / "nocfi.S").read_text())
+    (tmp / "link.ld").write_text(LINKER_SCRIPT)
+    subprocess.run(["arm-none-eabi-as", "-g", "-mcpu=cortex-a15", "nocfi.S", "-o", "nocfi.o"],
+                   check=True, cwd=tmp)
+    subprocess.run(["arm-none-eabi-ld", "-T", "link.ld", "nocfi.o", "-o", "nocfi.elf"],
+                   check=True, cwd=tmp)
+    return tmp / "nocfi.elf"
+
+
+def check_lr_fallback(tmp: Path) -> None:
+    elf_path = build_nocfi(tmp)
+    with open(elf_path, "rb") as f:
+        symtab = ELFFile(f).get_section_by_name(".symtab")
+        sym = {s.name: s["st_value"] & ~1 for s in symtab.iter_symbols() if s.name}
+
+    def no_memory(addr, size):
+        raise KeyError(f"a no-CFI leaf must not read memory (0x{addr:x})")
+
+    leaf = sym["leaf_body"]
+    cases = [
+        ("ARM caller, BL", sym["ret_a"], [leaf, sym["ret_a"]], True),
+        ("Thumb caller, BLX imm", sym["ret_t"] | 1, [leaf, sym["ret_t"]], True),
+        ("Thumb caller, BLX Rm", sym["ret_t_reg"] | 1, [leaf, sym["ret_t_reg"]], True),
+        ("LR not after a call", sym["caller_a"], [leaf], False),
+        ("LR zero", 0, [leaf], False),
+    ]
+    with DwarfCFIUnwinder(str(elf_path)) as unwinder:
+        for label, lr, expected, used in cases:
+            chain = unwinder.unwind(leaf, {SP_REG: 0xC000, LR_REG: lr}, no_memory)
+            assert chain == expected and unwinder.last_lr_fallback == used, (
+                f"{label}: got {[hex(p) for p in chain]} "
+                f"(fallback {unwinder.last_lr_fallback}), expected {[hex(p) for p in expected]}")
+        # A routine without CFI that made its own call: LR points back into it.
+        inside = sym["ret_inside"]
+        chain = unwinder.unwind(inside, {SP_REG: 0xC000, LR_REG: inside}, no_memory)
+        assert chain == [inside] and not unwinder.last_lr_fallback, [hex(p) for p in chain]
+        # Fallback disabled: leaf only, as before K3.
+        chain = unwinder.unwind(leaf, {SP_REG: 0xC000, LR_REG: sym["ret_a"]}, no_memory,
+                                lr_fallback=False)
+        assert chain == [leaf], [hex(p) for p in chain]
+    print("PASS: a no-CFI leaf gets its caller from LR only when LR follows a call "
+          "(A32 BL, T32 BLX imm and BLX Rm) outside the leaf's own routine")
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         elf_path = build(Path(tmpdir))
@@ -330,6 +377,8 @@ def main():
         print(f"PASS: {N_LEVELS} levels of genuine recursion (same PC, "
               f"advancing CFA each level) unwind correctly instead of "
               f"tripping the cycle guard after 2 frames")
+
+        check_lr_fallback(Path(tmpdir))
 
 
 if __name__ == "__main__":

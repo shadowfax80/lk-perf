@@ -166,11 +166,13 @@ def write_perf_script(stream: TextIO, elf: Path, samples: list[dict], *,
     ordered = sorted(samples, key=lambda s: (s["ts"], s["cpu"], s["seq"]))
     mapping = re.sub(r"[^A-Za-z0-9_.-]", "_", elf.name) or "lk.elf"
     errors = 0
+    lr_fallbacks = 0
     depths = Counter()
     with DwarfCFIUnwinder(str(elf)) as unwinder:
         for sample in ordered:
             try:
                 chain = unwind_sample(unwinder, sample)
+                lr_fallbacks += unwinder.last_lr_fallback
             except (ValueError, NotImplementedError):
                 errors += 1
                 chain = [sample["pc"]]
@@ -188,6 +190,7 @@ def write_perf_script(stream: TextIO, elf: Path, samples: list[dict], *,
             stream.write("\n")
     return {
         "unwind_exception_samples": errors,
+        "lr_fallback_samples": lr_fallbacks,
         "unwind_depth_counts": dict(sorted(depths.items())),
         "unwind_completeness": "not_proven",
         "threads": [{"pid": 1, "tid": tid, "thread_pointer": f"0x{pointer:08x}",

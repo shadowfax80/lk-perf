@@ -770,6 +770,24 @@ static void profiler_masktest(uint32_t loops, uint32_t us) {
     }
 }
 
+// K3 ground-truth workload: time spent in LK's hand-written memcpy and
+// memset (assembly without CFI), each reached from its own C caller. A
+// report should attribute memcpy samples to profiler_copy_a and memset
+// samples to profiler_fill_b. The length comes from a volatile so the
+// compiler cannot replace the calls with inline code.
+static uint8_t profiler_mem_src[4096], profiler_mem_dst[4096];
+static volatile uint32_t profiler_mem_len = sizeof(profiler_mem_dst);
+
+__NO_INLINE static void profiler_copy_a(uint32_t iters) {
+    for (uint32_t i = 0; i < iters; i++)
+        memcpy(profiler_mem_dst, profiler_mem_src, profiler_mem_len);
+}
+
+__NO_INLINE static void profiler_fill_b(uint32_t iters) {
+    for (uint32_t i = 0; i < iters; i++)
+        memset(profiler_mem_dst, (int)i, profiler_mem_len);
+}
+
 // Stage 4: run the same nested workload concurrently on SMP_MAX_CPUS
 // worker threads so the SMP scheduler has a reason to actually spread
 // work across every core -- proves per-CPU sampling captures activity
@@ -1042,7 +1060,7 @@ static uint32_t profiler_image_hash(void) {
 
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
-        printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|edgetest|stat|pmustart|pmustop|pmu|maskon|maskoff|mask|masktest|nmion|nmioff>\n");
+        printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|edgetest|stat|pmustart|pmustop|pmu|maskon|maskoff|mask|masktest|memtest|nmion|nmioff|buildid>\n");
         return -1;
     }
 
@@ -1081,6 +1099,13 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
 #else
         printf("nmi: needs real hardware (BCM2711)\n");
 #endif
+    } else if (!strcmp(sub, "memtest")) {
+        uint32_t iters = argc >= 3 ? (uint32_t)argv[2].u : 200000;
+        printf("memtest: %u x memcpy (profiler_copy_a) and %u x memset (profiler_fill_b), "
+               "%u bytes ...\n", iters, iters, profiler_mem_len);
+        profiler_copy_a(iters);
+        profiler_fill_b(iters);
+        printf("memtest: done\n");
     } else if (!strcmp(sub, "masktest")) {
         uint32_t loops = argc >= 3 ? (uint32_t)argv[2].u : 2000;
         uint32_t us = argc >= 4 ? (uint32_t)argv[3].u : 500;

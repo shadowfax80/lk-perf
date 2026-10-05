@@ -8,6 +8,7 @@
 | exporter | Timestamped perf-script export ([EXPORT.md](EXPORT.md), [verification](results/PERF_EXPORT_VERIFICATION.md)) |
 | `0f7f5e3` (K6) | IRQ-masked time accounting, delayed-sample attribution, delay-compensated PMU reload, console printing without IRQ masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
 | `84c25a9` (K12) | Opt-in pseudo-NMI sampling by GIC priority masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
+| K3 | Caller recovery for code without CFI from a validated LR ([§8.2](#82-per-sample-algorithm)) |
 | K2 | Self-describing dumps: session header with run id, image hash, modes/event/period; per-core taken/retained/overwritten/lost counts; footer record count ([§7.3](#73-sample-text-format), [§7.5](#75-transfer-cost-and-run-isolation)) |
 | K1 | Stack copy bounded by the top of the sampled stack, `slen` field, unwinder stops at the stack top ([§4.4](#44-captured-context), [§8.2](#82-per-sample-algorithm)) |
 
@@ -503,7 +504,8 @@ Unwind data stays on the host; the target neither loads CFI nor performs a CFI w
 4. Resolve the Canonical Frame Address (CFA) as `register + offset`. This becomes the caller SP. If a stack top is known and the CFA reaches it, this frame is the root of its stack and the walk ends here; whatever lies at the top (for LK threads, a stale return address in the initial context frame) is not a caller.
 5. Resolve each general-purpose register's rule, carrying live/unmodified register values forward where available.
 6. Obtain the caller address from resolved LR, strip bit 0, and append it unless it repeats an existing `(PC, CFA)` pair.
-7. Repeat with a **return-address lookup at PC−1**, until no FDE/row exists, LR is absent/zero, the pair repeats, or the configured iteration limit is reached.
+7. Repeat with a **return-address lookup at PC−1**, until no FDE/row exists, LR is absent/zero, the pair repeats, the stack top is reached, or the configured iteration limit is reached.
+8. **No CFI at the sampled PC** (K3): hand-written assembly such as `memcpy`, `memset`, spinlocks and cache operations has no FDE. The interrupted LR is then used as the caller if the instruction just before it, in the instruction set LR's bit 0 names, is a call (A32 `BL`/`BLX`, T32 `BL`/`BLX` immediate or `BLX` register, read from the ELF), and it does not point back into the leaf's own routine. The chain ends at that caller, because the leaf's stack adjustment is unknown without CFI.
 
 The first PC represents executing code and is looked up directly. Later PCs are return addresses pointing after a call. Looking up PC−1 keeps the unwind in the caller's FDE when a noreturn call sits at the end of a function. The reported chain keeps unadjusted normalized return addresses, which matters separately for symbolization.
 
@@ -524,7 +526,7 @@ The cycle key includes CFA so real recursion at the same call site with differen
 
 Reads outside `[sample SP, sample SP + slen)` return zero (`slen` is 128 for older dumps). A zero recovered LR stops the chain; an unavailable value in another register may instead cause a later failure or incomplete reconstruction. Out-of-window reads and genuine zero words are not distinguished. There is no target-memory access during host analysis.
 
-Missing FDEs stop the walk. A raw-LR fallback for assembly without CFI is not implemented; treating LR as a caller unconditionally would be unsafe where assembly repurposes it. A missing register or unsupported rule raising `ValueError`/`NotImplementedError` is caught per sample by the report tool, which replaces that sample's chain with its leaf PC and prints an aggregate warning. It discards any partially reconstructed chain in that exception case. ELF initialization failures and arbitrary other exceptions are not covered by that fallback.
+Missing FDEs stop the walk, except for the validated LR fallback at the sampled PC (step 8). Using LR unconditionally would be unsafe where assembly reuses it as a scratch register or after its own calls; the call-site and same-routine checks reject those cases, and `--no-lr-fallback` disables the fallback in the report. A missing register or unsupported rule raising `ValueError`/`NotImplementedError` is caught per sample by the report tool, which replaces that sample's chain with its leaf PC and prints an aggregate warning. It discards any partially reconstructed chain in that exception case. ELF initialization failures and arbitrary other exceptions are not covered by that fallback.
 
 ### 8.4 Symbol and source mapping
 
@@ -585,6 +587,7 @@ Timer samples approximate where execution is observed at scheduler timer interru
 | `profiler mask` | None | Per-core masked share, IRQ-handler share, region count, longest region and its site, and the top five masking sites |
 | `profiler nmion` / `nmioff` | None | Switch every core to masking by GIC priority (pseudo-NMI, PMU samples reach masked code) / back to CPSR.I. `nmion` programs priorities and refuses to enable if they do not read back; `status` shows the mode per core |
 | `profiler buildid` | None | Print the running image's read-only range and its FNV-1a hash (the dump's `build` value) and how long hashing took |
+| `profiler memtest [iters]` | 200000 | Ground-truth workload for code without CFI: `profiler_copy_a` calls `memcpy`, `profiler_fill_b` calls `memset`, each `iters` times on 4 KiB |
 | `profiler masktest [loops] [us]` | 2000, 500 | Ground-truth workload: alternate `us` microseconds with IRQs masked and `us` unmasked, so half the time is masked by construction |
 | `profiler bench [iters]` | 20000000 iterations per function | Alternate two arithmetic leaf workloads four times; does not start sampling |
 | `profiler nest [iters]` | 20000000 | Nested workload; optimization can eliminate wrapper frames via tail calls |
@@ -671,7 +674,7 @@ Hardware results: [results/k6_irqmask_20261005](results/k6_irqmask_20261005/READ
 | Buffer overflow | Preserve most recent per-core slots; dumps report taken, retained and overwritten per core (K2) | Older samples are lost; only their count is known |
 | Mixed sampling modes/runs | Dump header gives run, dump number, modes, PMU event/period and a changed-config flag; host picks one dump of a log; records carry their trigger (`src`) | A session that mixes PMU configurations is flagged, not split per configuration |
 | Context sufficiency | Capture SP/LR and one FP candidate; carry recoverable registers through CFI | Other live registers and the other FP candidate are missing |
-| Missing assembly CFI | Stop the walk | No validated LR fallback; caller contributions underrepresented |
+| Missing assembly CFI | Validated LR fallback at the sampled PC: caller recovered when LR follows a call outside the leaf (K3) | The stack ends at that caller; a leaf reached by a tail branch is credited to the caller's caller; a leaf that reused LR as scratch keeps leaf-only |
 | Bad symbol attribution | ELF checked against the dump's image hash (K2) | Nearest-start mapping lacks function-extent validation; return-address boundaries remain |
 | A55 transfer | Mechanism demonstrated on A72 | Target routing, ABI, event support, performance, and footprint unvalidated |
 | Scheduling/wakeups/blocking/frequency | Timestamped stack samples and CPU/thread identity only | No context-switch/wakeup events, blocking reasons/durations, or CPU-frequency history; additional target event instrumentation/export is required |
@@ -701,6 +704,7 @@ The following summarizes the repository's prior observations; it is not a claim 
 | UART integrity | 6-Mbaud console operation; sequence/checksum validation reported losses in real captures |
 | IRQ-masked time (K6) | Ground truth 50% masked: accounting 49.6%, PMU samples 48.2% on the masked side, all delayed samples attributed; console masking (up to 350 µs per line) removed |
 | Pseudo-NMI (K12) | Ground truth: 50.5% of PMU samples inside masked code, 0 delayed; stress with mode switching and a 6-minute soak (944,589 samples) clean |
+| No-CFI callers (K3) | `memtest`: all 460 samples in `memcpy`/`memset` attributed to their true callers (299/161), none to the wrong one; earlier captures unchanged |
 | Capture sessions (K2) | Image hash identical on the Pi and from the ELF across workloads, sampling, pseudo-NMI and dumps (0.7 ms); two-dump log split; exact loss (7/8458) and overwrite counts; wrong ELF refused; older capture exported byte-identically |
 | Stack bounds (K1) | Four-core workload: all samples bounded at 20 bytes (previously 108 bytes past the stack), clean `initial_thread_func` root; idle samples bounded exactly at the per-core boot-stack top |
 | Offline regressions | `scripts/test_dwarf_unwind.py`: nested/Thumb address handling, register propagation, noreturn-boundary FDE lookup, recursive cycle guard; `scripts/test_irqmask_report.py`: K6/K12 record format, MASK lines, delay classification, exporter acceptance |
@@ -750,7 +754,7 @@ Avoid turning a raw LR guess, a checksum-valid dump, or a plausible FlameGraph i
 | [pi4_perf_export.py](../scripts/pi4_perf_export.py), [EXPORT.md](EXPORT.md) | Strict single-dump timestamped perf-script export and metadata/quality sidecar |
 | [test_perf_export.py](../scripts/test_perf_export.py), [perf_export.S](../scripts/testdata/perf_export.S) | Offline capture/export regressions and optional real Perfetto consumer test |
 | [dwarf_unwind.py](../scripts/dwarf_unwind.py) | CFI evaluator and ELF function/source resolution |
-| [test_dwarf_unwind.py](../scripts/test_dwarf_unwind.py), [testdata](../scripts/testdata) | Offline compiler/assembly fixtures and unwind regressions |
+| [test_dwarf_unwind.py](../scripts/test_dwarf_unwind.py), [testdata](../scripts/testdata) | Offline compiler/assembly fixtures and unwind regressions, including `nocfi.S` for the K3 LR fallback |
 | [test_irqmask_report.py](../scripts/test_irqmask_report.py) | K6/K12 record, MASK-line and delay-attribution regressions |
 | [pi4_doctor.py](../scripts/pi4_doctor.py), [pi4_baud_calibrate.py](../scripts/pi4_baud_calibrate.py) | Serial readiness and calibration tooling |
 | [experiments/pi4-serialboot](../experiments/pi4-serialboot/README.md) | Persistent image loader |

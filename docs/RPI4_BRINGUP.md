@@ -3,6 +3,14 @@
 > Work queue, ownership and status updates: [HANDOFF.md](HANDOFF.md). This
 > file is the hardware evidence record.
 
+**No-CFI callers, K3 (2026-10-05, Claude):** samples in LK's hand-written
+assembly (memcpy, memset, spinlocks, cache operations) had no caller because
+that code has no DWARF CFI. The unwinder now takes the caller from the
+interrupted LR when the instruction before it is a call outside the leaf. In
+the new `profiler memtest` ground truth all 460 such samples went to their
+true callers. Details:
+[results/k3_nocfi_fallback_20261005](results/k3_nocfi_fallback_20261005/README.md).
+
 **Self-describing capture, K2 (2026-10-05, Claude):** every dump now states
 its session (run id, dump number), its image (a hash of the read-only bytes
 that the host checks against the ELF), its sampling modes and PMU settings,

@@ -62,6 +62,12 @@ class DwarfCFIUnwinder:
             for entry in dwarf.CFI_entries():
                 if isinstance(entry, FDE):
                     self._fdes.append(entry)
+            # Executable bytes, for validating a raw-LR fallback (K3).
+            self._path = elf_path
+            self._code = [(sec["sh_addr"], sec.data()) for sec in self._elf.iter_sections()
+                          if sec["sh_type"] == "SHT_PROGBITS" and sec["sh_flags"] & 0x4]
+            # Whether the last unwind() used the raw-LR fallback.
+            self.last_lr_fallback = False
         except Exception:
             # __exit__ cannot run if construction fails (e.g. a stale/stripped
             # or malformed ELF supplied to an exporter). Do not leak the file.
@@ -84,6 +90,52 @@ class DwarfCFIUnwinder:
             if start <= pc < end:
                 return fde
         return None
+
+    def _code_read(self, addr: int, size: int) -> Optional[int]:
+        """Little-endian value of `size` code bytes at `addr`, or None if the
+        bytes are not all inside one executable section."""
+        for base, data in self._code:
+            if base <= addr and addr + size <= base + len(data):
+                return int.from_bytes(data[addr - base:addr - base + size], "little")
+        return None
+
+    def _follows_call(self, lr: int) -> bool:
+        """True if `lr` is the return address of a call instruction: the
+        instruction just before it (in the ISA that LR's bit 0 names) is a
+        branch with link -- A32 BL/BLX(imm)/BLX(Rm), T32 BL/BLX(imm) (32-bit)
+        or BLX(Rm) (16-bit)."""
+        addr = strip_isa_bit(lr)
+        if lr & 1:
+            if addr % 2:
+                return False
+            hw = self._code_read(addr - 2, 2)
+            if hw is not None and (hw & 0xFF87) == 0x4780:      # BLX Rm
+                return True
+            hw1, hw2 = self._code_read(addr - 4, 2), self._code_read(addr - 2, 2)
+            return (hw1 is not None and hw2 is not None and (hw1 & 0xF800) == 0xF000
+                    and (hw2 & 0xC000) == 0xC000)                # BL / BLX imm
+        if addr % 4:
+            return False
+        w = self._code_read(addr - 4, 4)
+        if w is None:
+            return False
+        return (((w >> 28) != 0xF and (w & 0x0F000000) == 0x0B000000)   # BL<c>
+                or (w & 0xFE000000) == 0xFA000000                        # BLX imm
+                or (w & 0x0FFFFFF0) == 0x012FFF30)                       # BLX<c> Rm
+
+    def _lr_caller(self, leaf_pc: int, lr: Optional[int]) -> Optional[int]:
+        """K3: the caller of a leaf that has no CFI, taken from the live LR,
+        or None when LR is not believable: it must be the return address of a
+        call instruction, and must not point back into the leaf's own
+        function (a routine that made its own call leaves LR there)."""
+        if not lr or not self._follows_call(lr):
+            return None
+        caller = strip_isa_bit(lr)
+        leaf_fn = find_function(self._path, leaf_pc)
+        caller_fn = find_function(self._path, caller - 1)   # return address: look up pc-1
+        if leaf_fn is not None and caller_fn is not None and leaf_fn[1] == caller_fn[1]:
+            return None
+        return caller
 
     def _row_for_pc(self, fde: FDE, pc: int) -> Optional[dict]:
         table = fde.get_decoded().table
@@ -146,6 +198,7 @@ class DwarfCFIUnwinder:
         read_memory: Callable[[int, int], int],
         max_frames: int = 64,
         stack_top: int | None = None,
+        lr_fallback: bool = True,
     ) -> list[int]:
         """Return the list of PCs in this call chain, innermost first.
 
@@ -167,7 +220,15 @@ class DwarfCFIUnwinder:
         has no caller on this stack: the walk stops there instead of
         following whatever stale return address sits at the stack top
         (LK's initial thread frame, for example).
+
+        `lr_fallback` (K3): when the sampled PC itself has no CFI --
+        hand-written assembly such as memcpy, memset or a spinlock -- the
+        live LR is used as the caller if `_lr_caller` accepts it, and the
+        walk ends there: without CFI the leaf's stack adjustment is
+        unknown, so no frame beyond the caller can be recovered.
+        `last_lr_fallback` tells whether this happened.
         """
+        self.last_lr_fallback = False
         cur_pc = strip_isa_bit(pc)
         chain = [cur_pc]
         regs = dict(registers)
@@ -197,6 +258,11 @@ class DwarfCFIUnwinder:
             lookup_pc = cur_pc - 1 if is_return_address else cur_pc
             fde = self._find_fde(lookup_pc)
             if fde is None:
+                if lr_fallback and len(chain) == 1:
+                    caller = self._lr_caller(cur_pc, registers.get(LR_REG))
+                    if caller is not None:
+                        chain.append(caller)
+                        self.last_lr_fallback = True
                 break
             row = self._row_for_pc(fde, lookup_pc)
             if row is None:

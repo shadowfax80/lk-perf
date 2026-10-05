@@ -575,7 +575,7 @@ def annotate_function(elf_path: str, name: str, start: int, size: int,
     return out
 
 
-def unwind_sample(unwinder: DwarfCFIUnwinder, s: dict) -> list[int]:
+def unwind_sample(unwinder: DwarfCFIUnwinder, s: dict, lr_fallback: bool = True) -> list[int]:
     thumb = (s["spsr"] & SPSR_T_BIT) != 0
     fp_reg = 7 if thumb else 11
     registers = {SP_REG: s["sp"], LR_REG: s["lr"], fp_reg: s["fp"]}
@@ -585,7 +585,8 @@ def unwind_sample(unwinder: DwarfCFIUnwinder, s: dict) -> list[int]:
     # A copy cut short (0 < slen < window) ended exactly at the stack top.
     top = (s["sp"] + s["slen"]
            if s.get("slen") is not None and 0 < s["slen"] < len(s["stack"]) else None)
-    return unwinder.unwind(s["pc"], registers, read_memory, stack_top=top)
+    return unwinder.unwind(s["pc"], registers, read_memory, stack_top=top,
+                           lr_fallback=lr_fallback)
 
 
 def main() -> None:
@@ -600,6 +601,9 @@ def main() -> None:
                     help="which dump of the log to report: 0 = first, -1 = latest (default)")
     ap.add_argument("--allow-elf-mismatch", action="store_true",
                     help="report even if the ELF does not match the captured image")
+    ap.add_argument("--no-lr-fallback", action="store_true",
+                    help="do not use the interrupted LR as the caller of code without CFI "
+                         "(the behaviour before K3)")
     ap.add_argument("--no-mask-frames", action="store_true",
                     help="do not add [irq-masked: ...] leaf frames to delayed samples "
                          "in --folded output")
@@ -637,10 +641,12 @@ def main() -> None:
     # only costs its own multi-frame detail, not the whole run.
     chains = []
     unwind_errors = 0
+    lr_fallbacks = 0
     with DwarfCFIUnwinder(args.elf) as unwinder:
         for s in samples:
             try:
-                chains.append(unwind_sample(unwinder, s))
+                chains.append(unwind_sample(unwinder, s, not args.no_lr_fallback))
+                lr_fallbacks += unwinder.last_lr_fallback
             except (ValueError, NotImplementedError):
                 unwind_errors += 1
                 chains.append([s["pc"]])
@@ -668,6 +674,9 @@ def main() -> None:
     print(f"{total} samples across {len(per_cpu)} cpu(s): {dict(sorted(per_cpu.items()))}")
     print(f"{len(threads)} distinct thread(s) sampled (by thread_t* -- see profiler.c)")
     print(f"unwind depth histogram (frames per sample): {dict(sorted(depths.items()))}")
+    if lr_fallbacks:
+        print(f"no-CFI code: {lr_fallbacks} sample(s) in assembly without unwind data got their "
+              f"caller from the interrupted LR (checked to follow a call); their stacks end there")
     bounded = [s for s in samples if s.get("slen") is not None]
     if bounded:
         short = sum(1 for s in bounded if 0 < s["slen"] < len(s["stack"]))

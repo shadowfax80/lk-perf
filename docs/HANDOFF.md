@@ -80,13 +80,13 @@ snapshot, not a live guarantee.
 
 | Holder | Since | Purpose |
 |---|---|---|
-| Claude | 2026-10-05 | K3 (no-CFI fallback): host unwinder, profiler test workload, LK build in the shared checkout |
+| — (free) | 2026-10-05 | Released by Claude after K3; shared checkout at the K3 commit, untracked `scripts/flamegraph.pl` (Codex) left in place |
 
 ## Pi state (last release, copied from bolt-aarch32)
 
 | Released by | When | Board state |
 |---|---|---|
-| Claude | 2026-10-05 | lk-perf K2 image (lk.bin `1528064a…`) at the shell, 6000000 baud, pseudo-NMI off, samplers stopped, COM5 closed; no watchdog command issued. Recheck before use; `--reboot` at 6 Mbaud returns it to the loader |
+| Claude | 2026-10-05 | lk-perf K3 image (lk.bin `052a2e91…`) at the shell, 6000000 baud, pseudo-NMI off, samplers stopped, COM5 closed; no watchdog command issued. Recheck before use; `--reboot` at 6 Mbaud returns it to the loader |
 
 ## Claims (consolidated TODO)
 
@@ -98,20 +98,20 @@ current source. *Owner* is empty until someone claims it.
 
 | Order | ID | Item | Priority | Owner | Status | Notes |
 |---|---|---|---|---|---|---|
-| 1 | K3 | No-CFI fallback: use the raw LR as the caller when hand-written assembly has no `.debug_frame` | P1 | Claude | In progress | Finding #13; callers of memcpy/memset/spinlocks are undercounted |
-| 2 | K4 | `profiler stat` counts its own `printf` output (counters start before the status prints) | P2 | — | Open | Finding #10; confirmed still present in `profiler.c` |
-| 3 | K5 | `setup.sh` re-run fails on a file left by overlay patch 0004 (`gic.h`) | P2 | — | Open | Finding #14; scoped clean of that one path before the reset |
-| 4 | K10 | Timer-mode sampling phase-locks to IRQ masking: LK re-arms its scheduler tick from the handling time, so delayed ticks shift every later one (65% vs 50% in the K6 ground-truth test) | P2 | — | Open | Re-arm from the missed deadline (LK timer, an overlay) or a dedicated sampling timer; PMU mode is already fixed |
-| 5 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Open | Feasibility first on the Pi: `EDDEVID.PCSample`, debug APB address, non-invasive debug enabled in Non-secure state; leaf PC only |
-| 6 | K7 | Full `profiler stat`: any command, all 6 counters, derived IPC | P3 | — | Open | Review Phase 3 item 3 |
-| 7 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
-| 8 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim | P3 | — | Open | Fold into the next commit touching the same file |
-| 9 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
+| 1 | K4 | `profiler stat` counts its own `printf` output (counters start before the status prints) | P2 | — | Open | Finding #10; confirmed still present in `profiler.c` |
+| 2 | K5 | `setup.sh` re-run fails on a file left by overlay patch 0004 (`gic.h`) | P2 | — | Open | Finding #14; scoped clean of that one path before the reset |
+| 3 | K10 | Timer-mode sampling phase-locks to IRQ masking: LK re-arms its scheduler tick from the handling time, so delayed ticks shift every later one (65% vs 50% in the K6 ground-truth test) | P2 | — | Open | Re-arm from the missed deadline (LK timer, an overlay) or a dedicated sampling timer; PMU mode is already fixed |
+| 4 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Open | Feasibility first on the Pi: `EDDEVID.PCSample`, debug APB address, non-invasive debug enabled in Non-secure state; leaf PC only |
+| 5 | K7 | Full `profiler stat`: any command, all 6 counters, derived IPC | P3 | — | Open | Review Phase 3 item 3 |
+| 6 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
+| 7 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim | P3 | — | Open | Fold into the next commit touching the same file |
+| 8 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
 
 ### Done (recent)
 
 | ID | Item | Owner | Evidence |
 |---|---|---|---|
+| K3 | No-CFI fallback: caller of assembly without CFI taken from a validated LR (follows a call, outside the leaf) | Claude | Pi `memtest`: all 460 `memcpy`/`memset` samples attributed to their true callers (previously no caller); earlier captures unchanged; `nocfi.S` unwinder fixture, exporter tests 27; [results/k3_nocfi_fallback_20261005](results/k3_nocfi_fallback_20261005/README.md) |
 | K2 | Self-describing capture: session header (run, dump, image hash, modes/event/period), per-core counts, footer; host picks the latest dump and refuses a mismatched ELF | Claude | Pi: image hash stable and equal to the ELF's (0.7 ms); two-dump log split; exact transfer loss (7/8458) and overwrite counts; wrong ELF refused; older capture exported byte-identically; `test_irqmask_report.py` 20; [results/k2_session_20261005](results/k2_session_20261005/README.md) |
 | K1 | Stack-copy bounds: copy stops at the top of the sampled stack; `slen` field; unwinder stops at the stack top | Claude | Pi: four-core workload had 20 bytes above SP (108 bytes read past the stack before), now bounded with a clean root; idle samples bounded at the boot-stack top; `test_dwarf_unwind.py` stack-top case, `test_irqmask_report.py` 14; [results/k1_stack_bounds_20261005](results/k1_stack_bounds_20261005/README.md) |
 | K12 | IRQ-masked blind spot, route 3: GIC-priority pseudo-NMI sampling (Pi prototype, opt-in) | Claude | Overlay `0014`, `profiler nmion|nmioff`, `MASKNMI` dump line; ground truth 50.5% of PMU samples inside masked code, 0 delayed (default mode: 0%); stress + 6-min soak clean; `test_irqmask_report.py` 10; [results/k12_pseudo_nmi_20261005](results/k12_pseudo_nmi_20261005/README.md) |
@@ -126,6 +126,26 @@ Earlier milestones (M1–M5, DWARF unwinder, review Phases 1–2) are recorded i
 [RPI4_BRINGUP.md](RPI4_BRINGUP.md).
 
 ## Handoff log
+
+### 2026-10-05 — Claude: K3 done (no-CFI fallback); lock and Pi released
+
+- 33 functions in the LK image have no CFI: memcpy/memset/bzero/bcopy,
+  spinlocks, cache operations, `arch_idle`, the context switch. Samples in
+  them had no caller.
+- Unwinder: at a sampled PC without CFI, the interrupted LR becomes the
+  caller if the instruction before it (in LR's ISA, read from the ELF) is a
+  call (A32 BL/BLX, T32 BL/BLX imm or BLX Rm) and LR is outside the leaf's
+  own routine. The stack ends there. The report counts these samples, the
+  exporter records `lr_fallback_samples`, and `--no-lr-fallback` restores
+  the old behaviour.
+- New `profiler memtest` ground truth: on the Pi, 299 memcpy samples went to
+  `profiler_copy_a` and 161 memset samples to `profiler_fill_b`, versus no
+  caller before. Earlier captures report identically.
+- Tests: `nocfi.S` fixture in `test_dwarf_unwind.py`. The Codex exporter
+  test for no-CFI code was updated on purpose (its LR is a real return
+  address, so a caller is now expected) and a negative case was added; 27
+  pass. No FPU.
+- Lock free, Pi released. Next: K10 (timer phase lock), K11 (route 2), K4/K5.
 
 ### 2026-10-05 — Claude: K2 done (self-describing capture); lock and Pi released
 

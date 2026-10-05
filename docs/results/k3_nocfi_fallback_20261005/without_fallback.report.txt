@@ -1,0 +1,41 @@
+dump 1 of 1 in this log: run 0000000020074fab, dump #1 of that run; modes pmu, PMU event 0x11 every 1000000; ELF matches the image (0a8cd245)
+  cpu0: 0 taken, 0 retained
+  cpu1: 480 taken, 480 retained
+  cpu2: 0 taken, 0 retained
+  cpu3: 0 taken, 0 retained
+records: 480 sent, 464 accepted, 16 lost or rejected in transfer
+
+464 samples across 1 cpu(s): {1: 464}
+1 distinct thread(s) sampled (by thread_t* -- see profiler.c)
+unwind depth histogram (frames per sample): {1: 460, 2: 4}
+stack window: 0 sample(s) bounded by their stack top (< 128 bytes above SP), 0 with SP on no known stack (nothing copied)
+
+   count       %  leaf function (source line)
+     299   64.4%  memcpy  (memcpy.S:72)
+     161   34.7%  memset  (memset.S:59)
+       2    0.4%  profiler_copy_a  (profiler.c:782)
+       2    0.4%  profiler_fill_b  (profiler.c:787)
+
+IRQ-masked time (invisible to IRQ sampling), accounting on at dump time:
+  cpu0:  0.01% masked (0.01% in IRQ handlers), 15 regions, longest 17.4 us at [irq handler, GIC ID 153]
+  cpu1:  0.05% masked (0.05% in IRQ handlers), 610 regions, longest 3.9 us at [irq handler, GIC ID 15]
+  cpu2:  0.01% masked (0.00% in IRQ handlers), 83 regions, longest 4.8 us at [irq handler, GIC ID 15]
+  cpu3:  0.00% masked (0.00% in IRQ handlers), 13 regions, longest 4.5 us at [irq handler, GIC ID 15]
+
+  % of time   regions     longest  masking site
+     0.007%       480       1.6us  [irq handler, GIC ID 49]
+     0.004%        79       1.9us  [irq handler, GIC ID 30]
+     0.003%        13      17.4us  [irq handler, GIC ID 153]
+     0.002%        15       4.8us  [irq handler, GIC ID 15]
+     0.001%        55       1.9us  cbuf_read_char
+     0.001%        55       1.7us  event_wait_timeout
+     0.000%         6       3.4us  [irq handler, GIC ID 14]
+     0.000%         8       0.5us  mutex_acquire_timeout
+     0.000%         8       0.3us  mutex_release
+     0.000%         2       0.7us  mp_sync_exec_etc
+
+Samples delayed by IRQ masking (taken late, so the PC is the unmask point):
+  PMU, events: 0/464 delayed (threshold 1688), 0 attributed to the region that held them
+
+wrote without_fallback.folded -- render with: perl scripts/flamegraph.pl without_fallback.folded > flame.svg
+warning: 0 sample(s) failed their checksum, 16 sample(s) missing entirely (seq gap) -- both dropped, not trusted
