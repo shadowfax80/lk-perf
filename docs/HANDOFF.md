@@ -80,7 +80,7 @@ snapshot, not a live guarantee.
 
 | Holder | Since | Purpose |
 |---|---|---|
-| — (free) | 2026-10-05 | Released by Claude after K12; shared checkout at the K12 commit, untracked `scripts/flamegraph.pl` (Codex) left in place |
+| Claude | 2026-10-05 | K1 (stack-copy bounds): profiler edits and LK build in the shared checkout |
 
 ## Pi state (last release, copied from bolt-aarch32)
 
@@ -98,7 +98,7 @@ current source. *Owner* is empty until someone claims it.
 
 | Order | ID | Item | Priority | Owner | Status | Notes |
 |---|---|---|---|---|---|---|
-| 1 | K1 | Stack-copy bounds: the fixed 128-byte snapshot can read above a shallow thread's stack allocation | P1 | — | Open | Bound the copy to the thread's actual stack (ARCHITECTURE §11.2) |
+| 1 | K1 | Stack-copy bounds: the fixed 128-byte snapshot can read above a shallow thread's stack allocation | P1 | Claude | In progress | Bound the copy to the thread's actual stack (ARCHITECTURE §11.2) |
 | 2 | K2 | Self-describing capture: run-id, build-id, mode/event, per-CPU totals and overwrite/loss counts in a dump header/footer; parser keeps only the latest run | P1 | — | Open | Review findings #6 and #11 (labelling); logs append and mix runs today (ARCHITECTURE §7.5) |
 | 3 | K3 | No-CFI fallback: use the raw LR as the caller when hand-written assembly has no `.debug_frame` | P1 | — | Open | Finding #13; callers of memcpy/memset/spinlocks are undercounted |
 | 4 | K4 | `profiler stat` counts its own `printf` output (counters start before the status prints) | P2 | — | Open | Finding #10; confirmed still present in `profiler.c` |
