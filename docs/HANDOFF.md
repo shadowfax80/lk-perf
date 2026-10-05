@@ -124,6 +124,24 @@ Earlier milestones (M1–M5, DWARF unwinder, review Phases 1–2) are recorded i
 
 ## Handoff log
 
+### 2026-10-05 — Codex: synchronized and adopted the shared handoff
+
+- Fetched GitHub and confirmed Claude's coordination commit `c7b0145`.
+  Read `AGENTS.md`, `CLAUDE.md`, this queue/lock, and the current board-wide
+  Pi reservation in bolt-aarch32. Created the independent Codex clone at
+  `C:\Users\User\CURSOR\CodexProjects\lk-perf` for work without the WSL lock.
+- Sync/documentation only: no K item claimed, no implementation, tests,
+  build, sampler, watchdog, or serial action. Existing shared WSL checkout
+  was already at `c7b0145`; preserved its untracked `scripts/flamegraph.pl`
+  and generated LK/build evidence. Live-tree lock remains free.
+- Pi remains unreserved; last released state is the snapshot above, not
+  re-probed during this sync. This log was committed from the Codex clone,
+  without editing the shared WSL tree or Claude's checkout.
+- Next: claim K1 (first suggested item) and push before implementation;
+  acquire/push the lock before shared-tree work and use the single BOLT Pi
+  reservation for hardware. A future lock holder can fast-forward WSL to
+  include this documentation entry.
+
 ### 2026-10-05 — Claude: handoff scheme introduced
 
 - Added this file, `AGENTS.md`, and pointers in `CLAUDE.md` and
