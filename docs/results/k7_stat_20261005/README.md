@@ -59,11 +59,15 @@ timing results were all taken at this clock.
 
 ## Console output and the USB-serial link
 
-The first K7 build printed each table row as many small `printf`
-fragments. At 6 Mbaud the host side then lost large parts of the output, and
-sometimes the shell prompt. The target transmits every byte (polled,
-blocking PL011 writes), so the loss is in the USB-serial path. It is far
-worse for fragmented output than for whole lines. Each `stat` line is now
-assembled first and written once, which made the tables almost clean
-(occasional small drops remain, the same as in dumps). `profiler mask`
-still prints fragmented lines.
+The first K7 build printed each table line as many small `printf`
+fragments, and at 6 Mbaud large parts of the tables never reached the host,
+sometimes including the shell prompt. Each `stat` line is now assembled
+first and written once, which made the tables almost clean.
+
+Correction (K9): fragmentation is not the general cause of the link's
+losses. Dump records lose the same share whether each record is 130
+`printf` calls or one (0.18% vs 0.17% of about 32,000 records), and
+`profiler mask` output, which was always whole lines, has also come through
+damaged. The target sends every byte (polled, blocking PL011 writes), so
+the loss happens after the UART; why the fragmented `stat` tables were hit
+so much harder is not established.

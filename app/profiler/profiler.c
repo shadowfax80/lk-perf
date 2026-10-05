@@ -1463,10 +1463,11 @@ static int profiler_stat_find(uint32_t ev) {
     return -1;
 }
 
-// Output lines are assembled first and printed with one printf each: the
-// USB-serial link on the host side loses far more data when a line reaches
-// it as many small fragments (seen on `stat` and `mask` output) than as
-// one write.
+// Output lines are assembled first and printed with one printf each. The
+// first K7 build wrote each table line in many fragments and the host lost
+// large parts of them; whole-line writes made the tables almost clean. Not
+// a general fix for link loss: dump records lose the same ~0.2% either way
+// (K9 measurement).
 struct profiler_line {
     char buf[200];
     size_t len;
@@ -1893,13 +1894,19 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
                 uint32_t crc = profiler_sample_checksum((uint32_t)c, seq, pc, lr, fp, sp,
                                                          spsr, tid, ts, stack, src, lat,
                                                          msite, mgap, slen);
-                printf("SAMPLE seq=%08x cpu=%d pc=%08x lr=%08x fp=%08x sp=%08x "
-                       "spsr=%08x tid=%08x ts=%016llx stack=",
-                       seq, c, pc, lr, fp, sp, spsr, tid, (unsigned long long)ts);
+                // K9: the whole record in one write (it used to take 130
+                // printf calls, one per stack byte).
+                static const char hex[] = "0123456789abcdef";
+                char stack_hex[2 * PROFILER_STACK_CAPTURE_BYTES + 1];
                 for (int b = 0; b < PROFILER_STACK_CAPTURE_BYTES; b++) {
-                    printf("%02x", stack[b]);
+                    stack_hex[2 * b] = hex[stack[b] >> 4];
+                    stack_hex[2 * b + 1] = hex[stack[b] & 0xf];
                 }
-                printf(" src=%c lat=%08x msite=%08x mgap=%08x slen=%08x crc=%08x\n",
+                stack_hex[2 * PROFILER_STACK_CAPTURE_BYTES] = 0;
+                printf("SAMPLE seq=%08x cpu=%d pc=%08x lr=%08x fp=%08x sp=%08x "
+                       "spsr=%08x tid=%08x ts=%016llx stack=%s src=%c lat=%08x msite=%08x "
+                       "mgap=%08x slen=%08x crc=%08x\n",
+                       seq, c, pc, lr, fp, sp, spsr, tid, (unsigned long long)ts, stack_hex,
                        src ? (char)src : '?', lat, msite, mgap, slen, crc);
                 seq++;
             }
@@ -2114,21 +2121,17 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         //    not inferred. QEMU's minimal image has no secure-monitor
         //    boot stage to clear the NSACR PMU-access trap.
         //
-        // M5: on THIS real hardware, PMU access works cleanly -- see
-        // `profiler stat` above, confirmed on real Pi 4B silicon: reads
-        // PMCEID0/1, programs an event counter, runs a workload, reads
-        // real counts back, no fault anywhere. The Pi's own firmware
-        // does clear that trap during its real secure-world boot, as
-        // hypothesized (not previously confirmed) when this comment
-        // was first written for the QEMU target. Only the PMU
-        // *interrupt* path (event-overflow-triggered sampling, as
-        // opposed to plain counting) remains unverified on real
-        // hardware -- that's the actual PMU-event-driven-sampling
-        // milestone, still ahead.
-        printf("pmu: counting mode confirmed working on real hardware --\n");
-        printf("pmu: see `profiler stat`. What's still unverified here is\n");
-        printf("pmu: the PMU *interrupt* path (event-overflow-triggered\n");
-        printf("pmu: sampling) -- see this command's own source comment.\n");
+        // M5: on THIS real hardware, PMU access works cleanly: the Pi's
+        // firmware clears that trap during its secure-world boot. Both
+        // counting (`profiler stat`, K7) and overflow-interrupt sampling
+        // (`pmustart`, M5/K6) are verified on the Pi; this command just
+        // reports the PMU (K9: it used to say the interrupt path was
+        // unverified).
+        uint32_t pmcr = pmu_read_pmcr();
+        printf("pmu: PMCR=%08x, %u event counters + cycle counter; PMCEID0=%08x PMCEID1=%08x\n",
+               pmcr, (pmcr >> 11) & 0x1f, pmu_read_pmceid0(), pmu_read_pmceid1());
+        printf("pmu: counting: `profiler stat [-e ev,...] <command>`; sampling: "
+               "`profiler pmustart <event> <count>` / `pmustop`\n");
     } else if (!strcmp(sub, "status")) {
         uint32_t total = 0;
         for (int c = 0; c < SMP_MAX_CPUS; c++) {

@@ -160,6 +160,20 @@ def check_lr_fallback(tmp: Path) -> None:
           "(A32 BL, T32 BLX imm and BLX Rm) outside the leaf's own routine")
 
 
+def check_line_ties() -> None:
+    """K9: a CU whose sequence ends at the address where another CU's
+    function starts, listed in either order, must resolve to the start."""
+    from dwarf_unwind import _lookup_lines, _sort_line_rows
+    start = [(0x1000, "b.c", 10), (0x1004, "b.c", 11), (0x1010, None, None)]
+    ends_here = [(0x0f00, "a.c", 5), (0x1000, None, None)]
+    for order in (start + ends_here, ends_here + start):
+        rows = _sort_line_rows(order)
+        got = _lookup_lines(rows, [0x1000, 0x1002, 0x0f80, 0x1010])
+        assert got == ["b.c:10", "b.c:10", "a.c:5", None], got
+    print("PASS: a function start sharing its address with another sequence's end "
+          "resolves to the function's first line, in either CU order")
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         elf_path = build(Path(tmpdir))
@@ -379,6 +393,7 @@ def main():
               f"tripping the cycle guard after 2 frames")
 
         check_lr_fallback(Path(tmpdir))
+    check_line_ties()
 
 
 if __name__ == "__main__":

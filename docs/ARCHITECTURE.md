@@ -8,6 +8,7 @@
 | exporter | Timestamped perf-script export ([EXPORT.md](EXPORT.md), [verification](results/PERF_EXPORT_VERIFICATION.md)) |
 | `0f7f5e3` (K6) | IRQ-masked time accounting, delayed-sample attribution, delay-compensated PMU reload, console printing without IRQ masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
 | `84c25a9` (K12) | Opt-in pseudo-NMI sampling by GIC priority masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
+| K9 | Small fixes: one write per dump record, `pmu` message, function-start line lookup, design-doc and README corrections ([§8.4](#84-symbol-and-source-mapping)) |
 | K7 | `profiler stat` counts any console command on every core: up to six events plus cycles, 64-bit, derived IPC and ratios ([§6.3](#63-profiler-stat)); K4 (no printing inside the window) and K5 (`setup.sh` re-runnable) before it |
 | K10 | Timer mode on the profiler's own per-core virtual timer: fixed grid, one sample at a random point of each period, lost periods counted; dump format 3 ([§4.2](#42-timer-mode)) |
 | K11 | Cross-core PC sampling (`EDPCSR`) feasibility: implemented and reachable on the A72, prohibited by the SoC's debug authentication ([§4.7](#47-cross-core-pc-sampling-edpcsr-feasibility)) |
@@ -409,7 +410,7 @@ profiler stat [iters]          (built-in profiler_workload_a, 5,000,000 iteratio
 
 On the Pi: the built-in workload measures exactly 4.000 instructions and 2.000 cycles per iteration; the CPU_CYCLES event equals the 64-bit cycle counter on every core; and a 10 s run counted 12.0e9 instructions (2.8 × 2^32), consistent per iteration. The cycle counts also show that the A72 runs at **600 MHz** under LK, the firmware's boot clock ([results](results/k7_stat_20261005/README.md)).
 
-Each output line is assembled first and written with one `printf`: the USB-serial path on the host side loses far more data when a line arrives as many small fragments.
+Each output line is assembled first and written with one `printf`: the first K7 build wrote each line in many fragments, and large parts of its tables never reached the host; assembling each line first made them almost clean. Fragmentation is not the general cause of link loss, though: dump records lose the same 0.17-0.18% whether written in 130 fragments or one write (K9), and `mask` output, always whole lines, has also come through damaged. The target sends every byte (polled, blocking PL011), so the loss is after the UART.
 
 ## 7. Transport and dump-format contract
 
@@ -572,7 +573,7 @@ Function symbols come from `.symtab` entries of type `STT_FUNC`. Thumb symbol va
 
 Both functions currently select the **nearest function start at or below the PC** without verifying `PC < start + size`. An address in a gap or outside the true function extent can therefore receive a plausible but wrong name. Return addresses are symbolized without the PC−1 unwind-lookup adjustment, so boundary attribution remains a distinct caveat. This document records the behavior rather than treating the docstring's coverage wording as an enforced check.
 
-Line attribution reads `.debug_line`, accounts for DWARF version differences in file-table indexing, and uses end-of-sequence markers to stop coverage across gaps. It provides best-effort file-name/line output, not inline call-chain expansion or source-file validation. An unstripped, exact-match ELF is essential: a stale ELF can produce plausible but wrong names, CFI rows, and line numbers, and no capture build ID currently detects that mismatch.
+Line attribution reads `.debug_line`, accounts for DWARF version differences in file-table indexing, and uses end-of-sequence markers to stop coverage across gaps. Where a sequence ends at the address another one starts (26 function starts in the LK image), the start wins, whatever order the compilation units come in (K9; before, those starts resolved to no line). It provides best-effort file-name/line output, not inline call-chain expansion or source-file validation. An unstripped, exact-match ELF is essential: a stale ELF can produce plausible but wrong names, CFI rows, and line numbers. Since K2 the dump's image hash detects that mismatch, and both host tools refuse it.
 
 FDE lookup and symbol lookup are linear scans. Symbol-table caching avoids rebuilding the table per sample. Annotation batches line resolution per function; the overall flat report batches its unique leaf addresses. This is a simple host implementation suitable for current capture sizes, not an indexed production profiler database.
 

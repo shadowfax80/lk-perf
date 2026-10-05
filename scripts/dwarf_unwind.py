@@ -429,8 +429,16 @@ def _load_line_table(elf_path: str) -> list[tuple[int, Optional[str], Optional[i
                 else:
                     filename = "?"
                 rows.append((state.address, filename, state.line))
-    rows.sort(key=lambda r: r[0])
-    return rows
+    return _sort_line_rows(rows)
+
+
+def _sort_line_rows(rows):
+    """K9: an end_sequence and the first row of the next sequence often
+    share an address (one function ends where the next begins; 26 function
+    starts in the LK image). Sort the end_sequence first, so a lookup at
+    that address finds the function's first line whatever order the CUs
+    came in -- before, those starts resolved to no line at all."""
+    return sorted(rows, key=lambda r: (r[0], r[1] is not None))
 
 
 def resolve_lines(elf_path: str, pcs: list[int]) -> list[Optional[str]]:
@@ -440,6 +448,10 @@ def resolve_lines(elf_path: str, pcs: list[int]) -> list[Optional[str]]:
     `-g`, or a real `end_sequence` gap (see `_load_line_table`).
     """
     rows = _load_line_table(elf_path)
+    return _lookup_lines(rows, pcs)
+
+
+def _lookup_lines(rows, pcs: list[int]) -> list[Optional[str]]:
     results: list[Optional[str]] = []
     for raw_pc in pcs:
         pc = strip_isa_bit(raw_pc)

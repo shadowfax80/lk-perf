@@ -182,8 +182,12 @@ thread's stack is separate memory. SMP is bookkeeping, not new logic:
 - **Per-CPU ring buffers, no locking in the ISR.** A shared buffer with a
   lock is disqualified -- taking a lock inside a sampling interrupt is
   exactly the kind of perturbation that corrupts the measurement. Each
-  core writes only its own buffer, cache-line separated to avoid false
-  sharing.
+  core writes only its own buffer. (K9 correction: not all of it is on
+  separate cache lines. The sample arrays are per-core rows of several KiB,
+  but the small per-core counters -- `profiler_head`/`profiler_total`, the
+  r7/r11 capture slots, the missed-period counts -- are plain arrays
+  indexed by core and share lines. They are written once per interrupt, at
+  most a few kHz per core, so the false sharing is negligible.)
 - **Tag every sample with CPU ID and a timestamp.**
   **Use `CNTPCT` (the generic timer's counter), not `PMCCNTR`, for the
   timestamp** -- this is the one correction worth flagging explicitly.

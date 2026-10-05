@@ -1,8 +1,8 @@
 # lk-perf: working notes for Claude Code sessions
 
 Bare-metal statistical sampling profiler for LK (Little Kernel) on
-AArch32. Stages 1-4 run on QEMU (see README.md, docs/DESIGN.md). The
-current work is the **Raspberry Pi 4B real-hardware track**.
+AArch32. All work runs on real **Raspberry Pi 4B** hardware (QEMU was the
+early development history only; see docs/ARCHITECTURE.md for the design).
 **docs/RPI4_BRINGUP.md is the source of truth for its state and plan:
 read its "Start here" section before doing anything on the Pi.**
 

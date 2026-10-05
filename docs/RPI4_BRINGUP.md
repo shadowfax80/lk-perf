@@ -3,6 +3,15 @@
 > Work queue, ownership and status updates: [HANDOFF.md](HANDOFF.md). This
 > file is the hardware evidence record.
 
+**Small fixes, K9 (2026-10-05, Claude):** see the "Lower priority" list
+below. Two measurements came out of it. Writing each dump record in one
+`printf` instead of 130 does not change the link loss (0.17% vs 0.18%), so
+fragmentation is not its cause. And upstream LK's `__arm_in_handler` (the
+`arch_in_int_handler()` flag) is one global, not per core: an IRQ on one
+core makes another core's thread-context print take the spinlock path of
+overlay 0013 instead of the mutex. That is harmless (both paths are
+correct), so it is recorded rather than patched.
+
 **Full stat, K7 (2026-10-05, Claude):** `profiler stat [-e ev,...]
 <command>` counts any console command on every core: up to six events plus
 64-bit cycles, with 32-bit event wraps extended through the overflow
@@ -1001,7 +1010,11 @@ capable/convenient. Only the first tier clears that bar.
   against whatever toolchain actually builds for the target.
 
 **Lower priority, fold into whichever commit next touches the same
-file rather than doing as standalone work:**
+file rather than doing as standalone work:** (all resolved in K9,
+2026-10-05: README and CLAUDE.md status text, `pmu` message, dangling
+memory link, `resolve_lines()` ties -- 26 function starts in the LK image
+had resolved to no line -- the DESIGN.md claim corrected, dump records in
+one write. The PMU handler now reads PMSELR/PMOVSR, K6/K7.)
 - Stale docs/help text: README's leftover "M5 not yet implemented"
   claim, `CLAUDE.md`'s "Current task" section, the `pmu` command's
   own message, and the dangling `[[project_lk_perf_no_fpu_neon]]`
@@ -1524,7 +1537,7 @@ explicitly). Kept here only for detail not repeated above:
   hardware, matching a real Cortex-A72's PMU.
 - ~~Whether the target platform's real core is even Cortex-A-family~~ -- **settled**:
   The target platform is a multi-core Cortex-A55, no FPU/NEON (see
-  [[project_lk_perf_no_fpu_neon]]) -- this is why that fidelity work
+  overlay patch `0007-rpi4-no-fpu-neon.patch`) -- this is why that fidelity work
   happened. The Pi 4B's A72 remains a different, higher-performance
   core than the real target either way (see "Not A55-representative"
   above) -- that's a permanent, accepted mismatch, not an open risk.

@@ -86,11 +86,11 @@ hardware:
 python3 scripts/test_dwarf_unwind.py
 ```
 
-At the LK shell, once booted:
-`profiler <start|stop|status|clear|bench [iters]|nest [iters]|smp [iters]|pmu>`.
-Live sample extraction over serial (replacing the old QEMU/QMP-based
-`pc_histogram.py`, removed along with all QEMU references) is M5 in
-`docs/RPI4_BRINGUP.md` -- not yet implemented.
+At the LK shell, once booted, `profiler` with no arguments lists its
+subcommands; [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the full
+command reference. Captures come back over serial with `profiler dump` and
+are reported by `scripts/pi4_pc_histogram.py` or exported for Perfetto by
+`scripts/pi4_perf_export.py`.
 
 ## Layout
 
