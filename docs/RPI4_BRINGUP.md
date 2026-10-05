@@ -515,21 +515,19 @@ privilege to do so was never available on this boot chain in the first
 place. Attempting it isn't a "todo"; it's out of reach for this
 specific validation environment regardless of effort spent.
 
-**Confirmed (2026-09-28): the target platform runs in Secure mode, always AArch32
-SVC.** This directly answers the question above, not just narrows it.
-The target platform's RTOS has exactly the privilege this Pi bring-up never had --
-Secure-state access to reconfigure `GICD_IGROUPRn` and assign the PMU's
-overflow interrupt to Group 0/FIQ, which is precisely the mechanism
-that bypasses `CPSR.I` masking. **This gap is real and permanent on
-the Pi, but not on the target platform** -- it's specific to this validation
-environment's non-secure boot chain, not to the sampling mechanism
-itself, exactly as suspected but now confirmed rather than assumed.
-"Always SVC" is also a direct, useful cross-check on this project's
-own design: this Pi bring-up's interrupted-SP derivation (`frame + 1`,
-see the M5 section above) and its `usp`/`ulr`-are-dead-registers
-finding both depend on threads never leaving SVC mode -- the target platform
-sharing that property means this specific piece of the mechanism
-transfers as validated, not just as a hopeful analogy.
+**Target platform (corrected 2026-10-05): Non-secure, always AArch32
+SVC -- the same security state and mode as this Pi.** An earlier note
+here (2026-09-28) recorded the target as Secure and concluded that its
+RTOS could reconfigure `GICD_IGROUPRn` to route the PMU overflow
+interrupt to Group 0/FIQ. That premise was wrong: the target runs
+Non-secure SVC, and its PMU sampling interrupts are ordinary IRQs (user,
+2026-10-04). So the blind spot is **not specific to the Pi**: code that
+runs with `CPSR.I` set is invisible to sampling on the target too, for
+the same architectural reason. "Always SVC" still holds and remains a
+useful cross-check on this project's own design: the interrupted-SP
+derivation (`frame + 1`, see the M5 section above) and the
+`usp`/`ulr`-are-dead-registers finding both depend on threads never
+leaving SVC mode, so that piece of the mechanism transfers as validated.
 
 **The position:**
 1. Document the blind spot as a known, quantified bias in every report
@@ -538,11 +536,9 @@ transfers as validated, not just as a hopeful analogy.
    making this one visible, not pretending it doesn't exist.
 2. Still don't attempt FIQ/pseudo-NMI *on the Pi*. The GIC-group
    reconfiguration it needs is genuinely unreachable from this specific
-   non-secure boot chain regardless of effort spent -- that fact hasn't
-   changed. What has changed is why it's not worth building here even
-   in principle: the target platform's own GIC configuration and RTOS are
-   different enough from LK-on-Pi that the actual implementation has to
-   be written for that target directly, not ported from here.
+   non-secure boot chain regardless of effort spent, and the target is
+   Non-secure too, so there is no target-side FIQ route to prototype
+   against either.
 3. What *is* worth building here, being genuinely cheap and actually
    informative regardless of target: a running counter of total cycles
    spent with interrupts masked (hook the same
@@ -552,14 +548,11 @@ transfers as validated, not just as a hopeful analogy.
    real number, the same way `perf` itself reports lost/dropped
    samples rather than staying silent about them. Not built yet; a
    reasonable next small addition, distinct from closing the gap itself.
-4. **Real action item for the eventual target-platform port, not just a
-   question to check anymore**: implement FIQ-routed (or priority-based)
-   PMU sampling there, using this Pi's `profiler pmustart`/`pmustop` as
-   the reference for the counter-programming/overflow-handling side
-   (identical PMU architecture) while writing target-platform-specific code for
-   the interrupt-group/FIQ-vector side this Pi categorically can't
-   exercise. This closes the blind spot for real, on the target that
-   actually matters -- confirmed feasible, not just hoped for.
+4. **On the target:** the same position applies. It runs Non-secure SVC
+   with IRQ-based PMU sampling, so the masked-cycles counter from item 3
+   is the practical mitigation there as well. (Superseded 2026-10-05: an
+   earlier version planned FIQ-routed sampling on the target, based on
+   the incorrect Secure-target premise.)
 
 ## Software reboot (2026-09-28)
 
@@ -872,8 +865,6 @@ capable/convenient. Only the first tier clears that bar.
 **Deferred by design -- Phase 4 (target-specific, premature now):**
 - Finalize the buffer-format/memory-budget tradeoff from Phase 3
   against the real target's RAM constraints, once they're known.
-- FIQ-routed PMU sampling on the target itself -- new code, not
-  portable from the Pi (it can't exercise Secure state at all).
 - Re-verify `test_dwarf_unwind.py`'s hardcoded GCC-10.3 addresses
   against whatever toolchain actually builds for the target.
 
@@ -1408,8 +1399,8 @@ explicitly). Kept here only for detail not repeated above:
 - ~~The interrupts-masked blind spot has no documented position yet~~
   -- **resolved**: see "The interrupts-masked blind spot: a position"
   above. Documented and deliberately not fixed on this hardware, with
-  a small, real, cheap follow-up identified (a masked-cycles counter)
-  and the actual open question (the target platform's own secure-boot access)
-  correctly placed on the real target, not this one.
+  a small, real, cheap follow-up identified (a masked-cycles counter).
+  The target runs Non-secure SVC with IRQ sampling (corrected
+  2026-10-05), so the same position and follow-up apply there.
 - The persistent chainloader's own baud rate needs an SD-card reflash
   to improve, deliberately deferred -- see item 6 above.
