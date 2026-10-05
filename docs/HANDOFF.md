@@ -80,7 +80,7 @@ snapshot, not a live guarantee.
 
 | Holder | Since | Purpose |
 |---|---|---|
-| — (free) | 2026-10-05 | Released by Claude after K6; shared checkout at the K6 commit, untracked `scripts/flamegraph.pl` (Codex) left in place |
+| Claude | 2026-10-05 | K12 (GIC-priority pseudo-NMI prototype): edits, LK build in the shared checkout |
 
 ## Pi state (last release, copied from bolt-aarch32)
 
@@ -105,7 +105,7 @@ current source. *Owner* is empty until someone claims it.
 | 5 | K5 | `setup.sh` re-run fails on a file left by overlay patch 0004 (`gic.h`) | P2 | — | Open | Finding #14; scoped clean of that one path before the reset |
 | 6 | K10 | Timer-mode sampling phase-locks to IRQ masking: LK re-arms its scheduler tick from the handling time, so delayed ticks shift every later one (65% vs 50% in the K6 ground-truth test) | P2 | — | Open | Re-arm from the missed deadline (LK timer, an overlay) or a dedicated sampling timer; PMU mode is already fixed |
 | 7 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Open | Feasibility first on the Pi: `EDDEVID.PCSample`, debug APB address, non-invasive debug enabled in Non-secure state; leaf PC only |
-| 8 | K12 | IRQ-masked blind spot, route 3: mask by GIC priority (pseudo-NMI) instead of CPSR.I so the PMU interrupt still fires in masked code | P3 | — | Open | Needs the target GIC version (GICv3 `ICC_PMR`); larger LK change; prototype on the Pi's GICv2 `GICC_PMR` |
+| 8 | K12 | IRQ-masked blind spot, route 3: mask by GIC priority (pseudo-NMI) instead of CPSR.I so the PMU interrupt still fires in masked code | P3 | P2 | Claude | In progress |
 | 9 | K7 | Full `profiler stat`: any command, all 6 counters, derived IPC | P3 | — | Open | Review Phase 3 item 3 |
 | 10 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
 | 11 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim | P3 | — | Open | Fold into the next commit touching the same file |
