@@ -1,0 +1,7 @@
+thread_become_idle;arch_idle 3943
+secondary_cpu_bootstrap_thread;thread_become_idle 1
+thread_secondary_cpu_entry;arch_idle 7992
+cmd_profiler;profiler_spin_ticks 1964
+cmd_profiler;profiler_masked_spin;[irq-masked: profiler_masked_spin] 2019
+cmd_profiler;profiler_masked_spin 15
+0x3ea0;profiler_masked_spin 1

@@ -244,7 +244,12 @@ def export_capture(log: Path, elf: Path, output: Path, *, mode: str = "unknown",
                   "pmu_sampling": bool(h["modes"] & MODE_PMU),
                   "pmu_event_id": f"0x{h['event']:x}" if h["modes"] & MODE_PMU else None,
                   "pmu_period": h["period"] if h["modes"] & MODE_PMU else None,
-                  "pmu_config_changed_mid_run": bool(h["mixed"])}
+                  "pmu_config_changed_mid_run": bool(h["mixed"]),
+                  "timer_period_us": h.get("tperiod") if h["modes"] & MODE_TIMER else None,
+                  "timer_period_changed_mid_run": bool(h.get("tmixed")),
+                  "timer_source": (None if not h["modes"] & MODE_TIMER else
+                                   "lk-scheduler-tick" if h.get("tperiod") is None else
+                                   "dedicated-stratified")}
     artifacts = {"log": {"path": str(log), "sha256": sha256_file(log)},
                  "elf": {"path": str(elf), "sha256": sha256_file(elf)}}
     if image:

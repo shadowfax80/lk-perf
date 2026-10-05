@@ -1,0 +1,6 @@
+thread_become_idle;arch_idle 3991
+thread_secondary_cpu_entry;arch_idle 8007
+cmd_profiler;printf;console_print_lock 1
+cmd_profiler;profiler_masked_spin;profiler_spin_ticks 2012
+cmd_profiler;profiler_spin_ticks 1985
+cmd_profiler;profiler_masked_spin 3

@@ -58,6 +58,13 @@
  * so it adds no timer-programming code and cannot double-program
  * hardware timer registers already owned by kernel/timer.c.
  *
+ * K10 (Pi 4B): timer-mode sampling no longer uses LK's tick. LK re-arms
+ * that tick relative to when it is handled, so a tick delayed by masked
+ * code shifts every later one and the samples phase-lock onto the masking
+ * pattern. The profiler now owns the per-core virtual timer (CNTV, which
+ * LK does not use here) and keeps its own sampling grid; see
+ * profiler_timer_next().
+ *
  * M5 (real Pi 4B hardware): three more fields per sample -- SPSR (full
  * register, not just the Thumb bit already extracted below: the host
  * needs it to know the interrupted mode, and to correctly mask the ARM
@@ -136,7 +143,9 @@ status_t gic_configure_interrupt(unsigned int vector,
 // found by checking the actual registered vector before the first
 // real hardware test, not by a failed test.
 #if BCM2711
-#define PROFILER_TIMER_IRQ 30
+// K10: the profiler's own per-core sampling timer, the virtual timer (GIC
+// PPI 27 on BCM2711; LK's tick stays on the Non-secure physical timer, 30).
+#define PROFILER_TIMER_IRQ 27
 #else
 #define PROFILER_TIMER_IRQ 27
 #endif
@@ -384,8 +393,11 @@ static bool profiler_nmi_prio_ok(unsigned int irq, uint8_t want) {
     return !(*PROFILER_GICD_ISENABLER(irq / 32) & (1u << (irq % 32)));
 }
 
+// K10: the sampling timer gets the sampling priority too, so timer-mode
+// samples also reach masked thread code in this mode.
 static uint8_t profiler_nmi_prio_for(unsigned int irq) {
-    return (irq >= PROFILER_PMU_SPI_BASE && irq < PROFILER_PMU_SPI_BASE + 4)
+    return ((irq >= PROFILER_PMU_SPI_BASE && irq < PROFILER_PMU_SPI_BASE + 4) ||
+            irq == PROFILER_TIMER_IRQ)
                ? PROFILER_NMI_PRIO_PMU : PROFILER_NMI_PRIO_NORMAL;
 }
 
@@ -404,8 +416,8 @@ static void profiler_nmi_on_this_cpu(void *context) {
     ctx->bad_irq[cpu] = 32;
     // SGIs and PPIs (0-31) have banked priorities: program them per core.
     for (unsigned int irq = 0; irq < 32; irq++) {
-        *PROFILER_GICD_IPRIORITY(irq) = PROFILER_NMI_PRIO_NORMAL;
-        if (!profiler_nmi_prio_ok(irq, PROFILER_NMI_PRIO_NORMAL) && ctx->bad_irq[cpu] == 32) {
+        *PROFILER_GICD_IPRIORITY(irq) = profiler_nmi_prio_for(irq);
+        if (!profiler_nmi_prio_ok(irq, profiler_nmi_prio_for(irq)) && ctx->bad_irq[cpu] == 32) {
             ctx->bad_irq[cpu] = irq;
             ctx->bad_prio[cpu] = *PROFILER_GICD_IPRIORITY(irq);
             ok = false;
@@ -559,6 +571,91 @@ static inline uint32_t profiler_sat32(uint64_t v) {
     return v > 0xffffffffu ? 0xffffffffu : (uint32_t)v;
 }
 
+// K10: sampling periods whose whole length passed before the previous
+// sample could be taken (the core was masked throughout), per core.
+volatile uint32_t profiler_timer_missed[SMP_MAX_CPUS];
+
+#if BCM2711
+// K10: timer-mode sampling on the per-core virtual timer. Time is cut into
+// periods of a fixed length, counted from when sampling was armed, and each
+// period gets exactly one deadline at a random offset inside it (stratified
+// random sampling). The grid never moves: a sample delayed by masked code
+// does not shift the later deadlines, so the sample share of any code
+// equals its share of time for every workload, periodic or not; a fixed
+// offset would still alias with a workload whose period divides the
+// sampling period. A deadline that falls inside masked code is taken at the
+// unmask, as before, with its delay in `lat`.
+static uint32_t profiler_timer_period;                  // CNTVCT ticks
+static uint64_t profiler_timer_stratum[SMP_MAX_CPUS];   // start of the current period
+static uint32_t profiler_timer_rng[SMP_MAX_CPUS];
+
+static inline uint64_t profiler_cntvct(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("isb; mrrc p15, 1, %0, %1, c14" : "=r"(lo), "=r"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static inline uint64_t profiler_cntv_cval(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("mrrc p15, 3, %0, %1, c14" : "=r"(lo), "=r"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+static inline void profiler_cntv_ctl(uint32_t ctl) {
+    __asm__ volatile("mcr p15, 0, %0, c14, c3, 1; isb" : : "r"(ctl) : "memory");
+}
+
+// A new compare value takes the timer output low at once (the condition is
+// evaluated continuously), so the level interrupt is gone before the EOI.
+static inline void profiler_cntv_arm(uint64_t cval) {
+    __asm__ volatile("mcrr p15, 3, %0, %1, c14" : : "r"((uint32_t)cval),
+                     "r"((uint32_t)(cval >> 32)) : "memory");
+    profiler_cntv_ctl(1);   // enabled, not masked
+}
+
+static uint32_t profiler_timer_offset(uint cpu) {
+    uint32_t x = profiler_timer_rng[cpu];   // xorshift32
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    profiler_timer_rng[cpu] = x;
+    return x % profiler_timer_period;
+}
+
+// Runs in an IPI on every core.
+static void profiler_timer_arm_this_cpu(void *context) {
+    (void)context;
+    uint cpu = arch_curr_cpu_num();
+    uint64_t now = profiler_cntvct();
+    uint32_t seed = (uint32_t)now ^ (0x9e3779b9u * (cpu + 1));
+    profiler_timer_rng[cpu] = seed ? seed : 1;
+    profiler_timer_stratum[cpu] = now;
+    profiler_cntv_arm(now + profiler_timer_offset(cpu));
+    unmask_interrupt(PROFILER_TIMER_IRQ);   // PPI: enables it on this core only
+}
+
+static void profiler_timer_disarm_this_cpu(void *context) {
+    (void)context;
+    profiler_cntv_ctl(0);
+    mask_interrupt(PROFILER_TIMER_IRQ);
+}
+
+// Called for each timer sample, `now` being when it was taken: move to the
+// next period and arm its deadline. Periods that ended while this core was
+// masked get no sample and are counted.
+static void profiler_timer_next(uint cpu, uint64_t now) {
+    uint64_t period = profiler_timer_period;
+    uint64_t next = profiler_timer_stratum[cpu] + period;
+    if (now >= next + period) {
+        uint64_t whole = (now - next) / period;
+        profiler_timer_missed[cpu] += (uint32_t)whole;
+        next += whole * period;
+    }
+    profiler_timer_stratum[cpu] = next;
+    profiler_cntv_arm(next + profiler_timer_offset(cpu));
+}
+#endif
+
 // K1: bytes that can be read upward from the interrupted SP without leaving
 // its stack. Created threads record their stack (thread_t::stack/stack_size);
 // idle threads and the bootstrap thread record none and run on the per-core
@@ -610,6 +707,11 @@ void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
 #endif
     if (!is_timer_tick && !is_pmu_overflow) {
 #if BCM2711
+        // K10: the sampling timer is level-triggered too; one that fires
+        // after `stop` (before the disarm IPI reached this core) is
+        // switched off here instead of re-raising itself.
+        if (vector == PROFILER_TIMER_IRQ)
+            profiler_cntv_ctl(0);
         // Review finding #1: a real PMU-overflow vector for THIS core
         // must always be acknowledged, even when profiler_pmu_enabled[cpu]
         // is false -- it's level-triggered, so an unacknowledged one
@@ -625,6 +727,13 @@ void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
 #endif
         return;
     }
+
+#if BCM2711
+    // K10: no deadline has passed (the interrupt was seen again before the
+    // re-arm took the timer output low): nothing to sample.
+    if (is_timer_tick && !is_pmu_overflow && profiler_cntvct() < profiler_cntv_cval())
+        return;
+#endif
 
     bool thumb = (frame->spsr & PROFILER_SPSR_T_BIT) != 0;
 
@@ -661,8 +770,15 @@ void profiler_on_tick(struct arm_iframe *frame, unsigned int vector) {
     } else
 #endif
     {
+#if BCM2711
+        uint64_t vnow = profiler_cntvct();
+        uint64_t deadline = profiler_cntv_cval();
+        lat = vnow >= deadline ? profiler_sat32(vnow - deadline) : 0;
+        profiler_timer_next(cpu, vnow);
+#else
         uint64_t deadline = profiler_cntp_cval();
         lat = now_count >= deadline ? profiler_sat32(now_count - deadline) : 0;
+#endif
         src = 't';
     }
     const struct arm_irqmask_cpu *mc = &arm_irqmask_cpu[cpu];
@@ -1032,7 +1148,7 @@ extern const uint8_t __rodata_end[];
 // which sampling modes and PMU configuration produced it, and how many
 // samples each core took, kept, overwrote and lost, so a log holding several
 // dumps or a damaged transfer can be interpreted without operator notes.
-#define PROFILER_DUMP_FORMAT 2u
+#define PROFILER_DUMP_FORMAT 3u   // 3: K10 timer period and missed periods
 #define PROFILER_MODE_TIMER (1u << 0)
 #define PROFILER_MODE_PMU (1u << 1)
 static uint64_t profiler_run_id;       // CNTPCT when the session started
@@ -1041,6 +1157,8 @@ static uint32_t profiler_modes_used;   // PROFILER_MODE_* armed in this session
 static uint32_t profiler_pmu_event_used;
 static uint32_t profiler_pmu_period_used;
 static uint32_t profiler_pmu_config_mixed;  // a second, different PMU config
+static uint32_t profiler_timer_period_us;   // K10: timer-mode period (0: none)
+static uint32_t profiler_timer_mixed;       // a second, different timer period
 
 static void profiler_session_start(void) {
     profiler_run_id = profiler_cntpct();
@@ -1049,7 +1167,149 @@ static void profiler_session_start(void) {
     profiler_pmu_event_used = 0;
     profiler_pmu_period_used = 0;
     profiler_pmu_config_mixed = 0;
+    profiler_timer_period_us = 0;
+    profiler_timer_mixed = 0;
 }
+
+// K11 feasibility: what this core says about PC sampling through the
+// external debug interface (EDPCSR), from CP14 registers that are always
+// readable at PL1: whether PC sampling is implemented, whether non-invasive
+// debug is allowed in each security state, and where the debug ROM table
+// is, if the CPU can reach its own debug registers through memory.
+#define PROFILER_MRC14(op1, crn, crm, op2) ({ uint32_t v; \
+    __asm__ volatile("mrc p14, " #op1 ", %0, " #crn ", " #crm ", " #op2 : "=r"(v)); v; })
+
+static void profiler_dbginfo(void) {
+    uint32_t midr, lo, hi;
+    __asm__ volatile("mrc p15, 0, %0, c0, c0, 0" : "=r"(midr));
+    uint32_t didr = PROFILER_MRC14(0, c0, c0, 0);
+    uint32_t devid = PROFILER_MRC14(0, c7, c2, 7);
+    uint32_t devid1 = PROFILER_MRC14(0, c7, c1, 7);
+    uint32_t auth = PROFILER_MRC14(0, c7, c14, 6);
+    uint32_t oslsr = PROFILER_MRC14(0, c1, c1, 4);
+    uint32_t prcr = PROFILER_MRC14(0, c1, c4, 4);
+    uint32_t dscr = PROFILER_MRC14(0, c0, c1, 0);
+    __asm__ volatile("mrrc p14, 0, %0, %1, c1" : "=r"(lo), "=r"(hi));
+    uint64_t drar = ((uint64_t)hi << 32) | lo;
+    printf("dbginfo: cpu%u MIDR=%08x DBGDIDR=%08x DBGDEVID=%08x DBGDEVID1=%08x\n",
+           arch_curr_cpu_num(), midr, didr, devid, devid1);
+    printf("dbginfo: PC sampling (DBGDEVID.PCSample)=%u: %s; PCSR offset (DBGDEVID1)=%u\n",
+           devid & 0xf,
+           (devid & 0xf) == 0 ? "not implemented" :
+           (devid & 0xf) == 3 ? "EDPCSR+EDCIDSR+EDVIDSR" : "EDPCSR (partial)",
+           devid1 & 0xf);
+    printf("dbginfo: DBGAUTHSTATUS=%08x: non-invasive NS %s, S %s; invasive NS %s, S %s\n", auth,
+           (auth & 0xc) == 0xc ? "enabled" : (auth & 0xc) == 0x8 ? "disabled" : "n/i",
+           (auth & 0xc0) == 0xc0 ? "enabled" : (auth & 0xc0) == 0x80 ? "disabled" : "n/i",
+           (auth & 0x3) == 0x3 ? "enabled" : (auth & 0x3) == 0x2 ? "disabled" : "n/i",
+           (auth & 0x30) == 0x30 ? "enabled" : (auth & 0x30) == 0x20 ? "disabled" : "n/i");
+    printf("dbginfo: DBGOSLSR=%08x (OS lock %s) DBGPRCR=%08x DBGDSCRint=%08x\n", oslsr,
+           (oslsr & 0x2) ? "locked" : "unlocked", prcr, dscr);
+    printf("dbginfo: DBGDRAR=%016llx: ROM table %s at %016llx\n", (unsigned long long)drar,
+           (drar & 3) == 3 ? "valid" : (drar & 3) == 0 ? "NOT VALID (no memory-mapped route)"
+                                                        : "reserved",
+           (unsigned long long)(drar & ~0xfffull));
+}
+
+#if BCM2711
+// K11 feasibility: walk the CoreSight ROM table DBGDRAR names and report
+// each component; for the cores' debug blocks, read the PC-sample
+// registers from this core. Only the BCM2711 low-peripheral window
+// (0xfc000000-0xffffffff, mapped as device memory) is reachable.
+#define PROFILER_DBG_MAX 16
+static uint32_t profiler_dbg_core_pa[PROFILER_DBG_MAX];
+static uint32_t profiler_dbg_core_aff[PROFILER_DBG_MAX];
+static uint32_t profiler_dbg_cores;
+
+static volatile uint32_t *profiler_dbg_reg(uint32_t pa, uint32_t off) {
+    return (volatile uint32_t *)(BCM2711_LOW_PERIPH_VIRT + (pa - BCM2711_LOW_PERIPH_PHYS) + off);
+}
+
+static bool profiler_dbg_reachable(uint32_t pa) {
+    return pa >= BCM2711_LOW_PERIPH_PHYS && pa <= 0xfffff000u;
+}
+
+static void profiler_dbg_walk(uint32_t rom, int depth, bool print) {
+    for (uint32_t i = 0; i < 64; i++) {
+        uint32_t e = *profiler_dbg_reg(rom, 4 * i);
+        if (e == 0)
+            break;
+        uint32_t pa = rom + (e & 0xfffff000u);
+        if (!(e & 1)) {
+            if (print)
+                printf("dbgrom: %*s[%u] %08x not present\n", depth * 2, "", i, e);
+            continue;
+        }
+        if (!profiler_dbg_reachable(pa)) {
+            if (print)
+                printf("dbgrom: %*s[%u] %08x -> %08x outside the mapped window\n", depth * 2, "",
+                       i, e, pa);
+            continue;
+        }
+        uint32_t cidr1 = *profiler_dbg_reg(pa, 0xff4);
+        uint32_t cls = (cidr1 >> 4) & 0xf;
+        uint32_t part = (*profiler_dbg_reg(pa, 0xfe0) & 0xff) |
+                        ((*profiler_dbg_reg(pa, 0xfe4) & 0xf) << 8);
+        uint32_t devarch = *profiler_dbg_reg(pa, 0xfbc);
+        uint32_t devtype = *profiler_dbg_reg(pa, 0xfcc) & 0xff;
+        uint32_t aff = *profiler_dbg_reg(pa, 0xfa8);
+        if (print)
+            printf("dbgrom: %*s[%u] %08x class %x part %03x devarch %08x devtype %02x aff %08x\n",
+                   depth * 2, "", i, pa, cls, part, devarch, devtype, aff);
+        if (cls == 1 && depth < 2)
+            profiler_dbg_walk(pa, depth + 1, print);
+        if (cls == 9 && devtype == 0x15 && profiler_dbg_cores < PROFILER_DBG_MAX) {
+            profiler_dbg_core_pa[profiler_dbg_cores] = pa;
+            profiler_dbg_core_aff[profiler_dbg_cores] = aff;
+            profiler_dbg_cores++;
+        }
+    }
+}
+
+static bool profiler_dbg_find(bool print) {
+    uint32_t lo, hi;
+    __asm__ volatile("mrrc p14, 0, %0, %1, c1" : "=r"(lo), "=r"(hi));
+    uint32_t rom = lo & ~0xfffu;
+    profiler_dbg_cores = 0;
+    if ((lo & 3) != 3 || hi != 0 || !profiler_dbg_reachable(rom)) {
+        printf("dbgrom: no reachable ROM table (DBGDRAR %08x%08x)\n", hi, lo);
+        return false;
+    }
+    if (print)
+        printf("dbgrom: ROM table %08x, CIDR %08x %08x\n", rom, *profiler_dbg_reg(rom, 0xff0),
+               *profiler_dbg_reg(rom, 0xff4));
+    profiler_dbg_walk(rom, 0, print);
+    return true;
+}
+
+static void profiler_dbg_unlock_os_this_cpu(void *context) {
+    (void)context;
+    __asm__ volatile("mcr p14, 0, %0, c1, c0, 4; isb" : : "r"(0) : "memory");   // DBGOSLAR
+}
+
+static void profiler_dbgpcsr(void) {
+    if (!profiler_dbg_find(false) || !profiler_dbg_cores) {
+        printf("dbgpcsr: no core debug blocks found\n");
+        return;
+    }
+    mp_sync_exec(MP_IPI_TARGET_ALL, 0, profiler_dbg_unlock_os_this_cpu, NULL);
+    printf("dbgpcsr: OS lock cleared on all cores; reading from cpu%u\n", arch_curr_cpu_num());
+    for (uint32_t c = 0; c < profiler_dbg_cores; c++) {
+        uint32_t pa = profiler_dbg_core_pa[c];
+        printf("dbgpcsr: %08x aff %08x EDDEVID %08x EDPRSR %08x EDAUTHSTATUS %08x EDLSR %08x\n",
+               pa, profiler_dbg_core_aff[c], *profiler_dbg_reg(pa, 0xfc8),
+               *profiler_dbg_reg(pa, 0x314), *profiler_dbg_reg(pa, 0xfb8),
+               *profiler_dbg_reg(pa, 0xfb4));
+        for (int k = 0; k < 4; k++) {
+            uint32_t pcl = *profiler_dbg_reg(pa, 0x0a0);   // EDPCSRlo: takes the sample
+            uint32_t cid = *profiler_dbg_reg(pa, 0x0a4);
+            uint32_t vid = *profiler_dbg_reg(pa, 0x0a8);
+            uint32_t pch = *profiler_dbg_reg(pa, 0x0ac);
+            printf("dbgpcsr:   EDPCSR %08x%08x EDCIDSR %08x EDVIDSR %08x\n", pch, pcl, cid, vid);
+        }
+    }
+}
+#endif
 
 static uint32_t profiler_image_hash(void) {
     uint32_t h = 0x811c9dc5u;
@@ -1060,13 +1320,21 @@ static uint32_t profiler_image_hash(void) {
 
 static int cmd_profiler(int argc, const console_cmd_args *argv) {
     if (argc < 2) {
-        printf("usage: profiler <start|stop|status|clear|dump|bench|nest|smp|edgetest|stat|pmustart|pmustop|pmu|maskon|maskoff|mask|masktest|memtest|nmion|nmioff|buildid>\n");
+        printf("usage: profiler <start [period_us]|stop|status|clear|dump|bench|nest|smp|edgetest|stat|pmustart|pmustop|pmu|maskon|maskoff|mask|masktest|memtest|nmion|nmioff|buildid|dbginfo|dbgrom|dbgpcsr>\n");
         return -1;
     }
 
     const char *sub = argv[1].str;
 
-    if (!strcmp(sub, "buildid")) {
+    if (!strcmp(sub, "dbginfo")) {
+        profiler_dbginfo();
+#if BCM2711
+    } else if (!strcmp(sub, "dbgrom")) {
+        profiler_dbg_find(true);
+    } else if (!strcmp(sub, "dbgpcsr")) {
+        profiler_dbgpcsr();
+#endif
+    } else if (!strcmp(sub, "buildid")) {
         uint64_t t0 = profiler_cntpct();
         uint32_t h = profiler_image_hash();
         uint64_t t1 = profiler_cntpct();
@@ -1087,7 +1355,8 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
 #if BCM2711
         if (profiler_nmi_enable())
             printf("nmi: pseudo-NMI on all %d cores: masked code is masked by GIC priority, "
-                   "PMU sampling still reaches it (IRQ handlers stay unsampled)\n", SMP_MAX_CPUS);
+                   "PMU and timer sampling still reach it (IRQ handlers stay unsampled)\n",
+                   SMP_MAX_CPUS);
 #else
         printf("nmi: needs real hardware (BCM2711)\n");
 #endif
@@ -1114,18 +1383,45 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         profiler_masktest(loops, us);
         printf("masktest: done\n");
     } else if (!strcmp(sub, "start")) {
+#if BCM2711
+        uint32_t us = argc >= 3 ? (uint32_t)argv[2].u : 10000;
+        if (us < 50 || us > 1000000) {
+            printf("usage: profiler start [period_us]  (50..1000000, default 10000)\n");
+            return -1;
+        }
+        if (profiler_enabled) {
+            profiler_enabled = 0;
+            mp_sync_exec(MP_IPI_TARGET_ALL, 0, profiler_timer_disarm_this_cpu, NULL);
+        }
+#endif
         if (!profiler_run_id)
             profiler_session_start();
+#if BCM2711
+        if ((profiler_modes_used & PROFILER_MODE_TIMER) && profiler_timer_period_us != us)
+            profiler_timer_mixed = 1;
+        profiler_timer_period_us = us;
+#endif
         profiler_modes_used |= PROFILER_MODE_TIMER;
         if (!arm_irqmask_on) {
             profiler_mask_on();
             printf("mask: IRQ-masked time accounting started with sampling\n");
         }
         profiler_enabled = 1;
+#if BCM2711
+        profiler_timer_period = (uint32_t)(((uint64_t)us * profiler_cntfrq()) / 1000000u);
+        mp_sync_exec(MP_IPI_TARGET_ALL, 0, profiler_timer_arm_this_cpu, NULL);
+        printf("profiler: sampling started (virtual timer irq %d, one sample at a random point "
+               "of every %u us, %d cores, buffer %d entries/core)\n",
+               PROFILER_TIMER_IRQ, us, SMP_MAX_CPUS, PROFILER_BUF_SIZE);
+#else
         printf("profiler: sampling started (irq %d, %d cores, buffer %d entries/core)\n",
                PROFILER_TIMER_IRQ, SMP_MAX_CPUS, PROFILER_BUF_SIZE);
+#endif
     } else if (!strcmp(sub, "stop")) {
         profiler_enabled = 0;
+#if BCM2711
+        mp_sync_exec(MP_IPI_TARGET_ALL, 0, profiler_timer_disarm_this_cpu, NULL);
+#endif
         uint32_t total = 0;
         for (int c = 0; c < SMP_MAX_CPUS; c++) total += profiler_total[c];
         printf("profiler: sampling stopped (%u samples total across %d cores)\n",
@@ -1147,8 +1443,10 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         memset(profiler_mgap_buf, 0, sizeof(profiler_mgap_buf));
         memset(profiler_slen_buf, 0, sizeof(profiler_slen_buf));
         profiler_session_start();
-        for (int c = 0; c < SMP_MAX_CPUS; c++)
+        for (int c = 0; c < SMP_MAX_CPUS; c++) {
             profiler_pmu_missed[c] = 0;
+            profiler_timer_missed[c] = 0;
+        }
         if (arm_irqmask_on)
             profiler_mask_on();
         printf("profiler: buffer cleared%s\n",
@@ -1216,25 +1514,26 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
                           (uint32_t)(profiler_run_id >> 32), dump_no, image_lo, image_hi,
                           build, profiler_modes_used, profiler_pmu_event_used,
                           profiler_pmu_period_used, profiler_pmu_config_mixed, SMP_MAX_CPUS,
-                          PROFILER_BUF_SIZE };
+                          PROFILER_BUF_SIZE, profiler_timer_period_us, profiler_timer_mixed };
         for (unsigned i = 0; i < sizeof(hv) / sizeof(hv[0]); i++)
             hk = profiler_fnv(hk, hv[i]);
         printf("DUMPBEGIN fmt=%08x run=%016llx dump=%08x image=%08x-%08x build=%08x "
-               "modes=%08x event=%08x period=%08x mixed=%08x cpus=%08x buf=%08x crc=%08x\n",
+               "modes=%08x event=%08x period=%08x mixed=%08x cpus=%08x buf=%08x "
+               "tperiod=%08x tmixed=%08x crc=%08x\n",
                PROFILER_DUMP_FORMAT, (unsigned long long)profiler_run_id, dump_no, image_lo,
                image_hi, build, profiler_modes_used, profiler_pmu_event_used,
                profiler_pmu_period_used, profiler_pmu_config_mixed, SMP_MAX_CPUS,
-               PROFILER_BUF_SIZE, hk);
+               PROFILER_BUF_SIZE, profiler_timer_period_us, profiler_timer_mixed, hk);
         for (int c = 0; c < SMP_MAX_CPUS; c++) {
             uint32_t kept = snap_total[c] < PROFILER_BUF_SIZE ? snap_total[c] : PROFILER_BUF_SIZE;
             uint32_t ck = 0x811c9dc5u;
             uint32_t cv[] = { (uint32_t)c, snap_total[c], kept, snap_total[c] - kept,
-                              profiler_pmu_missed[c] };
+                              profiler_pmu_missed[c], profiler_timer_missed[c] };
             for (unsigned i = 0; i < sizeof(cv) / sizeof(cv[0]); i++)
                 ck = profiler_fnv(ck, cv[i]);
             printf("DUMPCPU cpu=%d total=%08x retained=%08x overwritten=%08x pmumissed=%08x "
-                   "crc=%08x\n", c, snap_total[c], kept, snap_total[c] - kept,
-                   profiler_pmu_missed[c], ck);
+                   "tmissed=%08x crc=%08x\n", c, snap_total[c], kept, snap_total[c] - kept,
+                   profiler_pmu_missed[c], profiler_timer_missed[c], ck);
         }
 
         uint32_t seq = 0;
@@ -1557,10 +1856,10 @@ static int cmd_profiler(int argc, const console_cmd_args *argv) {
         uint32_t total = 0;
         for (int c = 0; c < SMP_MAX_CPUS; c++) {
             total += profiler_total[c];
-            printf("profiler: cpu%d total_samples=%u head=%u%s pmu_missed=%u\n", c,
-                   profiler_total[c], profiler_head[c],
+            printf("profiler: cpu%d total_samples=%u head=%u%s pmu_missed=%u timer_missed=%u\n",
+                   c, profiler_total[c], profiler_head[c],
                    profiler_total[c] >= PROFILER_BUF_SIZE ? " (WRAPPED)" : "",
-                   profiler_pmu_missed[c]);
+                   profiler_pmu_missed[c], profiler_timer_missed[c]);
         }
         printf("profiler: enabled=%u total_samples(all cpus)=%u capacity=%d/core\n",
                profiler_enabled, total, PROFILER_BUF_SIZE);

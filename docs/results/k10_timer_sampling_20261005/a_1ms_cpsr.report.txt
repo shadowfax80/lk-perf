@@ -1,0 +1,44 @@
+warning: 2 sample(s) failed their checksum, 30 sample(s) missing entirely (seq gap) -- both dropped, not trusted
+note: the log holds 3 dumps; reporting dump 1, the others are ignored (--dump N picks another)
+dump 1 of 3 in this log: run 00008024000453f9, dump #1 of that run; modes timer, timer one sample per 1000 us; ELF matches the image (b8a617cc)
+  cpu0: 4008 taken, 4008 retained
+  cpu1: 4008 taken, 4008 retained
+  cpu2: 4008 taken, 4008 retained
+  cpu3: 4008 taken, 4008 retained
+records: 16032 sent, 16000 accepted, 32 lost or rejected in transfer
+
+16000 samples across 4 cpu(s): {0: 3989, 1: 4007, 2: 3998, 3: 4006}
+5 distinct thread(s) sampled (by thread_t* -- see profiler.c)
+unwind depth histogram (frames per sample): {2: 16000}
+no-CFI code: 11996 sample(s) in assembly without unwind data got their caller from the interrupted LR (checked to follow a call); their stacks end there
+stack window: 11996 sample(s) bounded by their stack top (< 128 bytes above SP), 0 with SP on no known stack (nothing copied)
+
+   count       %  leaf function (source line)
+   11996   75.0%  arch_idle  (ops.S:52)
+    2042   12.8%  profiler_spin_ticks  (profiler.c:554)
+    1962   12.3%  profiler_masked_spin  (profiler.c:875)
+
+IRQ-masked time (invisible to IRQ sampling), accounting on at dump time:
+  cpu0:  0.09% masked (0.09% in IRQ handlers), 4022 regions, longest 19.7 us at [irq handler, GIC ID 153]
+  cpu1:  0.08% masked (0.08% in IRQ handlers), 4043 regions, longest 4.7 us at [irq handler, GIC ID 15]
+  cpu2:  0.08% masked (0.08% in IRQ handlers), 4021 regions, longest 3.9 us at [irq handler, GIC ID 15]
+  cpu3: 50.01% masked (0.11% in IRQ handlers), 8507 regions, longest 500.2 us at profiler_masked_spin
+
+  % of time   regions     longest  masking site
+    12.476%      4000     500.2us  profiler_masked_spin
+     0.081%     16032       2.7us  [irq handler, GIC ID 27]
+     0.004%       400       2.3us  [irq handler, GIC ID 30]
+     0.001%        12      19.7us  [irq handler, GIC ID 153]
+     0.000%        15       4.7us  [irq handler, GIC ID 15]
+     0.000%        55       1.7us  cbuf_read_char
+     0.000%        55       2.8us  event_wait_timeout
+     0.000%         6       3.1us  [irq handler, GIC ID 14]
+     0.000%         8       0.4us  mutex_acquire_timeout
+     0.000%         8       0.4us  mutex_release
+     0.000%         2       0.9us  mp_sync_exec_etc
+
+Samples delayed by IRQ masking (taken late, so the PC is the unmask point):
+  timer, CNTPCT ticks: 1949/16000 delayed (threshold 180), 1949 attributed to the region that held them
+      1949  profiler_masked_spin
+
+wrote final0.folded -- render with: perl scripts/flamegraph.pl final0.folded > flame.svg

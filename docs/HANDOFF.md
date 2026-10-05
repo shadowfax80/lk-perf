@@ -80,13 +80,13 @@ snapshot, not a live guarantee.
 
 | Holder | Since | Purpose |
 |---|---|---|
-| Claude | 2026-10-05 | K10 (timer phase lock) and K11 (EDPCSR cross-core sampling) |
+| — (free) | 2026-10-05 | Released by Claude after K10/K11; shared checkout at the K10/K11 commit, untracked `scripts/flamegraph.pl` (Codex) left in place |
 
 ## Pi state (last release, copied from bolt-aarch32)
 
 | Released by | When | Board state |
 |---|---|---|
-| Claude | 2026-10-05 | lk-perf K3 image (lk.bin `052a2e91…`) at the shell, 6000000 baud, pseudo-NMI off, samplers stopped, COM5 closed; no watchdog command issued. Recheck before use; `--reboot` at 6 Mbaud returns it to the loader |
+| Claude | 2026-10-05 | lk-perf K10/K11 image (lk.bin `866ffee1…`) at the shell, 6000000 baud, pseudo-NMI off, samplers stopped, OS lock cleared on all cores by `dbgpcsr` (harmless; reset restores it), COM5 closed. Recheck before use; `--reboot` at 6 Mbaud returns it to the loader |
 
 ## Claims (consolidated TODO)
 
@@ -100,17 +100,17 @@ current source. *Owner* is empty until someone claims it.
 |---|---|---|---|---|---|---|
 | 1 | K4 | `profiler stat` counts its own `printf` output (counters start before the status prints) | P2 | — | Open | Finding #10; confirmed still present in `profiler.c` |
 | 2 | K5 | `setup.sh` re-run fails on a file left by overlay patch 0004 (`gic.h`) | P2 | — | Open | Finding #14; scoped clean of that one path before the reset |
-| 3 | K10 | Timer-mode sampling phase-locks to IRQ masking: LK re-arms its scheduler tick from the handling time, so delayed ticks shift every later one (65% vs 50% in the K6 ground-truth test) | P2 | Claude | In progress | Re-arm from the missed deadline (LK timer, an overlay) or a dedicated sampling timer; PMU mode is already fixed |
-| 4 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | Claude | In progress | Feasibility first on the Pi: `EDDEVID.PCSample`, debug APB address, non-invasive debug enabled in Non-secure state; leaf PC only |
-| 5 | K7 | Full `profiler stat`: any command, all 6 counters, derived IPC | P3 | — | Open | Review Phase 3 item 3 |
-| 6 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
-| 7 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim | P3 | — | Open | Fold into the next commit touching the same file |
-| 8 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
+| 3 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Blocked | Feasibility done (Claude, K11): A72 implements `EDPCSR` and the CPU reaches every core's debug block, but the SoC disables non-invasive debug (`DBGAUTHSTATUS` 0xaa), so `EDPCSR` reads `ffffffff`. Untested lever: `enable_jtag_gpio=1` in `config.txt` (SD-card change, needs user approval). On the target: `profiler dbginfo`; [results](results/k11_edpcsr_feasibility_20261005/README.md) |
+| 4 | K7 | Full `profiler stat`: any command, all 6 counters, derived IPC | P3 | — | Open | Review Phase 3 item 3 |
+| 5 | K8 | Scheduling, wakeup, blocking and CPU-frequency capture | P3 | — | Open | Documented limitation; needs target event instrumentation |
+| 6 | K9 | Small fixes: stale `profiler pmu` message; `resolve_lines()` misses a function's first line when two `.debug_line` rows share an address; DESIGN.md's per-core cache-line claim | P3 | — | Open | Fold into the next commit touching the same file |
+| 7 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
 
 ### Done (recent)
 
 | ID | Item | Owner | Evidence |
 |---|---|---|---|
+| K10 | Timer-mode sampling on the profiler's own per-core virtual timer: fixed grid, one sample at a random point of each period, lost periods counted, period selectable (`start [period_us]`), dump format 3; timer samples also reach masked code under pseudo-NMI | Claude | Pi `masktest` 50% masked, about 4000 samples per run: 49.0% (1 ms), 50.9% (10 ms, commensurate), 50.4% pseudo-NMI with 0 delayed; was 65% on LK's tick; `test_irqmask_report.py` 23; [results/k10_timer_sampling_20261005](results/k10_timer_sampling_20261005/README.md) |
 | K3 | No-CFI fallback: caller of assembly without CFI taken from a validated LR (follows a call, outside the leaf) | Claude | Pi `memtest`: all 460 `memcpy`/`memset` samples attributed to their true callers (previously no caller); earlier captures unchanged; `nocfi.S` unwinder fixture, exporter tests 27; [results/k3_nocfi_fallback_20261005](results/k3_nocfi_fallback_20261005/README.md) |
 | K2 | Self-describing capture: session header (run, dump, image hash, modes/event/period), per-core counts, footer; host picks the latest dump and refuses a mismatched ELF | Claude | Pi: image hash stable and equal to the ELF's (0.7 ms); two-dump log split; exact transfer loss (7/8458) and overwrite counts; wrong ELF refused; older capture exported byte-identically; `test_irqmask_report.py` 20; [results/k2_session_20261005](results/k2_session_20261005/README.md) |
 | K1 | Stack-copy bounds: copy stops at the top of the sampled stack; `slen` field; unwinder stops at the stack top | Claude | Pi: four-core workload had 20 bytes above SP (108 bytes read past the stack before), now bounded with a clean root; idle samples bounded at the boot-stack top; `test_dwarf_unwind.py` stack-top case, `test_irqmask_report.py` 14; [results/k1_stack_bounds_20261005](results/k1_stack_bounds_20261005/README.md) |
@@ -126,6 +126,27 @@ Earlier milestones (M1–M5, DWARF unwinder, review Phases 1–2) are recorded i
 [RPI4_BRINGUP.md](RPI4_BRINGUP.md).
 
 ## Handoff log
+
+### 2026-10-05 — Claude: K10 done, K11 feasibility done (blocked on the Pi); lock and Pi released
+
+- K10: timer mode no longer samples LK's tick (LK re-arms it from the
+  handling time, so samples phase-locked onto masking: 65% vs 50%). The
+  profiler owns the per-core virtual timer (PPI 27). It keeps a fixed grid
+  with one deadline at a random offset in each period (stratified sampling,
+  so no aliasing with periodic workloads) and counts periods lost entirely
+  inside masked code (`tmissed`). `profiler start [period_us]`, default 10 ms.
+  Under `nmion` the timer gets the sampling priority too.
+- Pi ground truth, about 4000 samples per run: 49.0% (1 ms), 50.9% (10 ms,
+  exactly commensurate with the 1 ms workload), 50.4% under pseudo-NMI with
+  0 of 15999 delayed; accounting 50.0%. Dump format 3 (`tperiod`, `tmixed`,
+  `tmissed`); host parses 2 and 3; exporter records the timer source and
+  period. Tests 23/27/6 PASS, K3 archive identical, no FPU.
+- K11: `profiler dbginfo/dbgrom/dbgpcsr`. The A72 implements EDPCSR, the ROM
+  table (`0xff820000`) and all four core debug blocks are reachable, and
+  accesses work. But `DBGAUTHSTATUS` is 0xaa (non-invasive debug disabled), so
+  EDPCSR reads `ffffffff`. Not fixable from software. K11 is now Blocked;
+  `enable_jtag_gpio=1` is an untested lever that needs SD-card approval.
+- Lock free, Pi released. Next: K4/K5 (small), K7.
 
 ### 2026-10-05 — Claude: K3 done (no-CFI fallback); lock and Pi released
 

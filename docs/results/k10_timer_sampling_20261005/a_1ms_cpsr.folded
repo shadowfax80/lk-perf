@@ -1,0 +1,5 @@
+thread_become_idle;arch_idle 3989
+thread_secondary_cpu_entry;arch_idle 8007
+cmd_profiler;profiler_masked_spin;[irq-masked: profiler_masked_spin] 1949
+cmd_profiler;profiler_spin_ticks 2042
+cmd_profiler;profiler_masked_spin 13

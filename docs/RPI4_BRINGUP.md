@@ -3,6 +3,20 @@
 > Work queue, ownership and status updates: [HANDOFF.md](HANDOFF.md). This
 > file is the hardware evidence record.
 
+**Timer grid, K10 (2026-10-05, Claude):** timer mode now runs on the
+profiler's own per-core virtual timer (PPI 27). It keeps a fixed grid with
+one sample at a random point of each period, instead of riding LK's tick,
+which LK re-arms from the handling time. In the 50% masked ground truth the
+masked share went from 65% to 49.0% (1 ms) and 50.9% (10 ms), and to 50.4%
+under pseudo-NMI with no delayed samples. Details:
+[results/k10_timer_sampling_20261005](results/k10_timer_sampling_20261005/README.md).
+
+**EDPCSR feasibility, K11 (2026-10-05, Claude):** the A72's PC-sample
+registers exist and every core's debug block is reachable (ROM table
+`0xff820000`), but the SoC disables non-invasive debug (`DBGAUTHSTATUS`
+0xaa), so `EDPCSR` reads `ffffffff`. Blocked on the Pi as booted. Details:
+[results/k11_edpcsr_feasibility_20261005](results/k11_edpcsr_feasibility_20261005/README.md).
+
 **No-CFI callers, K3 (2026-10-05, Claude):** samples in LK's hand-written
 assembly (memcpy, memset, spinlocks, cache operations) had no caller because
 that code has no DWARF CFI. The unwinder now takes the caller from the

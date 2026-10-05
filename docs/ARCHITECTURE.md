@@ -8,6 +8,8 @@
 | exporter | Timestamped perf-script export ([EXPORT.md](EXPORT.md), [verification](results/PERF_EXPORT_VERIFICATION.md)) |
 | `0f7f5e3` (K6) | IRQ-masked time accounting, delayed-sample attribution, delay-compensated PMU reload, console printing without IRQ masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
 | `84c25a9` (K12) | Opt-in pseudo-NMI sampling by GIC priority masking ([§4.6](#46-irq-masking-accounting-attribution-and-pseudo-nmi)) |
+| K10 | Timer mode on the profiler's own per-core virtual timer: fixed grid, one sample at a random point of each period, lost periods counted; dump format 3 ([§4.2](#42-timer-mode)) |
+| K11 | Cross-core PC sampling (`EDPCSR`) feasibility: implemented and reachable on the A72, prohibited by the SoC's debug authentication ([§4.7](#47-cross-core-pc-sampling-edpcsr-feasibility)) |
 | K3 | Caller recovery for code without CFI from a validated LR ([§8.2](#82-per-sample-algorithm)) |
 | K2 | Self-describing dumps: session header with run id, image hash, modes/event/period; per-core taken/retained/overwritten/lost counts; footer record count ([§7.3](#73-sample-text-format), [§7.5](#75-transfer-cost-and-run-isolation)) |
 | K1 | Stack copy bounded by the top of the sampled stack, `slen` field, unwinder stops at the stack top ([§4.4](#44-captured-context), [§8.2](#82-per-sample-algorithm)) |
@@ -65,7 +67,7 @@ The Pi verifies the mechanism on real silicon. It cannot establish Cortex-A55 ti
 1. Capture a small amount of state in interrupt context; perform expensive unwind and reporting work on the host.
 2. Copy stack bytes at sample time, because a live thread can return and reuse its stack before the host retrieves it.
 3. Use independent per-core storage so concurrent interrupt handlers do not contend on a shared sample-buffer lock.
-4. Reuse the scheduler timer for timer sampling, avoiding a second owner of timer hardware.
+4. Own a timer that LK does not use (the per-core virtual timer) for timer sampling, so the sampling grid does not depend on how LK re-arms its tick.
 5. Use a shared time base for timestamps, rather than each core's PMU cycle counter.
 6. Keep LK integration as ordered patches and copied modules, rather than a maintained LK fork.
 7. Preserve usable leaf samples when a particular call-chain unwind fails.
@@ -185,7 +187,8 @@ The payload is loaded at physical `0x00008000`; LK uses `KERNEL_BASE = 0x8000000
 | PL011 UART0 | Physical `0xFE201000` | Console and sample export |
 | GIC distributor | Physical `0xFF841000` | Interrupt configuration/routing |
 | GIC CPU interface | Physical `0xFF842000` | Per-core interrupt delivery |
-| Generic timer | GIC interrupt ID 30, PPI | Scheduler timer and timer-mode sample trigger |
+| Generic timer, physical | GIC interrupt ID 30, PPI | LK scheduler timer |
+| Generic timer, virtual | GIC interrupt ID 27, PPI | Timer-mode sampling (K10), owned by the profiler |
 | PMU overflow | GIC IDs 48–51, four SPIs | One routed overflow interrupt per core |
 | UART interrupt | GIC ID 153 | Console input |
 | Watchdog/PM block | BCM28xx platform reset implementation | Software return to the SD chainloader |
@@ -214,7 +217,16 @@ The hook runs for every dispatched valid interrupt, even when no sampling mode i
 
 ### 4.2 Timer mode
 
-`profiler start` sets a shared timer-enable flag; `profiler stop` clears it. The profiler does not create or reprogram a timer. It captures scheduler timer interrupts on each core: ID 30 on BCM2711, with the retained non-BCM2711 branch using ID 27. Sampling cadence therefore follows LK's actual timer configuration and scheduling behavior. Historical notes mention 100 Hz; that value is not an independent profiler rate guarantee or a configurable CLI setting.
+`profiler start [period_us]` (50 µs to 1 s, default 10000) arms the per-core virtual timer on every core through an IPI; `profiler stop` disarms it. LK does not use that timer on the Pi: its tick runs on the Non-secure physical timer (ID 30). The retained non-BCM2711 branch still samples LK's tick (ID 27 there).
+
+Until K10, timer samples came from LK's scheduler tick. LK re-arms that tick relative to when it is handled, so a tick held back by masked code shifted every later one, and the samples phase-locked onto periodic masking (65% / 35% in a 50% masked ground truth). The profiler now keeps its own grid:
+
+- Time is cut into periods of the requested length, counted from `start`. A sample taken late does not move later deadlines.
+- Each period gets exactly one deadline, at a random offset inside it (xorshift32 per core). A fixed offset would still alias with any workload whose period divides the sampling period. One uniform point per period (stratified random sampling) samples every piece of code in proportion to its time.
+- A deadline inside masked code is taken at the unmask, as before, with its delay in `lat` (virtual counter ticks; `CNTVCT` and `CNTPCT` run at the same rate). A period that ends entirely while the core is masked gets no sample and is counted per core (`tmissed` in the dump, `timer_missed` in `status`).
+- The timer is level-triggered. The handler moves the compare value to the next deadline, which drops the timer output before the EOI. An interrupt seen again with no deadline passed takes no sample, and one that arrives after `stop` switches the timer off.
+
+On the Pi, with the 50% masked ground truth, the sample share of the masked half matched the accounting within 1.3σ at both 1 ms and 10 ms. The 10 ms grid is exactly commensurate with the 1 ms workload. Each core took exactly one sample per period. The handler costs about 2.5 µs per sample.
 
 ### 4.3 PMU mode
 
@@ -263,7 +275,7 @@ flowchart TB
     end
     subgraph NMI[Opt-in: pseudo-NMI, profiler nmion]
         N1[arch_disable_ints raises GICC_PMR] --> N2[Normal IRQs blocked]
-        N1 --> N3[PMU SPIs outrank the mask]
+        N1 --> N3[PMU SPIs and sampling timer<br/>outrank the mask]
         N3 --> N4[Sample at the real masked PC<br/>lat small, full stack]
     end
     Acc[Accounting: masked time per core and site] --- Default
@@ -274,19 +286,19 @@ flowchart TB
 
 **2. Attribution.** Each core tracks the *cause* of the code now running: when a region closes, it becomes the cause, unless it is an IRQ region that began within 2 µs of the previous cause's end. Interrupts held by a masked region are taken back to back at its unmask, so a sample queued behind the timer handler still names the code that masked. The sampler records `lat`, `msite` (the cause) and `mgap`. The host marks a sample as delayed when `lat` exceeds four times the 5th-percentile latency for its source. It uses a low percentile because, when masking dominates, the median is itself a delay. A delayed sample is attributed when `mgap` is within 2 µs, and the folded output gets an `[irq-masked: <site>]` leaf frame. The report also prints masked time per core and the top masking sites.
 
-**3. Pseudo-NMI** (overlay 0014, opt-in with `profiler nmion`). On cores in this mode, thread-context `arch_disable_ints()` raises the GIC CPU interface priority mask instead of setting CPSR.I. All interrupts get Non-secure priority 0x80, which the raised mask (0x80) blocks and the open mask (0xff) admits. The PMU SPIs get 0x00, so they still interrupt masked code and sample its real PC with a full stack. The design rules that keep LK's critical sections correct:
+**3. Pseudo-NMI** (overlay 0014, opt-in with `profiler nmion`). On cores in this mode, thread-context `arch_disable_ints()` raises the GIC CPU interface priority mask instead of setting CPSR.I. All interrupts get Non-secure priority 0x80, which the raised mask (0x80) blocks and the open mask (0xff) admits. The PMU SPIs and, since K10, the profiler's sampling timer get 0x00, so they still interrupt masked code and sample its real PC with a full stack. The design rules that keep LK's critical sections correct:
 
 | Hazard | Rule |
 |---|---|
 | A thread migrating between reading its core number and touching that core's mask state | Every read or change of the per-core state runs with CPSR.I briefly set |
 | Exception return restores CPSR.I but not the GIC mask; a thread resumed through the IRQ path would inherit another's state | The IRQ path pushes the interrupted context's state on the thread's own stack and restores it before returning |
 | A normal interrupt already signalled when the mask is raised | GICv2 returns spurious (1023) from the acknowledge register for anything below the mask; LK ignores it and the interrupt stays pending |
-| The pseudo-NMI handler running inside a critical section | The PMU path never reschedules, takes locks or prints; it only writes per-core sample slots |
+| The pseudo-NMI handler running inside a critical section | The PMU and sampling-timer paths never reschedule, take locks or print; they only write per-core sample slots and re-arm their own source |
 | `arch_ints_disabled()` callers | Reports masked when CPSR.I is set or the core's priority mask is raised |
 | GIC not accepting the settings | `nmion` reads back priorities and the mask (implemented bits only; GIC-400 keeps 4 Non-secure PMR bits, and PPIs 16–24 do not exist) and refuses otherwise |
 | Switching modes | Done per core in an IPI, which is only taken while that core is unmasked |
 
-Exception entry still sets CPSR.I, so interrupt handlers remain unsampled (they were about 0.05% of time in the K6 runs). The scheduler tick reschedules, so it cannot be a pseudo-NMI, and timer-mode sampling is unchanged. On GICv2 each mask change is a memory-mapped write; a GICv3 target would use the `ICC_PMR` system register, as Linux's arm64 pseudo-NMI does, with the same LK-side rules.
+Exception entry still sets CPSR.I, so interrupt handlers remain unsampled (they were about 0.05% of time in the K6 runs). LK's scheduler tick reschedules, so it cannot be a pseudo-NMI. The profiler's own sampling timer (K10) does not, so it can: in pseudo-NMI mode, timer samples reach masked code too (50.4% inside the masked half of the ground truth, 0 of 15999 delayed). On GICv2 each mask change is a memory-mapped write; a GICv3 target would use the `ICC_PMR` system register, as Linux's arm64 pseudo-NMI does, with the same LK-side rules.
 
 **Console printing** (overlay 0013) is the profiler's own largest masked region: a print held an IRQ-masking spinlock while the UART sent the whole line, up to 350 µs per line at 6 Mbaud. Thread-context prints now serialise on a mutex. Prints from IRQ handlers, from already-masked code or from idle threads keep the spinlock; such a print can interleave with a thread-context line, which is rare and cosmetic.
 
@@ -294,7 +306,19 @@ Exception entry still sets CPSR.I, so interrupt handlers remain unsampled (they 
 |---|---|---|
 | Masked time reported | 49.6% | 49.8% |
 | PMU samples inside the masked code | 0% (moved to the unmask point, 100% attributed) | 50.5% |
+| Timer samples (K10, 1 ms) in the masked half | 49.0%, all at the unmask point, all attributed | 50.4%, inside the masked code |
 | Delayed samples | about half | 0 |
+
+### 4.7 Cross-core PC sampling (EDPCSR): feasibility
+
+Route 2 for the masked blind spot reads another core's external-debug PC sample register (`EDPCSR`) through memory. The sampled core's IRQ mask does not matter, and interrupt handlers would become visible (leaf PC only). `profiler dbginfo`, `dbgrom` and `dbgpcsr` probe it (K11, [results](results/k11_edpcsr_feasibility_20261005/README.md)).
+
+On the Pi's A72:
+- PC sampling is implemented (`DBGDEVID.PCSample` = 3, no PC offset).
+- The CPU can reach every core's debug block: the ROM table is at `0xff820000` (from `DBGDRAR`), and the core debug blocks are at `0xff{c,d,e,f}10000`, all inside LK's device window.
+- Reads work without faults, and the OS lock clears from software.
+
+`EDPCSR` reads `0xffffffff` (sampling prohibited) on every core, because the SoC holds the non-invasive debug authentication signal low (`DBGAUTHSTATUS` = `0xaa`: disabled in both security states). Software at Non-secure PL1 cannot change that. The route needs a platform that enables Non-secure non-invasive debug. On the Pi that is possibly the firmware's `enable_jtag_gpio=1` (untested; an SD-card change). On the real target, `profiler dbginfo` answers the same question.
 
 ## 5. Buffer layout, ownership, and lifecycle
 
@@ -437,8 +461,8 @@ recorded masking site. All durations are CNTPCT ticks at `cntfrq`.
 Since K2 every dump is a checksummed envelope around those records:
 
 ```text
-DUMPBEGIN fmt=<n> run=<hex> dump=<n> image=<lo>-<hi> build=<hash> modes=<bits> event=<id> period=<n> mixed=<0|1> cpus=<n> buf=<n> crc=<hex>
-DUMPCPU cpu=<n> total=<n> retained=<n> overwritten=<n> pmumissed=<n> crc=<hex>    (one per core)
+DUMPBEGIN fmt=<n> run=<hex> dump=<n> image=<lo>-<hi> build=<hash> modes=<bits> event=<id> period=<n> mixed=<0|1> cpus=<n> buf=<n> tperiod=<us> tmixed=<0|1> crc=<hex>
+DUMPCPU cpu=<n> total=<n> retained=<n> overwritten=<n> pmumissed=<n> tmissed=<n> crc=<hex>    (one per core)
 SAMPLE ...                                                                       (records)
 MASKINFO / MASKNMI / MASKCPU / MASKSITE ...                                      (K6/K12)
 DUMPEND run=<hex> dump=<n> samples=<n> crc=<hex>
@@ -447,12 +471,13 @@ SAMPLE done
 
 | Field | Meaning |
 |---|---|
-| `fmt` | Dump format version (2) |
+| `fmt` | Dump format version: 3 since K10 (adds `tperiod`, `tmixed`, `tmissed`); format 2 dumps still parse, and their timer mode is reported as LK's tick |
 | `run` | Session id: CNTPCT when the session began (`profiler clear`, or first use after boot) |
 | `dump` | Dump number within the session |
 | `image`, `build` | Address range `[_start, __rodata_end)` and the FNV-1a hash of its bytes, which the host recomputes from the ELF |
 | `modes`, `event`, `period`, `mixed` | Sampling modes armed in the session (bit 0 timer, bit 1 PMU), the last PMU event and period, and whether a different PMU configuration was used earlier in the session |
-| `total`, `retained`, `overwritten`, `pmumissed` | Per core: samples taken, kept in the ring, overwritten, and PMU overflows lost inside masked spans |
+| `tperiod`, `tmixed` | Timer-mode period in microseconds (0: timer mode not used) and whether a different period was used earlier in the session |
+| `total`, `retained`, `overwritten`, `pmumissed`, `tmissed` | Per core: samples taken, kept in the ring, overwritten, PMU overflows lost inside masked spans, and timer periods that ended entirely inside masked code |
 | `samples` | Exact number of SAMPLE records this dump printed |
 
 The read-only image range is never written at run time (verified on the Pi
@@ -569,7 +594,7 @@ import is verified; this is not native `perf.data`, and viewer import does
 not guarantee preservation of every CPU/event field. Missing frames and
 IRQ-masked execution remain known limitations in every sidecar.
 
-Timer samples approximate where execution is observed at scheduler timer interrupts, conditional on IRQ delivery. PMU samples reflect the chosen overflow period and interrupt latency; the PC need not identify the instruction that caused a cache miss or misprediction. The handler itself perturbs execution, and fixed-period sampling may correlate with workload periodicity. No sample-rate adaptation, multiplexing, counter scaling, event-weight field, or uncertainty estimate is implemented. Timestamps are captured during handler execution after the stack copy, not at the instant the hardware event occurred.
+Timer samples are one per period at a uniformly random point of it, taken at the next unmask when that point falls in masked code, so their shares estimate time shares without aliasing against periodic workloads. PMU samples reflect the chosen overflow period and interrupt latency; the PC need not identify the instruction that caused a cache miss or misprediction. The handler itself perturbs execution, and fixed-period sampling may correlate with workload periodicity. No sample-rate adaptation, multiplexing, counter scaling, event-weight field, or uncertainty estimate is implemented. Timestamps are captured during handler execution after the stack copy, not at the instant the hardware event occurred.
 
 ## 10. Operational workflow
 
@@ -577,15 +602,16 @@ Timer samples approximate where execution is observed at scheduler timer interru
 
 | Command | Default / arguments | Behavior |
 |---|---|---|
-| `profiler start` / `stop` | None | Enable/disable timer sampling; no implicit clear and no PMU stop |
+| `profiler start [period_us]` / `stop` | 10000 (50 to 1000000) | Arm/disarm timer sampling on every core: one sample at a random point of each period, on the per-core virtual timer; `start` while running re-arms with the new period; no implicit clear and no PMU stop |
 | `profiler pmustart` | Required event and count, base-0 parsing | Arm counter-0 overflow sampling on all cores; count must be at least 10000 |
 | `profiler pmustop` | None | Synchronously disarm PMU sampling across cores; no timer stop |
 | `profiler clear` | None | Zero sample arrays and ring counters and start a new capture session (new run id); no automatic producer stop |
-| `profiler status` | None | Show per-core lifetime totals, heads, wrap indication, PMU overflows lost inside masked spans longer than a period (`pmu_missed`), and timer-enable flag; no complete PMU-mode status |
+| `profiler status` | None | Show per-core lifetime totals, heads, wrap indication, PMU overflows lost inside masked spans longer than a period (`pmu_missed`), timer periods without a sample for the same reason (`timer_missed`), and timer-enable flag; no complete PMU-mode status |
 | `profiler dump` | None | Export retained records in CPU/slot order, then the masked-time accounting, and print `SAMPLE done`; ends the accounting window (turns it off) so the dump's own output is not counted; no automatic sampler freeze |
 | `profiler maskon` / `maskoff` | None | Start a fresh IRQ-masked time accounting window on every core / stop it, keeping totals. `start` and `pmustart` turn it on if it is off; `clear` restarts the window |
 | `profiler mask` | None | Per-core masked share, IRQ-handler share, region count, longest region and its site, and the top five masking sites |
 | `profiler nmion` / `nmioff` | None | Switch every core to masking by GIC priority (pseudo-NMI, PMU samples reach masked code) / back to CPSR.I. `nmion` programs priorities and refuses to enable if they do not read back; `status` shows the mode per core |
+| `profiler dbginfo` / `dbgrom` / `dbgpcsr` | None | K11 probes: PC-sampling support and debug authentication from CP14; walk of the CoreSight ROM table; per-core `EDPCSR` reads after clearing the OS lock (§4.7) |
 | `profiler buildid` | None | Print the running image's read-only range and its FNV-1a hash (the dump's `build` value) and how long hashing took |
 | `profiler memtest [iters]` | 200000 | Ground-truth workload for code without CFI: `profiler_copy_a` calls `memcpy`, `profiler_fill_b` calls `memset`, each `iters` times on 4 KiB |
 | `profiler masktest [loops] [us]` | 2000, 500 | Ground-truth workload: alternate `us` microseconds with IRQs masked and `us` unmasked, so half the time is masked by construction |
@@ -653,7 +679,7 @@ The report's session summary states the checks that used to be manual: which dum
 
 ### 11.1 IRQ-masked execution is a systematic blind spot
 
-Design and measured results are in §4.6. In the default mode, masked execution is never sampled: it is measured (accounting) and its delayed samples are attributed, but the samples themselves sit at unmask points. In pseudo-NMI mode, PMU samples reach masked thread code directly. What remains blind in both modes: interrupt handlers (exception entry sets CPSR.I), timer-mode samples in masked code, and the instruction-level location inside a masked region in the default mode. Timer-mode sampling also still phase-locks to masking, because LK re-arms its scheduler tick from the time the tick is handled (65% vs 50% in the ground-truth test, HANDOFF K10); use PMU mode for unbiased shares. Per-site accounting keeps 64 sites per core, and the hooks add a few `CNTPCT` reads to each masked region (plus a memory-mapped write per transition in pseudo-NMI mode). The target is Non-secure SVC, where FIQ routing is unavailable.
+Design and measured results are in §4.6. In the default mode, masked execution is never sampled: it is measured (accounting) and its delayed samples are attributed, but the samples themselves sit at unmask points. In pseudo-NMI mode, PMU and timer samples reach masked thread code directly. What remains blind in both modes: interrupt handlers (exception entry sets CPSR.I), and the instruction-level location inside a masked region in the default mode. Since K10 both sources keep a fixed grid, so their sample shares are unbiased (timer: 49.0% and 50.9% against 50.0% in the ground truth); a period or overflow that falls entirely inside one masked span is counted, not sampled. Cross-core PC sampling, which would also see interrupt handlers, is prohibited on the Pi by the SoC's debug authentication (§4.7). Per-site accounting keeps 64 sites per core, and the hooks add a few `CNTPCT` reads to each masked region (plus a memory-mapped write per transition in pseudo-NMI mode). The target is Non-secure SVC, where FIQ routing is unavailable.
 
 Hardware results: [results/k6_irqmask_20261005](results/k6_irqmask_20261005/README.md), [results/k12_pseudo_nmi_20261005](results/k12_pseudo_nmi_20261005/README.md). Stack bounds: [results/k1_stack_bounds_20261005](results/k1_stack_bounds_20261005/README.md).
 
@@ -665,7 +691,7 @@ Hardware results: [results/k6_irqmask_20261005](results/k6_irqmask_20261005/READ
 | Too-small overflow period | Reject counts below 10000 | No measured/adaptive overhead budget |
 | UART image corruption | True CRC-32 before payload entry | Does not validate correct ELF pairing |
 | UART sample corruption | Sequence tracking and per-record field checksum | No retransmission, complete footer, or guaranteed trailing-loss count; at 6 Mbaud the host side can drop whole chunks of long output, including the shell prompt |
-| IRQ-masked execution | Accounting, delayed-sample attribution, compensated PMU reload; opt-in pseudo-NMI | IRQ handlers and timer-mode samples stay blind; timer mode phase-locks (K10) |
+| IRQ-masked execution | Accounting, delayed-sample attribution, fixed sampling grids (compensated PMU reload, stratified timer); opt-in pseudo-NMI for both sources | IRQ handlers stay blind; cross-core `EDPCSR` sampling prohibited on the Pi (K11) |
 | Pseudo-NMI critical sections | Stack-saved mask state, CPSR.I-guarded state changes, spurious-IAR race handling, non-rescheduling PMU path | Any future handler raised above the mask must follow the same rules |
 | One unsupported unwind | Keep a leaf-only sample on the handled exceptions | Outer frames vanish; not all failure classes are caught |
 | Deep/large frames | Snapshot-backed reads stop beyond available memory; `slen` says whether the copy ended at the stack top or at the 128-byte limit | A walk cut by the 128-byte limit still has no explicit stop reason |
@@ -704,6 +730,8 @@ The following summarizes the repository's prior observations; it is not a claim 
 | UART integrity | 6-Mbaud console operation; sequence/checksum validation reported losses in real captures |
 | IRQ-masked time (K6) | Ground truth 50% masked: accounting 49.6%, PMU samples 48.2% on the masked side, all delayed samples attributed; console masking (up to 350 µs per line) removed |
 | Pseudo-NMI (K12) | Ground truth: 50.5% of PMU samples inside masked code, 0 delayed; stress with mode switching and a 6-minute soak (944,589 samples) clean |
+| Timer grid (K10) | `masktest` 50% masked, about 4000 samples per run: 49.0% (1 ms), 50.9% (10 ms, commensurate with the workload), 50.4% under pseudo-NMI with 0 of 15999 delayed; was 65% on LK's tick |
+| Cross-core PC sampling (K11) | A72 implements `EDPCSR` and its debug blocks are reachable at `0xff{c,d,e,f}10000`, but `EDPCSR` reads `ffffffff` everywhere: non-invasive debug disabled (`DBGAUTHSTATUS` `0xaa`) |
 | No-CFI callers (K3) | `memtest`: all 460 samples in `memcpy`/`memset` attributed to their true callers (299/161), none to the wrong one; earlier captures unchanged |
 | Capture sessions (K2) | Image hash identical on the Pi and from the ELF across workloads, sampling, pseudo-NMI and dumps (0.7 ms); two-dump log split; exact loss (7/8458) and overwrite counts; wrong ELF refused; older capture exported byte-identically |
 | Stack bounds (K1) | Four-core workload: all samples bounded at 20 bytes (previously 108 bytes past the stack), clean `initial_thread_func` root; idle samples bounded exactly at the per-core boot-stack top |
@@ -721,7 +749,7 @@ These are architectural directions, **not additional claimed work items or a rep
 | Safe and richer context | Bounds check: done (K1). Remaining: capture both r7/r11 and required GPRs or declare a smaller supported CFI subset | Large-frame, mixed-mode, and alternate-CFA fixtures on hardware |
 | Self-describing session | Done (K2): versioned header/footer, run/build identity, modes/event/period, per-core counts, exact record count, latest-dump selection | Done on the Pi: wrong ELF refused, two-dump log split, exact transfer loss and overwrite counts |
 | Reporting integrity | Function range validation, consistent return-address attribution, explicit unwind stop reasons | Assembly gaps, function-boundary calls, missing CFI, and corrupted context regressions |
-| Bias/overhead accounting | IRQ-masked duration: done (K6). Remaining: measured sampler cost, timer-mode grid (K10), cross-core PC sampling for handlers (K11) | Controlled masked-region workload (`masktest`) and sampling-rate sweeps |
+| Bias/overhead accounting | IRQ-masked duration (K6) and unbiased timer grid (K10): done. Remaining: measured sampler cost; cross-core PC sampling for handlers needs a platform with non-invasive debug enabled (K11) | Controlled masked-region workload (`masktest`) and sampling-rate sweeps |
 | Accurate counting | Define PMU ownership, preserve state, pin execution or collect per-core, bracket counts outside prints, extend overflow handling | Stat-only and stat-with-sampling comparisons, migration/wrap cases |
 | Alternative export | Document a binary schema separate from compiler layout; implement memory-dump reader | Same capture yields equivalent serial and memory-export reports |
 | A55 deployment | Target-specific interrupt, timer, PMU, exception ABI, and stack integration | Real intended-target images and workloads, with build/config provenance |

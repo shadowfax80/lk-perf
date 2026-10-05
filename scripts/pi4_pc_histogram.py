@@ -94,12 +94,15 @@ DUMPBEGIN_RE = re.compile(
     r"build=(?P<build>[0-9a-fA-F]{8}) modes=(?P<modes>[0-9a-fA-F]{8}) "
     r"event=(?P<event>[0-9a-fA-F]{8}) period=(?P<period>[0-9a-fA-F]{8}) "
     r"mixed=(?P<mixed>[0-9a-fA-F]{8}) cpus=(?P<cpus>[0-9a-fA-F]{8}) "
-    r"buf=(?P<buf>[0-9a-fA-F]{8}) crc=(?P<crc>[0-9a-fA-F]{8})\s*$"
+    r"buf=(?P<buf>[0-9a-fA-F]{8}) "
+    r"(?:tperiod=(?P<tperiod>[0-9a-fA-F]{8}) tmixed=(?P<tmixed>[0-9a-fA-F]{8}) )?"
+    r"crc=(?P<crc>[0-9a-fA-F]{8})\s*$"
 )
 DUMPCPU_RE = re.compile(
     r"DUMPCPU cpu=(?P<cpu>\d+) total=(?P<total>[0-9a-fA-F]{8}) "
     r"retained=(?P<retained>[0-9a-fA-F]{8}) overwritten=(?P<overwritten>[0-9a-fA-F]{8}) "
-    r"pmumissed=(?P<pmumissed>[0-9a-fA-F]{8}) crc=(?P<crc>[0-9a-fA-F]{8})\s*$"
+    r"pmumissed=(?P<pmumissed>[0-9a-fA-F]{8}) (?:tmissed=(?P<tmissed>[0-9a-fA-F]{8}) )?"
+    r"crc=(?P<crc>[0-9a-fA-F]{8})\s*$"
 )
 DUMPEND_RE = re.compile(
     r"DUMPEND run=(?P<run>[0-9a-fA-F]{16}) dump=(?P<dump>[0-9a-fA-F]{8}) "
@@ -167,6 +170,12 @@ def parse_session(lines: list[str]) -> dict | None:
             words = [v["fmt"], v["run"], v["run"] >> 32, v["dump"], v["lo"], v["hi"],
                      v["build"], v["modes"], v["event"], v["period"], v["mixed"], v["cpus"],
                      v["buf"]]
+            # K10 (format 3): timer-mode period in microseconds and whether it
+            # changed during the session; absent before.
+            v["tperiod"] = v["tmixed"] = None
+            if m["tperiod"] is not None:
+                v["tperiod"], v["tmixed"] = int(m["tperiod"], 16), int(m["tmixed"], 16)
+                words += [v["tperiod"], v["tmixed"]]
             if _fnv(words) != int(m["crc"], 16):
                 rejected += 1
                 continue
@@ -174,8 +183,12 @@ def parse_session(lines: list[str]) -> dict | None:
         elif m := DUMPCPU_RE.search(line):
             v = {k: int(m[k], 16) for k in ("total", "retained", "overwritten", "pmumissed")}
             cpu = int(m["cpu"])
-            if _fnv([cpu, v["total"], v["retained"], v["overwritten"], v["pmumissed"]]) != \
-                    int(m["crc"], 16):
+            words = [cpu, v["total"], v["retained"], v["overwritten"], v["pmumissed"]]
+            v["tmissed"] = None
+            if m["tmissed"] is not None:
+                v["tmissed"] = int(m["tmissed"], 16)
+                words.append(v["tmissed"])
+            if _fnv(words) != int(m["crc"], 16):
                 rejected += 1
                 continue
             cpus[cpu] = v
@@ -437,6 +450,11 @@ def print_session(session: dict, where: dict, accepted: int, built: bool | None)
         pmu = (f", PMU event 0x{h['event']:x} every {h['period']}"
                f"{' (CONFIG CHANGED MID-SESSION)' if h['mixed'] else ''}"
                if h["modes"] & MODE_PMU else "")
+        if h["modes"] & MODE_TIMER and h.get("tperiod"):
+            pmu = (f", timer one sample per {h['tperiod']} us"
+                   f"{' (PERIOD CHANGED MID-SESSION)' if h['tmixed'] else ''}") + pmu
+        elif h["modes"] & MODE_TIMER and h.get("tperiod") is None:
+            pmu = ", timer on LK's tick (before K10: phase-locks to masking)" + pmu
         print(f"dump {where['index'] + 1} of {where['dumps']} in this log: run "
               f"{h['run']:016x}, dump #{h['dump']} of that run; modes {modes}{pmu}; "
               f"ELF {'matches' if built else 'DOES NOT MATCH'} the image "
@@ -444,6 +462,8 @@ def print_session(session: dict, where: dict, accepted: int, built: bool | None)
     for cpu, c in sorted(session["cpus"].items()):
         extra = f", {c['overwritten']} overwritten" if c["overwritten"] else ""
         extra += f", {c['pmumissed']} PMU overflows lost while masked" if c["pmumissed"] else ""
+        extra += (f", {c['tmissed']} timer periods without a sample (masked throughout)"
+                  if c.get("tmissed") else "")
         print(f"  cpu{cpu}: {c['total']} taken, {c['retained']} retained{extra}")
     if f:
         lost = f["samples"] - accepted

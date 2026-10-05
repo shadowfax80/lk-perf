@@ -9,6 +9,8 @@ the perf-script exporter accepting the extended format.
 from __future__ import annotations
 
 from pathlib import Path
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -17,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import shutil
 import subprocess
 
-from pi4_pc_histogram import (_fnv, _sample_checksum, check_build, classify_delays, image_hash,
+from pi4_pc_histogram import (_fnv, print_session, _sample_checksum, check_build, classify_delays, image_hash,
                               parse_mask, parse_samples, parse_session, read_lines,
                               select_dump)
 from pi4_perf_export import read_capture
@@ -57,22 +59,33 @@ def mask_lines(now=10 * FREQ, start=FREQ, masked=FREQ // 10, site=0x80001234):
 
 def dump_text(run=0x1234, dump=1, samples=((0, 0x8000),), build=0xabcdef01, lo=0x8000,
               hi=0x8010, modes=2, event=0x11, period=1000000, mixed=0, cpus=1,
-              totals=None, footer_count=None, header_crc=None):
-    """One complete K2 dump: header, per-core lines, samples, footer."""
-    words = [2, run, run >> 32, dump, lo, hi, build, modes, event, period, mixed, cpus, 4096]
+              totals=None, footer_count=None, header_crc=None, timer=None):
+    """One complete K2 dump: header, per-core lines, samples, footer.
+    `timer` = (period_us, mixed, missed per core) writes format 3 (K10)."""
+    fmt = 3 if timer else 2
+    words = [fmt, run, run >> 32, dump, lo, hi, build, modes, event, period, mixed, cpus, 4096]
+    t3 = ""
+    if timer:
+        words += [timer[0], timer[1]]
+        t3 = f"tperiod={timer[0]:08x} tmixed={timer[1]:08x} "
     hcrc = _fnv(words) if header_crc is None else header_crc
-    text = (f"DUMPBEGIN fmt=00000002 run={run:016x} dump={dump:08x} image={lo:08x}-{hi:08x} "
+    text = (f"DUMPBEGIN fmt={fmt:08x} run={run:016x} dump={dump:08x} image={lo:08x}-{hi:08x} "
             f"build={build:08x} modes={modes:08x} event={event:08x} period={period:08x} "
-            f"mixed={mixed:08x} cpus={cpus:08x} buf=00001000 crc={hcrc:08x}\n")
+            f"mixed={mixed:08x} cpus={cpus:08x} buf=00001000 {t3}crc={hcrc:08x}\n")
     per_cpu = {}
     for cpu, _ in samples:
         per_cpu[cpu] = per_cpu.get(cpu, 0) + 1
     for cpu in range(cpus):
         kept = per_cpu.get(cpu, 0)
         total = (totals or {}).get(cpu, kept)
+        cw = [cpu, total, kept, total - kept, 0]
+        tm = ""
+        if timer:
+            cw.append(timer[2])
+            tm = f"tmissed={timer[2]:08x} "
         text += (f"DUMPCPU cpu={cpu} total={total:08x} retained={kept:08x} "
-                 f"overwritten={total - kept:08x} pmumissed=00000000 "
-                 f"crc={_fnv([cpu, total, kept, total - kept, 0]):08x}\n")
+                 f"overwritten={total - kept:08x} pmumissed=00000000 {tm}"
+                 f"crc={_fnv(cw):08x}\n")
     for seq, (cpu, pc) in enumerate(samples):
         text += sample_line(seq=seq, cpu=cpu, pc=pc, ts=1000000 + seq,
                             k6=("p", 400, 0, 0xffffffff), slen=128)
@@ -152,6 +165,37 @@ class K6Tests(unittest.TestCase):
         self.assertEqual(s["header"]["period"], 1000000)
         self.assertEqual(s["cpus"][0]["overwritten"], 4996)
         self.assertEqual(s["footer"]["samples"], 4)
+
+    def test_format3_timer_period_and_missed_periods(self):
+        # K10: the dedicated sampling timer's period and missed periods.
+        text = dump_text(modes=1, event=0, period=0, timer=(1000, 0, 7))
+        s = parse_session(select_dump(read_lines(self.write(text)))[0])
+        self.assertEqual(s["problems"], [])
+        self.assertEqual((s["header"]["tperiod"], s["header"]["tmixed"]), (1000, 0))
+        self.assertEqual(s["cpus"][0]["tmissed"], 7)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            print_session(s, {"index": 0, "dumps": 1}, 1, True)
+        self.assertIn("timer one sample per 1000 us", out.getvalue())
+        self.assertIn("7 timer periods without a sample", out.getvalue())
+
+    def test_format3_field_corruption_is_rejected(self):
+        text = dump_text(modes=1, event=0, period=0, timer=(1000, 0, 7))
+        bad = text.replace("tperiod=000003e8", "tperiod=000007d0")
+        s = parse_session(select_dump(read_lines(self.write(bad)))[0])
+        self.assertIn("dump header missing or damaged", s["problems"])
+        bad = text.replace("tmissed=00000007", "tmissed=00000000")
+        s = parse_session(select_dump(read_lines(self.write(bad)))[0])
+        self.assertTrue(any("per-core" in p for p in s["problems"]))
+
+    def test_format2_timer_dump_is_reported_as_lk_tick(self):
+        s = parse_session(select_dump(read_lines(self.write(dump_text(modes=1))))[0])
+        self.assertIsNone(s["header"]["tperiod"])
+        self.assertIsNone(s["cpus"][0]["tmissed"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            print_session(s, {"index": 0, "dumps": 1}, 1, True)
+        self.assertIn("timer on LK's tick", out.getvalue())
 
     def test_damaged_header_and_missing_footer_are_reported(self):
         lines, _ = select_dump(read_lines(self.write(dump_text(header_crc=0))))

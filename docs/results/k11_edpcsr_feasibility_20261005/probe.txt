@@ -1,0 +1,45 @@
+buildid: image 80008000-80022cc8 fnv1a=b8a617cc (109768 bytes, 733 us)
+dbginfo: cpu3 MIDR=410fd083 DBGDIDR=3516d000 DBGDEVID=01110f13 DBGDEVID1=00000002
+dbginfo: PC sampling (DBGDEVID.PCSample)=3: EDPCSR+EDCIDSR+EDVIDSR; PCSR offset (DBGDEVID1)=2
+dbginfo: DBGAUTHSTATUS=000000aa: non-invasive NS disabled, S disabled; invasive NS disabled, S disabled
+dbginfo: DBGOSLSR=0000000a (OS lock locked) DBGPRCR=00000000 DBGDSCRint=00070000
+dbginfo: DBGDRAR=00000000ff820003: ROM table valid at 00000000ff820000
+dbgrom: ROM table ff820000, CIDR 0000000d 00000010
+dbgrom: [0] ffc00000 class 1 part 4a4 devarch 00000000 devtype 00 aff 00000000
+dbgrom:   [0] ffc10000 class 9 part d08 devarch 47706a15 devtype 15 aff 80000000
+dbgrom:   [1] ffc20000 class 9 part 906 devarch 00000000 devtype 14 aff 00000000
+dbgrom:   [2] ffc30000 class 9 part 9d8 devarch 47702a16 devtype 16 aff 80000000
+dbgrom:   [3] 00040002 not present
+dbgrom:   [4] ffd10000 class 9 part d08 devarch 47706a15 devtype 15 aff 80000001
+dbgrom:   [5] ffd20000 class 9 part 906 devarch 00000000 devtype 14 aff 00000000
+dbgrom:   [6] ffd30000 class 9 part 9d8 devarch 47702a16 devtype 16 aff 80000001
+dbgrom:   [7] 00140002 not present
+dbgrom:   [8] ffe10000 class 9 part d08 devarch 47706a15 devtype 15 aff 80000002
+dbgrom:   [9] ffe20000 class 9 part 906 devarch 00000000 devtype 14 aff 00000000
+dbgrom:   [10] ffe30000 class 9 part 9d8 devarch 47702a16 devtype 16 aff 80000002
+dbgrom:   [11] 00240002 not present
+dbgrom:   [12] fff10000 class 9 part d08 devarch 47706a15 devtype 15 aff 80000003
+dbgrom:   [13] fff20000 class 9 part 906 devarch 00000000 devtype 14 aff 00000000
+dbgrom:   [14] fff30000 class 9 part 9d8 devarch 47702a16 devtype 16 aff 80000003
+dbgrom:   [15] 00340002 not present
+dbgpcsr: OS lock cleared on all cores; reading from cpu3
+dbgpcsr: ffc10000 aff 80000000 EDDEVID 01000003 EDPRSR 0000028b EDAUTHSTATUS 000000aa EDLSR 00000003
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr: ffd10000 aff 80000001 EDDEVID 01000003 EDPRSR 0000028b EDAUTHSTATUS 000000aa EDLSR 00000003
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr: ffe10000 aff 80000002 EDDEVID 01000003 EDPRSR 0000028b EDAUTHSTATUS 000000aa EDLSR 00000003
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr: fff10000 aff 80000003 EDDEVID 01000003 EDPRSR 0000028b EDAUTHSTATUS 000000aa EDLSR 00000003
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
+dbgpcsr:   EDPCSR 00000000ffffffff EDCIDSR 00000000 EDVIDSR 00000000
