@@ -33,6 +33,26 @@ ensure_pyelftools() {
     python3 -m pip install --quiet pyelftools
 }
 
+# Files the overlay patches create are untracked in the LK tree, so the
+# reset above leaves them behind, and re-applying their patch then fails
+# ("already exists in working directory"; finding #14: 0004's gic.h, also
+# 0012's irqmask.c). Remove exactly those paths, read from each patch, and
+# nothing else (no blanket `git clean`, see clone_lk's comment).
+remove_patch_created_files() {
+    local patch path
+    for patch in "$ROOT"/overlay/lk/*.patch; do
+        [ -e "$patch" ] || continue
+        git -C "$LK_DIR" apply --summary "$patch" | awk '$1 == "create" {print $NF}' |
+            while read -r path; do
+                if [ -e "$LK_DIR/$path" ] &&
+                   ! git -C "$LK_DIR" ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+                    echo "  removing patch-created file: $path"
+                    rm -f -- "$LK_DIR/$path"
+                fi
+            done
+    done
+}
+
 clone_lk() {
     if [ ! -d "$LK_DIR/.git" ]; then
         echo "Cloning littlekernel/lk into $LK_DIR ..."
@@ -53,6 +73,7 @@ clone_lk() {
         # importantly) build-profiler/ output, forcing a needless full
         # rebuild on every setup.sh re-run for no correctness benefit.
         git -C "$LK_DIR" reset -q --hard HEAD 2>/dev/null || true
+        remove_patch_created_files
         git -C "$LK_DIR" pull -q --ff-only
     fi
     echo "LK at: $(git -C "$LK_DIR" rev-parse --short HEAD) ($(git -C "$LK_DIR" log -1 --format=%s))"

@@ -150,7 +150,7 @@ The build entry point is `make rpi4-test` inside the generated LK tree. [`projec
 
 Patch 0007 sets `ARM_WITHOUT_VFP_NEON := true`. The project omits `app/tests`, whose math dependency could introduce VFP instructions independently of the kernel setting. Historical linked-image disassembly found no VFP/NEON instructions; a fresh build needs its own scan before making that claim again.
 
-`setup.sh` resets tracked changes in the generated LK tree before updating it. It should not be used to refresh an active development tree containing unexported LK changes. Reverse-apply checks avoid reapplying an already present patch, but the patch-created untracked `gic.h` makes a second setup run a known idempotence problem. Neither the moving upstream revision nor the downloaded FlameGraph script is automatically locked by version or hash.
+`setup.sh` resets tracked changes in the generated LK tree before updating it. It should not be used to refresh an active development tree containing unexported LK changes. Reverse-apply checks avoid reapplying an already present patch. Files that patches create (`gic.h`, `irqmask.c`) are untracked, so after the reset the script removes exactly those paths, read from each patch, and a second run succeeds (K5). Neither the moving upstream revision nor the downloaded FlameGraph script is automatically locked by version or hash.
 
 ### 3.2 Boot chain
 

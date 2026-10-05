@@ -959,7 +959,11 @@ capable/convenient. Only the first tier clears that bar.
   saying which mode produced which sample. Fix: tag each sample with
   mode + event id; make `stat` refuse to run over an active
   `pmustart`.
-- **`setup.sh` isn't idempotent (finding #14).** A second run on the
+- **Fixed (K5, 2026-10-05): `setup.sh` isn't idempotent (finding #14).**
+  Fix as built: after the reset, remove each file the overlay patches create
+  (from `git apply --summary`), if untracked; covers 0012's `irqmask.c` too.
+  Verified: the old script fails on a set-up tree, the new one runs twice.
+  Original note: A second run on the
   same `build/lk` fails on a file patch 0004 leaves behind
   (`gic.h`) that a scoped `git reset --hard` doesn't clean up. Fix:
   `git clean -fd` scoped to that one path before the reset.
