@@ -1,6 +1,6 @@
 # lk-perf architecture and design
 
-**Implementation baseline:** lk-perf commit `84c25a9` (2026-10-05), LK `88a8efae` plus overlays 0001–0016 (they also apply to upstream `fe5e5a00`). Hardware observations are attributed to [RPI4_BRINGUP.md](RPI4_BRINGUP.md) and the `docs/results/` records.
+**Implementation baseline:** lk-perf commit `a547f94` (through K15, reviewed 2026-10-06), LK `88a8efae` plus overlays 0001–0016 (they also apply to upstream `fe5e5a00`). Hardware observations are attributed to [RPI4_BRINGUP.md](RPI4_BRINGUP.md) and the `docs/results/` records. The [joint review](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md) records remaining integrity, lifecycle and ownership gaps; their current status is in [HANDOFF](HANDOFF.md).
 
 | Revision | Change described in this document |
 |---|---|
@@ -385,7 +385,7 @@ stateDiagram-v2
 
 This diagram describes the intended operational sequence, **not an enforced target state machine**. The masked-time window is the exception: `dump` ends it (accounting off, IPI barrier, snapshot) before printing. The CLI accepts `clear` and `dump` while sampling is active. `clear` zeroes counters and arrays without stopping other cores. `dump` reads arrays without a snapshot lock or generation validation. A checksum of a racing record can be valid even though its fields came from different sample generations.
 
-PMU stop uses synchronous cross-core callbacks. Timer stop merely changes a shared `volatile` flag and does not explicitly wait for already executing handlers on other cores. `volatile` is not a complete publication/quiescence protocol. Stopping both modes before clear/export is the required operational discipline, but a future synchronized freeze operation is needed for a formal snapshot guarantee.
+PMU and timer stop both use synchronous cross-core callbacks in the current source; timer stop disarms the virtual timer on each core. This corrects the earlier flag-only description. It does not enforce the intended state machine around active clear/dump. Scheduler disable/reset also lacks complete serialization with in-flight hooks and the frequency producer. Stopping before clear/export is the required operational discipline; K19 covers enforced freeze/session generations and scheduler producer quiescence.
 
 ## 6. PMU control and counting
 
@@ -410,9 +410,9 @@ The routing code assumes this four-core board, and the handler recognizes any ve
 
 ### 6.2 Counter ownership and PMSELR
 
-Counter 0 belongs to overflow sampling. The current `stat` command uses **event counter 1**, which fixes the earlier implementation that overwrote the sampling event in counter 0. IRQ reload and cross-core arm callbacks preserve PMSELR so they do not redirect a preempted selected-counter access.
+Counter 0 belongs to overflow sampling while armed. K7 `stat` uses up to six event counters starting at counter 0 when sampling is off, or up to five starting at counter 1 when sampling owns counter 0. IRQ reload and cross-core arm callbacks preserve PMSELR so they do not redirect a preempted selected-counter access.
 
-This is partial sharing discipline, not general PMU virtualization. `stat` resets the cycle counter and does not restore every selector/enable/event-counter setting. `pmustop` clears global PMCR.E on each CPU, affecting other PMU users. Hardware state would need stronger ownership/restoration rules before arbitrary subsystems can safely share it.
+This is partial sharing discipline. K15 restores PMCR and the relevant prior counter-enable bits, but `stat` resets the cycle value and reprograms event configuration/count/interrupt state without restoring every predecessor's state. `pmustop` clears global PMCR.E on each CPU, affecting other PMU users and an active stat window. K20 covers supported ownership/restoration and conflicting-command refusal. Event wrap extension also cannot recover multiple wraps while a single pending overflow bit remains unserviced (K22).
 
 ### 6.3 `profiler stat`
 
@@ -713,13 +713,13 @@ To see into IRQ-masked code, add `profiler nmion` (and optionally `profiler mask
 
 ### 10.4 Assess a report before using it
 
-The report's session summary states the checks that used to be manual: which dump of the log is used, whether the ELF matches the image, per-core taken/retained/overwritten counts, PMU overflows lost while masked, and the exact number of records lost in transfer. Read its warnings (a damaged header or footer, counts that do not add up, a PMU configuration changed mid-session) before trusting the numbers. Then inspect unwind depths and leaf-only warnings before treating a FlameGraph as a complete calling-context distribution.
+The report's session summary states which dump is used, whether the ELF matches the stated image range, per-core taken/retained/overwritten counts, PMU overflows lost while masked, and transfer-loss diagnostics. Read warnings about damaged metadata, count disagreement or changed configuration before interpreting numbers. Current sample validation still needs observed per-core/count reconciliation (K18), and scheduler accounting needs explicit unknown intervals after loss/overwrite (K17). Neither a checksum nor a plausible loss count establishes completeness. Inspect unwind depth and leaf-only warnings before treating a FlameGraph as a complete calling-context distribution.
 
 ## 11. Correctness boundaries and failure behavior
 
 ### 11.1 IRQ-masked execution is a systematic blind spot
 
-Design and measured results are in §4.6. In the default mode, masked execution is never sampled: it is measured (accounting) and its delayed samples are attributed, but the samples themselves sit at unmask points. In pseudo-NMI mode, PMU and timer samples reach masked thread code directly. What remains blind in both modes: interrupt handlers (exception entry sets CPSR.I), and the instruction-level location inside a masked region in the default mode. Since K10 both sources keep a fixed grid, so their sample shares are unbiased (timer: 49.0% and 50.9% against 50.0% in the ground truth); a period or overflow that falls entirely inside one masked span is counted, not sampled. Cross-core PC sampling, which would also see interrupt handlers, is prohibited on the Pi by the SoC's debug authentication (§4.7). Per-site accounting keeps 64 sites per core, and the hooks add a few `CNTPCT` reads to each masked region (plus a memory-mapped write per transition in pseudo-NMI mode). The target is Non-secure SVC, where FIQ routing is unavailable.
+Design and measured results are in §4.6. In the default mode, masked execution is never sampled: it is measured (accounting) and its delayed samples are attributed, but the samples themselves sit at unmask points. In pseudo-NMI mode, PMU and timer samples reach masked thread code directly. What remains blind in both modes: interrupt handlers (exception entry sets CPSR.I), and the instruction-level location inside a masked region in the default mode. K6/K10's fixed grids remove the demonstrated reload/tick bias in the controlled workloads (timer: 49.0% and 50.9% against 50.0% ground truth); a period or overflow that falls entirely inside one masked span is counted, not sampled. This is not proof of unbiased shares under every rate/workload; K24 covers overhead and lost-trigger calibration. Cross-core PC sampling, which would also see interrupt handlers, is prohibited on the Pi by the SoC's debug authentication (§4.7). Per-site accounting keeps 64 sites per core, and the hooks add a few `CNTPCT` reads to each masked region (plus a memory-mapped write per transition in pseudo-NMI mode). The target is Non-secure SVC, where FIQ routing is unavailable.
 
 Hardware results: [results/k6_irqmask_20261005](results/k6_irqmask_20261005/README.md), [results/k12_pseudo_nmi_20261005](results/k12_pseudo_nmi_20261005/README.md). Stack bounds: [results/k1_stack_bounds_20261005](results/k1_stack_bounds_20261005/README.md).
 
@@ -730,20 +730,20 @@ Hardware results: [results/k6_irqmask_20261005](results/k6_irqmask_20261005/READ
 | PMU overflow during stop | Per-core flags, all-core callbacks, unconditional disabled-vector acknowledgment | General PMU ownership/reconfiguration is still incomplete |
 | Too-small overflow period | Reject counts below 10000 | No measured/adaptive overhead budget |
 | UART image corruption | True CRC-32 before payload entry | Does not validate correct ELF pairing |
-| UART sample corruption | Sequence tracking and per-record field checksum | No retransmission, complete footer, or guaranteed trailing-loss count; at 6 Mbaud the host side can drop whole chunks of long output, including the shell prompt |
+| UART sample corruption | Sequence tracking, field checksum and current K2 header/CPU/footer counts | No retransmission; metadata itself can be lost and observed-count reconciliation needs K18. Legacy dumps have no footer; at 6 Mbaud the host can drop whole chunks including the prompt |
 | IRQ-masked execution | Accounting, delayed-sample attribution, fixed sampling grids (compensated PMU reload, stratified timer); opt-in pseudo-NMI for both sources | IRQ handlers stay blind; cross-core `EDPCSR` sampling prohibited on the Pi (K11) |
 | Pseudo-NMI critical sections | Stack-saved mask state, CPSR.I-guarded state changes, spurious-IAR race handling, non-rescheduling PMU path | Any future handler raised above the mask must follow the same rules |
 | One unsupported unwind | Keep a leaf-only sample on the handled exceptions | Outer frames vanish; not all failure classes are caught |
 | Deep/large frames | Snapshot-backed reads stop beyond available memory; `slen` says whether the copy ended at the stack top or at the 128-byte limit | A walk cut by the 128-byte limit still has no explicit stop reason |
 | Stack-copy bounds | Copy bounded by the top of the sampled stack (thread stack, or per-core boot stack for idle/bootstrap threads); nothing copied when SP is on no known stack (K1) | Bounds come from LK's thread records and boot-stack layout; another stack kind (e.g. a separate IRQ stack on a target port) would need its own bounds |
-| Concurrent clear/dump | Operational stop-before-export sequence | No enforced freeze, synchronized timer stop, or record-generation validation |
+| Concurrent clear/dump | Operational stop-before-export sequence; timer/PMU stop callbacks synchronous | No enforced active-clear/dump freeze or record-generation validation; scheduler writers need quiescence (K19) |
 | Buffer overflow | Preserve most recent per-core slots; dumps report taken, retained and overwritten per core (K2) | Older samples are lost; only their count is known |
 | Mixed sampling modes/runs | Dump header gives run, dump number, modes, PMU event/period and a changed-config flag; host picks one dump of a log; records carry their trigger (`src`) | A session that mixes PMU configurations is flagged, not split per configuration |
 | Context sufficiency | Capture SP/LR and one FP candidate; carry recoverable registers through CFI | Other live registers and the other FP candidate are missing |
 | Missing assembly CFI | Validated LR fallback at the sampled PC: caller recovered when LR follows a call outside the leaf (K3) | The stack ends at that caller; a leaf reached by a tail branch is credited to the caller's caller; a leaf that reused LR as scratch keeps leaf-only |
 | Bad symbol attribution | ELF checked against the dump's image hash (K2) | Nearest-start mapping lacks function-extent validation; return-address boundaries remain |
 | A55 transfer | Mechanism demonstrated on A72 | Target routing, ABI, event support, performance, and footprint unvalidated |
-| Scheduling/wakeups/blocking/frequency | Since K8: switch, wakeup, name and clock events, reported per thread and exported for Perfetto | Interrupt handlers are not threads; transfer loss can break a switch chain (counted); the dump stops recording |
+| Scheduling/wakeups/blocking/frequency | Since K8: switch, wakeup, name and polled clock events, reported per thread and exported for Perfetto | Interrupt handlers are not threads; overwritten/lost windows lack boundary identities and current accounting overstates certainty (K17); producer stop/reset needs K19; clock polling can miss transitions |
 | (before K8) Scheduling/wakeups/blocking/frequency | Timestamped stack samples and CPU/thread identity only | No context-switch/wakeup events, blocking reasons/durations, or CPU-frequency history; additional target event instrumentation/export is required |
 
 The stack-bound issue concerned **reading above SP** near a stack's high address, when a thread has little active stack. It was the normal case, not an edge case: every sample of the four-core workload had only 20 bytes above SP and read 108 bytes past its stack before K1. A 128-byte copy is still not a complete call-chain snapshot for deep stacks.
@@ -790,10 +790,10 @@ These are architectural directions, **not additional claimed work items or a rep
 |---|---|---|
 | Coherent capture lifecycle | Synchronous producer stop/freeze and guarded clear/export with an explicit state model | Concurrent all-core start/stop/dump/clear stress with no mixed generations |
 | Safe and richer context | Bounds check: done (K1). Remaining: capture both r7/r11 and required GPRs or declare a smaller supported CFI subset | Large-frame, mixed-mode, and alternate-CFA fixtures on hardware |
-| Self-describing session | Done (K2): versioned header/footer, run/build identity, modes/event/period, per-core counts, exact record count, latest-dump selection | Done on the Pi: wrong ELF refused, two-dump log split, exact transfer loss and overwrite counts |
+| Self-describing session | K2 format implemented: header/footer, identity/configuration, per-core counts and latest-dump selection; stricter interpretation remains K18 | Recorded Pi tests: wrong ELF refused, two-dump log split and known transfer/overwrite counts; adversarial count/source cases remain open |
 | Reporting integrity | Function range validation, consistent return-address attribution, explicit unwind stop reasons | Assembly gaps, function-boundary calls, missing CFI, and corrupted context regressions |
 | Bias/overhead accounting | IRQ-masked duration (K6) and unbiased timer grid (K10): done. Remaining: measured sampler cost; cross-core PC sampling for handlers needs a platform with non-invasive debug enabled (K11) | Controlled masked-region workload (`masktest`) and sampling-rate sweeps |
-| Accurate counting | Done (K4, K7): counter 0 left to sampling, PMCR restored, all-core collection, no prints in the window, 64-bit counts | Done on the Pi: stat alone and with sampling, multi-core command, 2.8 × 2^32 wrap case, CPU_CYCLES cross-check |
+| Accurate counting | K4/K7/K15 measured route: sampling counter reserved, PMCR/enable bits restored, all-core collection, prints excluded from setup window, extended counts; general sharing K20 and delayed multi-wrap validity K22 remain | Recorded Pi tests: stat alone/with sampling, multi-core command, 2.8 × 2^32 normal-service wrap case and CPU_CYCLES cross-check |
 | Alternative export | Document a binary schema separate from compiler layout; implement memory-dump reader | Same capture yields equivalent serial and memory-export reports |
 | A55 deployment | Target-specific interrupt, timer, PMU, exception ABI, and stack integration | Real intended-target images and workloads, with build/config provenance |
 | On-target unwind alternative | Host-generated compact CFI tables plus bounded IRQ-safe evaluator | Equivalence to the host reference, footprint and worst-case interrupt cost measurements |
@@ -801,6 +801,12 @@ These are architectural directions, **not additional claimed work items or a rep
 Avoid turning a raw LR guess, a checksum-valid dump, or a plausible FlameGraph into a stronger correctness claim than its evidence supports. Capability expansion should retain useful leaf counts while making missing context and measurement bias visible.
 
 ## 13. Source map
+
+The extension directions above are design options, not a second queue. The
+joint review mapped concrete current gaps into HANDOFF K16–K26: protect
+publication and validate sessions before interpreting profiles, then enforce
+lifecycle/PMU contracts and calibrate context/measurement quality. Self-
+describing records and normal wrap tests do not close K18/K19/K20/K22.
 
 | File or directory | Role |
 |---|---|

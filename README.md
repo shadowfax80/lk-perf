@@ -5,7 +5,8 @@ AArch32 SMP -- a standalone tool for finding real hotspots/bottlenecks in
 LK workloads, developed and validated on real Raspberry Pi 4B hardware
 (Cortex-A72, BCM2711; QEMU was used only for early staged development,
 not for this project's hardware-validation work). See
-[docs/RPI4_BRINGUP.md](docs/RPI4_BRINGUP.md) for current status.
+[docs/HANDOFF.md](docs/HANDOFF.md) for current status/priority and
+[docs/RPI4_BRINGUP.md](docs/RPI4_BRINGUP.md) for hardware evidence.
 
 For the current implementation's architecture, data formats, operational
 workflow, and correctness boundaries, see
@@ -33,15 +34,22 @@ for a four-core workload capture, interactive SVG, importable profile, saved
 SQL analysis, and an offline replay with the matching image/ELF.
 
 **Known limitations:** missing stack frames cannot be reconstructed from
-incomplete captured context, and execution while IRQs are masked is invisible
-to both sampling modes. `profiler maskon` / `profiler mask` measure that
+incomplete captured context. Default IRQ sampling misses masked execution.
+`profiler maskon` / `profiler mask` measure that
 masked time per core and per masking site, and the report attributes delayed
 samples to the region that held them; with `profiler nmion` (pseudo-NMI, GIC
-priority masking) PMU samples also reach masked thread code directly. IRQ
-handlers and timer-mode samples remain blind (see ARCHITECTURE.md §11.1).
-Scheduling, wakeups, blocking reasons/durations, and CPU-frequency history
-are also absent from capture; analyzing them requires additional event
-instrumentation rather than stack samples alone.
+priority masking), both PMU and dedicated timer samples reach masked thread
+code. IRQ handlers remain blind (see ARCHITECTURE.md §11.1). K8 separately
+captures scheduling/wakeup/name events and polled CPU-frequency observations,
+exported with `pi4_sched_report.py --systrace`; they are absent from the
+perf-script stack export. Frequency polling can miss transitions.
+
+The [2026-10-06 joint review](docs/reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md)
+records open P1 gaps in output protection, loss/boundary accounting, mixed
+profile weighting, capture lifecycle and PMU ownership. In particular, the
+scheduler CLI currently requires a fresh output distinct from its inputs.
+Existing hardware milestones do not certify these edge cases. The optional
+real Perfetto test also has a stale K3 expectation (K25).
 
 **Scope: a PoC for a real target platform's actual perf use case.**
 Stack unwinding uses DWARF CFI (`.debug_frame`), not ARM's own EXIDX --

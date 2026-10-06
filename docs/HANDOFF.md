@@ -62,6 +62,8 @@ snapshot, not a live guarantee.
 - **Design and contracts:** [ARCHITECTURE.md](ARCHITECTURE.md) (capture,
   dump, unwind and correctness boundaries), [EXPORT.md](EXPORT.md)
   (perf-script/Perfetto export), [DESIGN.md](DESIGN.md) (original stages).
+- **Latest review:** [K15 joint review](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md)
+  (2026-10-06), including reproduced analysis defects and follow-up closure criteria.
 - **Evidence and history:** [RPI4_BRINGUP.md](RPI4_BRINGUP.md), results in
   [results/](results/).
 - **Target:** Cortex-A55, AArch32, SMP, always **Non-secure SVC** (the same
@@ -86,7 +88,7 @@ snapshot, not a live guarantee.
 
 | Released by | When | Board state |
 |---|---|---|
-| Claude | 2026-10-05 | lk-perf K8 image (lk.bin `5c6af40e…`) at the shell, 6000000 baud, pseudo-NMI off, samplers and scheduler recording stopped, COM5 closed. Recheck before use; `--reboot` at 6 Mbaud returns it to the loader |
+| Claude (copied by Codex; no live probe) | 2026-10-06 | Authoritative BOLT G1 release: LK shell on G1 image, watchdog disarmed by runner, COM5 closed. Payload/baud/sampler state must be rechecked before use; `--reboot` returns to loader. This supersedes this file's older K8 image snapshot, not the board-wide reservation |
 
 ## Claims (consolidated TODO)
 
@@ -94,18 +96,35 @@ One shared list, seeded on 2026-10-05 from RPI4_BRINGUP's "Outstanding work"
 backlog (code-review findings) and ARCHITECTURE.md §11.2, checked against the
 current source. *Owner* is empty until someone claims it.
 
+The [2026-10-06 joint review](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md)
+adds K16–K26. K1–K15 Done rows remain historical, scoped milestones;
+CR1 Done covers review/docs, not the new implementation follow-ups. K18's
+strict capture contract should be reused by BOLT R31. Close P1 evidence
+and lifecycle gaps before adding profiler capabilities.
+
 ### Open, in suggested order
 
 | Order | ID | Item | Priority | Owner | Status | Notes |
 |---|---|---|---|---|---|---|
-| Review | CR1 | Deep review after K15: target capture, PMU, scheduler export, host validation and TODO reconciliation | P1 | Codex | In progress | Read-only code/evidence review and focused offline probes in the Codex clone; documentation changes only, no shared build/Pi ownership |
-| 1 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Blocked | Feasibility done (Claude, K11): A72 implements `EDPCSR` and the CPU reaches every core's debug block, but the SoC disables non-invasive debug (`DBGAUTHSTATUS` 0xaa), so `EDPCSR` reads `ffffffff`. Untested lever: `enable_jtag_gpio=1` in `config.txt` (SD-card change, needs user approval). On the target: `profiler dbginfo`; [results](results/k11_edpcsr_feasibility_20261005/README.md) |
-| 2 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
+| 1 | K16 | Safe scheduler export publication and input protection | P1 | — | Open | Real CLI overwrites matching ELF with systrace and exits 0; protect inputs/aliases/existing outputs and failed writes; [closure criteria](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 2 | K17 | Strict scheduler sessions and unknown intervals after loss | P1 | — | Open | Mismatched footer and duplicate accepted; overwritten prefix assigned to one thread; validate complete structural contract and boundary identities, expose unknown time; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 3 | K18 | Strict sample counts, source/configuration and weighting | P1 | — | Open | Reproduced negative loss and timer record weighted as PMU; validate per-core/footer/sequence contract, retain source, reject/split mixtures; common component for BOLT R31; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 4 | K19 | Enforced sample/scheduler lifecycle and producer quiescence | P1 | — | Open | Active clear/dump races; scheduler reset and frequency writer not joined; timer stop already synchronous. All-core generation/freeze/restart tests with and without pseudo-NMI; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 5 | K20 | Complete PMU ownership, restoration and conflict guards | P1 | — | Open | K15 restores enable bits, not every prior config/count/interrupt state; pmustop can clear PMCR.E during stat; strict input/event validation and supported-user restoration/refusal tests; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 6 | K21 | Exact wait-queue ownership and thread lifetimes | P2 | — | Open | Guessed 0x200 thread range selects wrong adjacent owner; exact queue/ABI relation and same-name pointer reuse/lost identity tests; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 7 | K22 | Event-counter multi-wrap validity under delayed service | P2 | — | Open | One PMOVSR bit cannot count multiple unserviced 32-bit wraps; bound service interval or mark unreliable, verify masked workload; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 8 | K23 | Structured unwind stop reasons and context confidence | P2 | — | Open | Distinguish bounds/CFI/register/fallback stops; richer registers only with safe measured capture contract; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 9 | K24 | Sampling-rate, overhead and loss calibration | P2 | — | Open | Rate sweeps, handler/hook cost and missed-trigger confidence under pseudo-NMI/scheduler load; K6/K10 do not validate all workloads; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 10 | K25 | Reconcile K3 with real Perfetto consumer test | P2 | — | Open | Actual importer test FAIL: expected no_cfi, got caller;no_cfi (correct K3 fallback); verify assembled call site, update expectation and run full external-consumer suite; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 11 | K26 | Capability-aware exported limitation metadata | P2 | — | Open | Sidecar strings still claim all masked execution and scheduling absent; qualify default/pseudo-NMI and stack/SCHED/polled frequency with regressions; docs corrected in CR1; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 12 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Blocked | Feasibility done (Claude, K11): A72 implements `EDPCSR` and the CPU reaches every core's debug block, but the SoC disables non-invasive debug (`DBGAUTHSTATUS` 0xaa), so `EDPCSR` reads `ffffffff`. Untested lever: `enable_jtag_gpio=1` in `config.txt` (SD-card change, needs user approval). On the target: `profiler dbginfo`; [results](results/k11_edpcsr_feasibility_20261005/README.md) |
+| 13 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
 
 ### Done (recent)
 
 | ID | Item | Owner | Evidence |
 |---|---|---|---|
+| CR1 | Deep joint review through K15 and TODO reconciliation (review/docs only) | Codex | [Review](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md), [joint evidence](https://github.com/shadowfax80/bolt-aarch32/tree/main/docs/results/cr1_review_20261006): 56 host tests OK/1 skipped, 7 unwind checks PASS; real optional consumer FAIL on stale K3 expectation (K25); reproduced export/input, scheduler, sample and BOLT evidence defects; K16–K26 opened; no target/build/Pi mutation |
 | K15 | `profiler stat` left the cycle counter disabled, so later cycle-counter users read 0 (bolt-aarch32 `bolt_bench` after a `stat`) | Claude | Pi: `PMCNTENSET` 0x80000000 / 0x80000001 (sampling armed) unchanged across `stat`; `profiler pmu` now prints it; [bolt-aarch32 B1](https://github.com/shadowfax80/bolt-aarch32/blob/main/docs/results/b1_sampling_vs_instrumentation_20261005/README.md) |
 | K14 | Masking-site capture read the PC as data (`mov rX, pc`) in every inlined `arch_disable_ints()`; now the return address of an out-of-line helper (overlay 0016) | Claude | BOLT refusals on the combined LK image: 44 kernel functions -> 2 (both hand-written assembly); no `mov rX, pc` left in the lk-perf image; site attribution unchanged in kind (an address inside the masking function); [bolt-aarch32 B1](https://github.com/shadowfax80/bolt-aarch32/blob/main/docs/results/b1_sampling_vs_instrumentation_20261005/README.md) |
 | K13 | Host image hash failed on ELFs with gaps between load segments (every dump of such an image looked like a mismatch); gaps now hash as the zero fill objcopy uploads | Claude | A 2-byte gap in an ARM-mode bolt-aarch32 build: host hash now equals the target's (`e4a8ead8`); gap test in `test_irqmask_report.py` (24); found in [bolt-aarch32 B1](https://github.com/shadowfax80/bolt-aarch32/blob/main/docs/results/b1_sampling_vs_instrumentation_20261005/README.md) |
@@ -130,6 +149,33 @@ Earlier milestones (M1–M5, DWARF unwinder, review Phases 1–2) are recorded i
 [RPI4_BRINGUP.md](RPI4_BRINGUP.md).
 
 ## Handoff log
+
+### 2026-10-06 — Codex: CR1 joint review complete; K16–K26 opened
+
+- Reviewed `a547f94` through K15 with BOLT `d6aa4bb`/0001–0072. Published
+  [review/closure criteria](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md)
+  and prioritized K16–K26. Reproduced scheduler ELF overwrite, invalid
+  session acceptance/prefix accounting, wrong queue owner, negative sample
+  loss and mixed-source PMU weighting. BOLT R31/R32 reproduce missing-footer
+  capture acceptance and false suite gain. K19/K20/K22 are source-level
+  lifecycle/ownership/wrap findings awaiting hardware closure.
+- Host discovery 56 OK/1 skipped; standalone unwind 7 PASS. Ran actual
+  Perfetto consumer: FAIL on stale no-CFI stack expectation after K3 (K25),
+  with the returned caller matching the existing fallback test. [Joint
+  probe, test and identity evidence](https://github.com/shadowfax80/bolt-aarch32/tree/main/docs/results/cr1_review_20261006).
+  No new Pi certification. Existing K1–K15 milestones remain scoped.
+- Changed-document local links/code fences and staged whitespace checks
+  pass in both clones; BOLT tracked-file repository health also passes.
+- Corrected EXPORT/README/current architecture for K2/K8/K10/K12 and
+  synchronous timer stop; generated sidecar strings remain K26. Copied the
+  authoritative 2026-10-06 BOLT G1 release into Pi state (no live probe).
+- Independent Codex clone docs only. No scripts/target/overlay changes,
+  setup, build, serial, sampler or watchdog action. Shared WSL checkout/index,
+  all builds and Claude's checkout untouched; live-tree locks free,
+  Pi unreserved, `scripts/flamegraph.pl` preserved.
+- Next: claim K16–K20 from this pool; coordinate K18 with BOLT R31 so the
+  strict parser is shared. Reserve the live tree for target/build work and
+  the single BOLT Pi table before board use. K11 blocked; T4 user-owned.
 
 ### 2026-10-06 — Codex: GitHub synchronization of both project checkouts
 
