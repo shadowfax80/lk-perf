@@ -106,17 +106,17 @@ and lifecycle gaps before adding profiler capabilities.
 
 | Order | ID | Item | Priority | Owner | Status | Notes |
 |---|---|---|---|---|---|---|
-| 1 | K16 | Safe scheduler export publication and input protection | P1 | — | Open | Real CLI overwrites matching ELF with systrace and exits 0; protect inputs/aliases/existing outputs and failed writes; [closure criteria](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
-| 2 | K17 | Strict scheduler sessions and unknown intervals after loss | P1 | — | Open | Mismatched footer and duplicate accepted; overwritten prefix assigned to one thread; validate complete structural contract and boundary identities, expose unknown time; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
-| 3 | K18 | Strict sample counts, source/configuration and weighting | P1 | — | Open | Reproduced negative loss and timer record weighted as PMU; validate per-core/footer/sequence contract, retain source, reject/split mixtures; common component for BOLT R31; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
-| 4 | K19 | Enforced sample/scheduler lifecycle and producer quiescence | P1 | — | Open | Active clear/dump races; scheduler reset and frequency writer not joined; timer stop already synchronous. All-core generation/freeze/restart tests with and without pseudo-NMI; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
-| 5 | K20 | Complete PMU ownership, restoration and conflict guards | P1 | — | Open | K15 restores enable bits, not every prior config/count/interrupt state; pmustop can clear PMCR.E during stat; strict input/event validation and supported-user restoration/refusal tests; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
-| 6 | K21 | Exact wait-queue ownership and thread lifetimes | P2 | — | Open | Guessed 0x200 thread range selects wrong adjacent owner; exact queue/ABI relation and same-name pointer reuse/lost identity tests; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
-| 7 | K22 | Event-counter multi-wrap validity under delayed service | P2 | — | Open | One PMOVSR bit cannot count multiple unserviced 32-bit wraps; bound service interval or mark unreliable, verify masked workload; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 1 | K17 | Strict scheduler sessions and unknown intervals after loss | P1 | — | Open | Mismatched footer and duplicate accepted; overwritten prefix assigned to one thread; validate complete structural contract and boundary identities, expose unknown time; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 2 | K18 | Strict sample counts, source/configuration and weighting | P1 | — | Open | Reproduced negative loss and timer record weighted as PMU; validate per-core/footer/sequence contract, retain source, reject/split mixtures; common component for BOLT R31 (R31 is blocked on this item); [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 3 | K19 | Enforced sample/scheduler lifecycle and producer quiescence | P1 | — | Open | Active clear/dump races; scheduler reset and frequency writer not joined; timer stop already synchronous. All-core generation/freeze/restart tests with and without pseudo-NMI; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 4 | K16 | Safe scheduler export publication and input protection | P2 | — | Open | P2 (needs the input path passed as the output): real CLI overwrites matching ELF with systrace and exits 0; protect inputs/aliases/existing outputs and failed writes; [closure criteria](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 5 | K20 | Complete PMU ownership, restoration and conflict guards | P2 | — | Open | P2 (needs a conflicting command inside `stat`, e.g. `stat "profiler pmustop"`): K15 restores enable bits, not every prior config/count/interrupt state; pmustop can clear PMCR.E during stat; strict input/event validation and supported-user restoration/refusal tests; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 6 | K25 | Reconcile K3 with real Perfetto consumer test | P2 | — | Open | Quick fix (expectation only; the line-194 fallback test already asserts `caller;no_cfi`): actual importer test FAIL: expected no_cfi, got caller;no_cfi (correct K3 fallback); verify assembled call site, update expectation and run full external-consumer suite; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 7 | K21 | Exact wait-queue ownership and thread lifetimes | P2 | — | Open | Quick fix: real `sizeof(thread_t)` is 0xa0 (rpi4 lk.elf DWARF); guessed 0x200 thread range selects wrong adjacent owner; exact queue/ABI relation and same-name pointer reuse/lost identity tests; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
 | 8 | K23 | Structured unwind stop reasons and context confidence | P2 | — | Open | Distinguish bounds/CFI/register/fallback stops; richer registers only with safe measured capture contract; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
 | 9 | K24 | Sampling-rate, overhead and loss calibration | P2 | — | Open | Rate sweeps, handler/hook cost and missed-trigger confidence under pseudo-NMI/scheduler load; K6/K10 do not validate all workloads; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
-| 10 | K25 | Reconcile K3 with real Perfetto consumer test | P2 | — | Open | Actual importer test FAIL: expected no_cfi, got caller;no_cfi (correct K3 fallback); verify assembled call site, update expectation and run full external-consumer suite; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
-| 11 | K26 | Capability-aware exported limitation metadata | P2 | — | Open | Sidecar strings still claim all masked execution and scheduling absent; qualify default/pseudo-NMI and stack/SCHED/polled frequency with regressions; docs corrected in CR1; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 10 | K26 | Capability-aware exported limitation metadata | P2 | — | Open | Sidecar strings still claim all masked execution and scheduling absent; qualify default/pseudo-NMI and stack/SCHED/polled frequency with regressions; docs corrected in CR1; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
+| 11 | K22 | Event-counter multi-wrap validity under delayed service | P3 | — | Open | P3 (needs more than 2^32 events with the overflow IRQ masked, about 7 s at 600 MHz): one PMOVSR bit cannot count multiple unserviced 32-bit wraps; bound service interval or mark unreliable, verify masked workload; [closure](reviews/CORRECTNESS_REVIEW_CODEX_K15_20261006.md#findings-and-acceptance-criteria) |
 | 12 | K11 | IRQ-masked blind spot, route 2: cross-core PC sampling through the debug PC-sample registers (`EDPCSR`), unaffected by the sampled core's IRQ mask | P2 | — | Blocked | Feasibility done (Claude, K11): A72 implements `EDPCSR` and the CPU reaches every core's debug block, but the SoC disables non-invasive debug (`DBGAUTHSTATUS` 0xaa), so `EDPCSR` reads `ffffffff`. Untested lever: `enable_jtag_gpio=1` in `config.txt` (SD-card change, needs user approval). On the target: `profiler dbginfo`; [results](results/k11_edpcsr_feasibility_20261005/README.md) |
 | 13 | T4 | Port to the real A55 target and validate there | P2 | User | Out of scope here | Buffer/RAM budget, toolchain re-check of `test_dwarf_unwind.py` addresses; pseudo-NMI (K12) needs the target GIC: GICv2 as on the Pi, or GICv3 `ICC_PMR` sysreg variant |
 
@@ -149,6 +149,18 @@ Earlier milestones (M1–M5, DWARF unwinder, review Phases 1–2) are recorded i
 [RPI4_BRINGUP.md](RPI4_BRINGUP.md).
 
 ## Handoff log
+
+### 2026-10-06 — Claude: CR1 follow-ups verified; priorities adjusted
+
+- Reran Codex's joint `probe_contracts.py`: K16, K17, K18 and K21 reproduce.
+  Source check confirms K19 (`clear` without stopping producers; scheduler
+  totals reset before `thread_lock`; frequency thread not joined), K20
+  (`pmustop` not refused by `profiler_stat_busy`; stat leaves `PMCCNTR` and
+  event types reset), K25 (stale expectation vs the line-194 fallback test)
+  and K26 (`pi4_perf_export.py` limitation strings). All items are accurate.
+- Priorities: K16 and K20 P1 -> P2 (they need operator misuse), K22 P2 -> P3
+  (theoretical). Order now K17, K18, K19 first; K18 precedes BOLT R31, which
+  is blocked on it. K21 and K25 marked as quick fixes. Docs only.
 
 ### 2026-10-06 — Codex: CR1 joint review complete; K16–K26 opened
 
