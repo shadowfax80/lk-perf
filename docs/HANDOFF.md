@@ -130,6 +130,23 @@ Earlier milestones (M1–M5, DWARF unwinder, review Phases 1–2) are recorded i
 
 ## Handoff log
 
+### 2026-10-06 — Codex: GitHub synchronization of both project checkouts
+
+- Fast-forwarded the independent Codex lk-perf clone to `a547f94` and the
+  Codex BOLT clone to `d6aa4bb`; read both updated handoffs and claims.
+  Imported Claude's K1–K10/K12–K15 implementation and evidence. This sync
+  did not independently rerun those tests or hardware checks.
+- Git fast-forward checks passed. No item claimed, source change, setup,
+  build, sampler, watchdog or serial action. Shared WSL trees/builds and
+  Claude's checkouts were not modified; both live-tree locks remain free.
+- Pi unreserved. The authoritative BOLT table now records Claude's
+  2026-10-06 G1 release (LK shell, watchdog disarmed, COM5 closed), newer
+  than this file's copied K8 snapshot. Neither was live-probed here;
+  recheck payload/baud before use.
+- Next: K11 remains blocked by debug authentication; T4 is user-owned.
+  Any new work needs a published claim, shared-tree ownership if used,
+  and the single BOLT Pi reservation for hardware. Sync-only stop.
+
 ### 2026-10-05 — Claude: K13, K14, K15 done (from bolt-aarch32 B1); lock released
 
 - Found while combining lk-perf's profiler with bolt-aarch32's LK for B1
